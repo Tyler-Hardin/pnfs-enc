@@ -1,0 +1,1279 @@
+diff --git a/fs/Makefile b/fs/Makefile
+index b64bc8432..704b0828a 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -155,6 +155,7 @@ bcachefs-y		:=			\
+ 	debug/debug.o				\
+ 	debug/sysfs.o				\
+ 	debug/trace.o				\
++	encoded_extent.o			\
+ 	errcode.o				\
+ 	fs/acl.o				\
+ 	fs/check.o				\
+diff --git a/fs/btree/commit.c b/fs/btree/commit.c
+index 6c8b121d3..913daa694 100644
+--- a/fs/btree/commit.c
++++ b/fs/btree/commit.c
+@@ -1450,6 +1450,14 @@ int __bch2_trans_commit(struct btree_trans *trans, enum bch_trans_commit_flags f
+ 			goto out_reset;
+ 	}
+ 
++	/*
++	 * Extents updates release open buckets, which is what the journal
++	 * throttles on - they have to be elevated before we take a journal
++	 * reservation, not just in the btree node alloc path.
++	 */
++	if (trans_commit_has_extents(trans))
++		flags = btree_update_set_watermark_hipri(flags);
++
+ 	ret = bch2_trans_commit_run_triggers(trans);
+ 	if (ret)
+ 		goto out_reset;
+diff --git a/fs/data/extents_types.h b/fs/data/extents_types.h
+index 9e717a8eb..794f70c89 100644
+--- a/fs/data/extents_types.h
++++ b/fs/data/extents_types.h
+@@ -40,6 +40,14 @@ struct bch_io_failures {
+ 	struct printbuf		ec_msg;
+ };
+ 
++/*
++ * BCH_READ_encoded: read the whole encoded unit covering the requested range
++ * and hand the bytes back as they are on disk - no decryption, no
++ * decompression. The caller gets crc.compressed_size sectors, not the decoded
++ * data, and is responsible for decoding them. Set by the encoded-extent
++ * serving path (fs/encoded_extent.c); the local filesystem never sets it, and
++ * an encoded read deliberately does not retry, because the retry path decodes.
++ */
+ #define BCH_READ_FLAGS()		\
+ 	x(retry_if_stale)		\
+ 	x(may_promote)			\
+@@ -50,7 +58,8 @@ struct bch_io_failures {
+ 	x(must_bounce)			\
+ 	x(must_clone)			\
+ 	x(in_retry)			\
+-	x(no_poison_check)
++	x(no_poison_check)		\
++	x(encoded)
+ 
+ enum __bch_read_flags {
+ #define x(n)	__BCH_READ_##n,
+diff --git a/fs/data/read.c b/fs/data/read.c
+index ff267da2e..30d04ff10 100644
+--- a/fs/data/read.c
++++ b/fs/data/read.c
+@@ -743,6 +743,21 @@ static void bch2_rbio_retry(struct work_struct *work)
+ 	int orig_ret = rbio->ret;
+ 	CLASS(bch_io_failures, failed)();
+ 
++	/*
++	 * An encoded read has no internal retry: the retry path re-reads through
++	 * bch2_read(), whose fragment loop decodes, and bch2_read_retry_nodecode()
++	 * is shaped for struct data_update - neither can hand back raw payload
++	 * bytes. Fail fast instead, so the caller falls back to the decoded path,
++	 * which retries and self-heals properly. The EC-reconstruct path punts
++	 * here directly, so this check cannot live only in bch2_rbio_error().
++	 */
++	if (unlikely(rbio->flags & BCH_READ_encoded)) {
++		rbio = bch2_rbio_free(rbio);
++		rbio->ret = orig_ret;
++		bch2_rbio_done(rbio);
++		return;
++	}
++
+ 	flags &= ~BCH_READ_hard_require_read_device;
+ 
+ 	event_inc_trace(c, data_read_retry, buf,
+@@ -883,7 +898,8 @@ static int bch2_rbio_error(struct bch_read_bio *rbio, int ret)
+ 	bch2_rbio_parent(rbio)->saw_error = true;
+ 
+ 	if (!(rbio->flags & BCH_READ_in_retry)) {
+-		if (data_read_err_should_retry(ret)) {
++		if (data_read_err_should_retry(ret) &&
++		    !(rbio->flags & BCH_READ_encoded)) {
+ 			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_dfl_wq);
+ 		} else {
+ 			rbio = bch2_rbio_free(rbio);
+@@ -1018,7 +1034,14 @@ static int __bch2_read_endio_work(struct bch_read_bio *rbio)
+ 	if (unlikely(rbio->narrow_crcs) && csum_good)
+ 		bch2_rbio_narrow_crcs(rbio);
+ 
+-	if (likely(!parent->data_update)) {
++	/*
++	 * An encoded read is not a data update, but it wants the same thing one
++	 * wants: the payload, not the plaintext. Skip the decode and let the
++	 * bytes the device delivered stand - the checksum above was computed
++	 * over exactly those bytes.
++	 */
++	if (likely(!parent->data_update &&
++		   !(parent->flags & BCH_READ_encoded))) {
+ 		/* Adjust crc to point to subset of data we want: */
+ 		crc.offset     += rbio->offset_into_extent;
+ 		crc.live_size	= bvec_iter_sectors(rbio->bvec_iter);
+@@ -1603,17 +1626,14 @@ int __bch2_read_extent(struct btree_trans *trans,
+ 	}
+ 
+ 	bool narrow_crcs = !orig->data_update &&
+-		!(flags & BCH_READ_in_retry) &&
++		!(flags & (BCH_READ_in_retry|BCH_READ_encoded)) &&
+ 		can_narrow_crc(pick.crc);
+ 
+ 	if (narrow_crcs && (flags & BCH_READ_user_mapped))
+ 		flags |= BCH_READ_must_bounce;
+ 
+ 
+-	if (likely(!orig->data_update)) {
+-		/* Check we're not trying to read more than we have in this extent: */
+-		EBUG_ON(offset_into_extent + bvec_iter_sectors(iter) > k.k->size);
+-	} else {
++	if (unlikely(orig->data_update)) {
+ 		/*
+ 		 * For data updates, iter.bi_size can be bigger than the key - it's just
+ 		 * the buffer size, we're not trying to read a specific amount of data
+@@ -1631,9 +1651,29 @@ int __bch2_read_extent(struct btree_trans *trans,
+ 
+ 		iter.bi_size = pick.crc.compressed_size << 9;
+ 		read_full = true;
++	} else if (flags & BCH_READ_encoded) {
++		/*
++		 * The caller wants the encoded unit as it is on disk, so the
++		 * device read is the whole payload: crc.compressed_size sectors
++		 * from the start of the extent, not the requested slice.
++		 * offset_into_extent stays out of it - the decoded-extent slice
++		 * it selects is the caller's business and travels back in the
++		 * descriptor we built it from.
++		 */
++		iter.bi_size = pick.crc.compressed_size << 9;
++		read_full = true;
++	} else {
++		/* Check we're not trying to read more than we have in this extent: */
++		EBUG_ON(offset_into_extent + bvec_iter_sectors(iter) > k.k->size);
+ 	}
+ 
+-	bool decode = !orig->data_update || orig->data_update_verify_decompress;
++	/*
++	 * BCH_READ_encoded asks for the payload, not the plaintext: no decrypt,
++	 * no decompress. The device writes straight into the caller's bio, so
++	 * there is nothing to bounce either.
++	 */
++	bool decode = !(flags & BCH_READ_encoded) &&
++		(!orig->data_update || orig->data_update_verify_decompress);
+ 
+ 	if (likely(decode))
+ 		if (crc_is_compressed(pick.crc) ||
+diff --git a/fs/data/update.c b/fs/data/update.c
+index 6f079d191..a756100a7 100644
+--- a/fs/data/update.c
++++ b/fs/data/update.c
+@@ -1077,6 +1077,23 @@ static unsigned durability_available_on_target(struct bch_fs *c,
+ 	struct bch_devs_mask devs = target_rw_devs(c, data_type, target);
+ 	unsigned durability = 0;
+ 
++	/*
++	 * A cached write - a promote - may allocate its copy from a durability 0
++	 * device, and those are not in rw_devs[BCH_DATA_user]. The allocator
++	 * unions BCH_DATA_cached in for BCH_WRITE_cached for exactly this reason
++	 * (bch2_alloc_sectors_start()); without the same union here this check
++	 * counted zero durability available on a cache device and refused every
++	 * promote with data_update_fail_no_rw_devs before the allocator was ever
++	 * reached, so a promote_target on a durability 0 device - the documented
++	 * way to configure a cache - silently never promoted anything.
++	 */
++	if (write_flags & BCH_WRITE_cached) {
++		struct bch_devs_mask cached_devs =
++			target_rw_devs(c, BCH_DATA_cached, target);
++
++		bitmap_or(devs.d, devs.d, cached_devs.d, BCH_SB_MEMBERS_MAX);
++	}
++
+ 	unsigned i;
+ 	for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
+ 		if (bch2_dev_list_has_dev(*devs_have, i))
+diff --git a/fs/data/write.c b/fs/data/write.c
+index 2b221c573..23af75d75 100644
+--- a/fs/data/write.c
++++ b/fs/data/write.c
+@@ -1814,6 +1814,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
+ 		return bch_err_throw(c, write_encoded_as_is);
+ 	}
+ 
++	/*
++	 * The payload is not a whole live encoded extent that can go out as it
++	 * stands. The encoded-extent serving path asked for encoded-write-only,
++	 * and falling through would decompress and recompress it here - so ask
++	 * for fresh buckets instead. A compressed extent cannot be split, so a
++	 * write point without room for the whole thing is a retry rather than a
++	 * failure; anything else means the caller's payload is not legal, and
++	 * is refused.
++	 */
++	if (op->flags & BCH_WRITE_encoded_only)
++		return op->crc.compressed_size > wp->sectors_free
++			? bch_err_throw(c, data_write_need_fresh_buckets)
++			: bch_err_throw(c, data_write_encoded_not_whole_extent);
++
+ 	/*
+ 	 * If the data is compressed and we couldn't write the entire extent as
+ 	 * is, we have to decompress it:
+diff --git a/fs/data/write_types.h b/fs/data/write_types.h
+index b0dc9839e..9e16cda0b 100644
+--- a/fs/data/write_types.h
++++ b/fs/data/write_types.h
+@@ -28,7 +28,8 @@
+ 	x(move)				\
+ 	x(in_worker)			\
+ 	x(submitted)			\
+-	x(convert_unwritten)
++	x(convert_unwritten)		\
++	x(encoded_only)
+ 
+ enum __bch_write_flags {
+ #define x(f)	__BCH_WRITE_##f,
+@@ -129,6 +130,13 @@ struct bch_write_op {
+ 	 *
+ 	 * So the three layers are: @opts is policy, @csum_type is intent, @crc
+ 	 * is fact. Anything that changes the buffer must update @crc with it.
++	 *
++	 * BCH_WRITE_encoded_only narrows that: a payload that cannot go out
++	 * exactly as it stands is refused (with more buckets asked for, so a
++	 * full write point is a retry and not a failure) rather than falling
++	 * into bch2_write_op_decode(). The encoded-extent serving path sets it
++	 * so that "the server never decoded a peer's payload" is a guarantee
++	 * rather than a hope.
+ 	 */
+ 	struct bch_extent_crc_unpacked crc;
+ 
+diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
+new file mode 100644
+index 000000000..6e88a7ad0
+--- /dev/null
++++ b/fs/encoded_extent.c
+@@ -0,0 +1,922 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Encoded-extent serving for bcachefs.
++ *
++ * This is bcachefs's backend for the kernel's encoded_extent_ops, and so the
++ * only bcachefs-specific piece of the pNFS encoded-extent layout type: the
++ * layout, the data service and the client are filesystem-agnostic and live in
++ * the kernel tree. What bcachefs has to supply is
++ *
++ *   - unit_max/unit_align: the largest encoded payload it will produce
++ *     (encoded_extent_max) and the alignment an encoded offset and length must
++ *     respect (block_size);
++ *   - probe/read: find the extent covering a range and describe it, or hand
++ *     back its compressed, checksum-verified bytes without decoding them;
++ *   - write: store a peer's already-compressed payload through bcachefs's own
++ *     allocation and checksum path, never decoding and re-compressing it.
++ *
++ * None of that I/O is new. The rebalance/move path already reads a whole
++ * encoded unit and writes one back as it stands; the mechanism is the
++ * BCH_READ_encoded read flag (see data/read.c) and BCH_WRITE_data_encoded with
++ * a populated op->crc (see data/write.c). This file is the serving front end:
++ * it finds the extent, moves the bytes, and classifies every refusal.
++ *
++ * The contract with a peer, and what is refused on purpose:
++ *
++ *   - checksums are bcachefs's. Read verifies the stored checksum before
++ *     handing a payload back; write computes one over the bytes it received.
++ *     A peer never reproduces checksum code, and a payload is never stored
++ *     without a checksum that describes it.
++ *   - encryption is refused rather than implemented: the payload would be
++ *     ciphertext and the key is not on the wire.
++ *   - a hole, an inline extent, an uncompressed extent or a reflink target is
++ *     refused: there is no codec work to offload, or the extent is not the
++ *     peer's to reinterpret.
++ *   - a write is stored only if its codec is what the inode's own policy asks
++ *     for, and only if it is smaller than the unit. Anything else would let a
++ *     peer's payload stop matching what a local write would have produced, or
++ *     record compressed data that did not compress.
++ *
++ * Every refusal is -ENODATA, which to the data service means "not served
++ * encoded" and to the NFS client means "use the MDS instead" - always correct,
++ * just not offloaded. Anything else is a real error and is passed through.
++ *
++ * Build note: the interface and the codec registry exist only when the kernel
++ * has CONFIG_ENCODED_EXTENT_CODECS (selected by the layout type). Without it
++ * this file compiles to nothing, so bcachefs-tools still builds against a stock
++ * kernel and the export ops simply omit .encoded_extent_ops.
++ */
++
++#include "bcachefs.h"
++
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++
++#include <linux/bio.h>
++#include <linux/encoded_extent.h>
++#include <linux/highmem.h>
++#include <linux/module.h>
++#include <linux/nfs4.h>
++#include <linux/slab.h>
++#include <linux/zstd.h>
++
++#include "alloc/buckets.h"
++#include "alloc/foreground.h"
++#include "btree/bkey_buf.h"
++#include "btree/iter.h"
++#include "data/checksum.h"
++#include "data/compress.h"
++#include "data/extents.h"
++#include "data/read.h"
++#include "data/write.h"
++#include "fs/inode.h"
++#include "snapshots/subvolume.h"
++#include "util/util.h"
++#include "vfs/fs.h"
++#include "vfs/io.h"
++#include "vfs/pagecache.h"
++
++/*
++ * Used by init/fs.c (registration) and vfs/fs.c (the export ops); declared
++ * here as well so the definitions have a prototype in scope.
++ */
++int bch2_encoded_extent_codecs_init(void);
++void bch2_encoded_extent_codecs_exit(void);
++
++/* ------------------------------------------------------- the encoded unit -- */
++
++/*
++ * One extent as the lookup found it: the logical offset the unit starts at, and
++ * the extent's checksum entry, which carries the codec, the payload length and
++ * the decoded length.
++ */
++struct bch_encoded_unit {
++	u64				logical_offset;
++	struct bch_extent_crc_unpacked	crc;
++};
++
++static inline u64 bch2_encoded_unit_len(const struct bch_encoded_unit *u)
++{
++	return (u64) u->crc.uncompressed_size << 9;
++}
++
++static inline u64 bch2_encoded_payload_len(const struct bch_encoded_unit *u)
++{
++	return (u64) u->crc.compressed_size << 9;
++}
++
++/*
++ * The whole encoded error class means "this range is not served encoded": a
++ * hole, an inline/encrypted/nocow/reflink extent, a codec we will not hand out.
++ * The caller's answer is ordinary I/O, so at this boundary it is -ENODATA.
++ * Anything else is a real error and keeps its meaning.
++ */
++static int bch2_encoded_err(int ret)
++{
++	if (bch2_err_matches(ret, BCH_ERR_encoded))
++		return -ENODATA;
++	return bch2_err_class(ret);
++}
++
++/* ------------------------------------------------------------- the lookup -- */
++
++/*
++ * Find the encoded extent covering @offset and describe it. @sk is filled with
++ * a reassembled copy of the key and @k_out points into it, because the caller's
++ * read needs a key that outlives the iterator.
++ *
++ * A refusal here is about the extent, not about I/O: everything that cannot be
++ * handed to a peer is thrown with a BCH_ERR_encoded code so the caller maps it
++ * to a fallback in one place.
++ */
++static int __bch2_encoded_find(struct btree_trans *trans, subvol_inum inum,
++			       u64 offset, struct bkey_buf *sk,
++			       struct bch_encoded_unit *out,
++			       struct bkey_s_c *k_out,
++			       unsigned *offset_into_extent)
++{
++	struct bch_fs *c = trans->c;
++	struct extent_ptr_decoded pick;
++	struct bkey_s_c k;
++	u64 unit_len, payload_len;
++	u32 snapshot;
++	int ret;
++
++	bch2_trans_begin(trans);
++
++	CLASS(btree_iter, iter)(trans, BTREE_ID_extents,
++				POS(inum.inum, offset >> 9), BTREE_ITER_slots);
++
++	ret = bch2_subvolume_get_snapshot(trans, inum.subvol, &snapshot);
++	if (ret)
++		return ret;
++
++	bch2_btree_iter_set_snapshot(&iter, snapshot);
++
++	k = bch2_btree_iter_peek_slot(&iter);
++	ret = bkey_err(k);
++	if (ret)
++		return ret;
++
++	/*
++	 * Reflink targets are shared: reading one is fine, but a peer that
++	 * names one is not getting a unit it may later rewrite, so the
++	 * indirect pointer itself is refused.
++	 */
++	if (k.k->type == KEY_TYPE_reflink_p)
++		return bch_err_throw(c, encoded_reflink);
++
++	/* Hole, reservation, inline data: no separate payload to move. */
++	if (!bkey_extent_is_direct_data(k.k))
++		return bch_err_throw(c, encoded_no_extent);
++
++	ret = bch2_bkey_buf_reassemble(sk, k);
++	if (ret)
++		return ret;
++	k = bkey_i_to_s_c(sk->k);
++
++	ret = bch2_bkey_pick_read_device(c, k, NULL, &pick, -1, 0);
++	if (ret < 0)
++		return ret;
++	if (!ret)
++		return bch_err_throw(c, encoded_no_extent);
++
++	if (bch2_csum_type_is_encryption(pick.crc.csum_type))
++		return bch_err_throw(c, encoded_encrypted);
++
++	if (!bch2_checksum_type_valid(c, pick.crc.csum_type))
++		return bch_err_throw(c, encoded_metadata_invalid);
++
++	/*
++	 * An extent stored without a codec has no codec work to offload: the
++	 * peer would be decoding plaintext. This is the same answer read gives,
++	 * and it is why a probe never sends a caller looking for a codec it
++	 * cannot use.
++	 */
++	if (!crc_is_compressed(pick.crc))
++		return bch_err_throw(c, encoded_no_extent);
++
++	unit_len	= (u64) pick.crc.uncompressed_size << 9;
++	payload_len	= (u64) pick.crc.compressed_size << 9;
++
++	if (unit_len > c->opts.encoded_extent_max ||
++	    payload_len > c->opts.encoded_extent_max)
++		return bch_err_throw(c, encoded_bad_size);
++
++	*offset_into_extent	= iter.pos.offset - bkey_start_offset(k.k);
++	out->logical_offset	= bkey_start_offset(k.k) << 9;
++	out->crc		= pick.crc;
++	*k_out			= k;
++	return 0;
++}
++
++static int __bch2_encoded_probe(struct btree_trans *trans, subvol_inum inum,
++				u64 offset, struct bch_encoded_unit *out)
++{
++	struct bkey_buf sk __cleanup(bch2_bkey_buf_exit);
++	struct bkey_s_c k;
++	unsigned offset_into_extent;
++
++	bch2_bkey_buf_init(&sk);
++
++	return __bch2_encoded_find(trans, inum, offset, &sk, out, &k,
++				   &offset_into_extent);
++}
++
++/* ------------------------------------------------------------- the read -- */
++
++static void bch2_encoded_read_end_io(struct bio *bio)
++{
++	complete(bio->bi_private);
++}
++
++static int __bch2_encoded_read(struct btree_trans *trans, subvol_inum inum,
++			       u64 offset, struct bch_encoded_unit *out,
++			       struct bch_read_bio *rbio)
++{
++	struct bkey_buf sk __cleanup(bch2_bkey_buf_exit);
++	struct bkey_s_c k;
++	unsigned offset_into_extent;
++	int ret;
++
++	bch2_bkey_buf_init(&sk);
++
++	ret = __bch2_encoded_find(trans, inum, offset, &sk, out, &k,
++				  &offset_into_extent);
++	if (ret)
++		return ret;
++
++	/*
++	 * The extent is known and whole: read it as it sits on disk. A restart
++	 * or ENOMEM can still come back synchronously; anything later fails the
++	 * bio, and an encoded read never retries internally, so it surfaces
++	 * here and the caller falls back.
++	 */
++	return bch2_read_extent(trans, rbio, POS(inum.inum, offset >> 9),
++				BTREE_ID_extents, k, offset_into_extent,
++				BCH_READ_encoded|BCH_READ_last_fragment);
++}
++
++/*
++ * Read the encoded unit covering @offset into @dst (capacity @dst_cap), with
++ * the payload length in *@payload_len and the descriptor in @out.
++ *
++ * The read path wants a bio, and the data service hands us a linear buffer, so
++ * the payload lands in the bio's pages first and is copied out. That extra copy
++ * is the price of keeping the I/O path exactly the one the move code uses;
++ * it is not on the decoded-data path.
++ */
++static int bch2_encoded_read_unit(struct bch_fs *c, subvol_inum inum, u64 offset,
++				  void *dst, size_t dst_cap, size_t *payload_len,
++				  struct bch_encoded_unit *out)
++{
++	struct bch_read_bio *rbio;
++	struct bio *bio;
++	size_t bytes = c->opts.encoded_extent_max;
++	DECLARE_COMPLETION_ONSTACK(done);
++	int ret;
++
++	if (offset & (block_bytes(c) - 1))
++		return bch_err_throw(c, encoded_bad_size);
++
++	/*
++	 * Sized for the largest payload the fs allows: the exact length is not
++	 * known until the extent is looked up, and the read path rewrites the
++	 * iterator down to it before the device sees it. The pages are attached
++	 * here so the device writes straight into them.
++	 */
++	/*
++	 * Never ask the bio layer for more vectors than it has: bvec_alloc()
++	 * BUGs rather than failing, so a unit above that ceiling is refused
++	 * here, where the caller still has somewhere to fall back to. The
++	 * ceiling is the same one bch2_encoded_extent_unit_max() advertises, so
++	 * a unit that reaches this is one this build cannot read at all.
++	 */
++	if (bytes > BIO_MAX_VECS * PAGE_SIZE)
++		return bch_err_throw(c, encoded_bad_size);
++
++	bio = bio_alloc_bioset(NULL, DIV_ROUND_UP(bytes, PAGE_SIZE),
++			       REQ_OP_READ, GFP_NOIO, &c->bio_read);
++	if (!bio)
++		return -ENOMEM;
++
++	rbio = rbio_init(bio, c, (struct bch_inode_opts) { 0 },
++			 bch2_encoded_read_end_io);
++	rbio->bio.bi_private		= &done;
++	rbio->bio.bi_iter.bi_sector	= offset >> 9;
++
++	bch2_bio_alloc_pages_pool(c, &rbio->bio, 512, bytes,
++				  GFP_NOIO|__GFP_SKIP_ZERO);
++
++	ret = bch2_trans_run(c, __bch2_encoded_read(trans, inum, offset, out, rbio));
++	if (ret)
++		goto err;
++
++	wait_for_completion(&done);
++
++	if (rbio->ret) {
++		ret = rbio->ret;
++		goto err;
++	}
++
++	/*
++	 * The read path sized the bio to the payload, so it holds exactly
++	 * crc.compressed_size sectors - nothing to trim.
++	 */
++	if (bio_sectors(bio) != out->crc.compressed_size) {
++		ret = bch_err_throw(c, encoded_metadata_invalid);
++		goto err;
++	}
++
++	*payload_len = bch2_encoded_payload_len(out);
++	if (*payload_len > dst_cap) {
++		ret = bch_err_throw(c, encoded_bad_size);
++		goto err;
++	}
++
++	memcpy_from_bio(dst, bio, bio->bi_iter);
++	ret = 0;
++err:
++	/*
++	 * The pages came from the bounce pool and bio_put() does not return them,
++	 * so they have to go back explicitly - before the put, and in that order,
++	 * because the free zeroes bi_vcnt and the put must not see them. The
++	 * normal read path does this (fs/data/read.c). Without it a read leaked
++	 * encoded_extent_max (256 KiB by default) per unit, which is ~7.5 GiB
++	 * over a suite run: the server ran out of memory and panicked.
++	 */
++	bch2_bio_free_pages_pool(c, bio);
++	bio_put(bio);
++	return ret;
++}
++
++/* ------------------------------------------------------------ the write -- */
++
++struct bch_encoded_write {
++	struct completion	done;
++	struct bio_vec		*bvecs;
++	struct bch_write_op	op;
++};
++
++static void bch2_encoded_write_end_io(struct bch_write_op *op)
++{
++	struct bch_encoded_write *w =
++		container_of(op, struct bch_encoded_write, op);
++
++	complete(&w->done);
++}
++
++/*
++ * A POSIX write updates mtime and ctime; the local path gets that from
++ * file_modified(), and a serving path that never goes through the VFS has to
++ * do it here.
++ *
++ * This is not cosmetic, and what it is for is worth being precise about: this
++ * filesystem publishes no change cookie (it has no fetch_iversion and sets no
++ * SB_I_VERSION), so nfsd's change_attribute is derived from the *ctime of the
++ * VFS inode* - and a write that only touches the btree never moves it. Without
++ * this the file does not look written to anyone who asks: a second client's
++ * close-to-open check sees the same attributes and keeps serving what it had
++ * cached, and so does a local reader. Bumping the times writes the inode key,
++ * which also advances bi_journal_seq - the sequence an fsync checks.
++ *
++ * bch2_inode_write() only updates the btree, so the in-memory inode is carried
++ * along afterwards the same way bch2_write_inode() does it: one mechanism, and
++ * it keeps ei_inode from going stale, which would let a later inode write put
++ * the old size and times back.
++ */
++static int bch2_encoded_write_times_update(struct bch_fs *c,
++					   struct bch_inode_info *inode)
++{
++	subvol_inum inum = inode_inum(inode);
++	CLASS(btree_trans, trans)(c);
++
++	return commit_do(trans, NULL, NULL, 0, ({
++		struct bch_inode_unpacked inode_u;
++		CLASS(btree_iter, iter)(trans, BTREE_ID_inodes,
++					POS(0, inum.inum), BTREE_ITER_intent);
++		u64 now = bch2_current_time(c);
++		int ret = bch2_inode_peek(trans, &iter, &inode_u, inum,
++					  BTREE_ITER_intent);
++
++		if (!ret) {
++			inode_u.bi_mtime = now;
++			inode_u.bi_ctime = now;
++			ret = bch2_inode_write(trans, &iter, &inode_u);
++		}
++		if (!ret)
++			bch2_inode_update_after_write(trans, inode, &inode_u,
++					ATTR_SIZE|ATTR_MTIME|ATTR_CTIME);
++		ret;
++	}));
++}
++
++/*
++ * Store @len bytes of @data as the encoded unit covering @offset, with the
++ * inode's own allocation options. The checksum is computed here, over the bytes
++ * actually received, which is what lets a peer skip checksum code entirely and
++ * still never store an extent its checksum does not describe.
++ */
++static int bch2_encoded_write_unit(struct bch_fs *c,
++				   struct bch_inode_info *inode,
++				   u64 offset, const void *data, size_t len,
++				   const struct encoded_extent_desc *desc)
++{
++	subvol_inum inum = inode_inum(inode);
++	struct bch_inode_unpacked inode_u;
++	struct bch_inode_opts io_opts;
++	struct bch_extent_crc_unpacked crc = {};
++	struct bch_encoded_write *w;
++	struct bch_write_op *op;
++	struct bio *bio;
++	enum bch_compression_type want;
++	struct nonce nonce;
++	u8 want_csum;
++	unsigned nr_vecs;
++	size_t padded_len;
++	int ret;
++
++	/*
++	 * A whole, block-aligned unit only, and the descriptor has to describe
++	 * the range being written: a payload packed against a different offset
++	 * or unit length would be indexed as something it is not. Refusing
++	 * rather than clamping keeps the two ends agreeing about what happened.
++	 *
++	 * The payload length itself is the codec's business, not a fixed length:
++	 * a peer's frame carries its own exact length inside it, so it is padded
++	 * to the filesystem's block size below, exactly as the local encoder
++	 * does (data/compress.c). The padding is invisible to the decoder and
++	 * the checksum covers the padded unit on both sides.
++	 */
++	if (!len || (offset & (block_bytes(c) - 1)) ||
++	    (desc->unit_len & (block_bytes(c) - 1)) ||
++	    desc->unencoded_offset ||
++	    offset != desc->unit_offset ||
++	    desc->unit_len > c->opts.encoded_extent_max)
++		return bch_err_throw(c, encoded_bad_size);
++
++	/*
++	 * A codec that did not shrink the unit has nothing to offload, and a
++	 * local write of that data would have recorded it as incompressible
++	 * rather than zstd - so it is not the extent the inode's policy says
++	 * this file holds. The caller falls back to ordinary I/O, which
++	 * compresses or not on its own.
++	 */
++	padded_len = round_up(len, block_bytes(c));
++	if (padded_len > c->opts.encoded_extent_max || padded_len >= desc->unit_len)
++		return bch_err_throw(c, encoded_bad_size);
++
++	ret = bch2_inode_find_by_inum(c, inum, &inode_u);
++	if (ret)
++		return ret;
++
++	/* Only a regular file's data is served encoded. */
++	if (!S_ISREG(inode_u.bi_mode))
++		return bch_err_throw(c, encoded_no_extent);
++
++	if (offset > MAX_LFS_FILESIZE || desc->unit_len > MAX_LFS_FILESIZE - offset)
++		return bch_err_throw(c, encoded_bad_size);
++
++	bch2_inode_opts_get_inode(c, &inode_u, &io_opts);
++
++	/*
++	 * The codec is the filesystem's policy, not the peer's choice. Comparing
++	 * it here is what keeps a file's recorded compression describing its
++	 * data: a peer that compressed with something else is refused, not
++	 * silently accepted. (A peer using a different *checksum* type is not a
++	 * problem - the write path recomputes one without decoding - but we
++	 * refuse encryption outright, because storing ciphertext without a key
++	 * is not something this interface can describe.)
++	 */
++	want = bch2_compression_opt_to_type(io_opts.compression);
++	if (desc->compression != want)
++		return bch_err_throw(c, encoded_policy_mismatch);
++
++	if ((io_opts.nocow && c->opts.nocow_enabled) || c->sb.encryption_type)
++		return bch_err_throw(c, encoded_encrypted);
++
++	want_csum = bch2_data_checksum_type(c, io_opts);
++	if (bch2_csum_type_is_encryption(want_csum))
++		return bch_err_throw(c, encoded_encrypted);
++
++	crc.compression_type	= desc->compression;
++	crc.compressed_size	= padded_len >> 9;
++	crc.uncompressed_size	= desc->unit_len >> 9;
++	crc.live_size		= desc->unit_len >> 9;
++	crc.offset		= 0;
++	crc.nonce		= 0;
++	crc.csum_type		= want_csum;
++
++	nr_vecs = DIV_ROUND_UP(padded_len, PAGE_SIZE);
++	w = kzalloc(sizeof(*w), GFP_NOIO);
++	if (!w)
++		return bch_err_throw(c, ENOMEM_bio_write_init);
++
++	w->bvecs = kmalloc_array(nr_vecs, sizeof(struct bio_vec), GFP_NOIO);
++	if (!w->bvecs) {
++		kfree(w);
++		return bch_err_throw(c, ENOMEM_bio_write_init);
++	}
++	init_completion(&w->done);
++
++	op = &w->op;
++	bch2_write_op_init(op, c, io_opts);
++
++	bio = &op->wbio.bio;
++	bio_init(bio, NULL, w->bvecs, nr_vecs, REQ_OP_WRITE);
++	/* __GFP_ZERO so the block padding behind the frame is zero. */
++	if (bch2_bio_alloc_pages(bio, c->opts.block_size, padded_len,
++				 GFP_NOIO|__GFP_ZERO)) {
++		ret = bch_err_throw(c, ENOMEM_bio_write_init);
++		goto err;
++	}
++
++	bio->bi_iter.bi_size = len;
++	memcpy_to_bio(bio, bio->bi_iter, data);
++	bio->bi_iter.bi_size = padded_len;
++	bio->bi_iter.bi_sector = offset >> 9;
++
++	/* The checksum covers the padded unit, exactly as the reader verifies it. */
++	nonce = extent_nonce(ZERO_VERSION, crc);
++	crc.csum = bch2_checksum_bio(c, crc.csum_type, nonce, bio);
++
++	/*
++	 * data_encoded + a populated op->crc says "this buffer already is the
++	 * extent"; encoded_only makes "and do not decode it to make it one" a
++	 * guarantee. pages_stable/pages_owned say the payload will not move and
++	 * the write path may keep it.
++	 */
++	op->flags		= BCH_WRITE_data_encoded|
++				  BCH_WRITE_pages_stable|
++				  BCH_WRITE_pages_owned|
++				  BCH_WRITE_encoded_only|
++				  BCH_WRITE_check_enospc;
++	op->crc			= crc;
++	op->version		= ZERO_VERSION;
++	op->nonce		= 0;
++	op->csum_type		= want_csum;
++	op->compression_opt	= io_opts.compression;
++	op->incompressible	= 0;
++	op->target		= io_opts.foreground_target;
++	op->nr_replicas		= io_opts.data_replicas;
++	op->res.nr_replicas	= io_opts.data_replicas;
++	op->write_point		= writepoint_hashed((unsigned long) current);
++	op->subvol		= inum.subvol;
++	op->pos			= POS(inum.inum, offset >> 9);
++	/*
++	 * Never shrink: a write in the middle of a file must not truncate it,
++	 * and a write past the end must extend it. The unit is block-aligned by
++	 * the check above, which also keeps this out of the small-write inline
++	 * path - the payload is packed data, not plaintext.
++	 */
++	op->new_i_size		= max_t(u64, inode_u.bi_size,
++					 offset + desc->unit_len);
++	op->end_io		= bch2_encoded_write_end_io;
++
++	ret = bch2_disk_reservation_get(c, &op->res, padded_len >> 9,
++					io_opts.data_replicas, 0);
++	if (ret)
++		goto err;
++
++	closure_call(&op->cl, bch2_write, NULL, NULL);
++	wait_for_completion(&w->done);
++
++	/*
++	 * The write path reports what the extent changed the file's sector count
++	 * by and leaves applying it to the caller: the page cache and direct
++	 * paths do it in their completions (bch2_i_sectors_acct), because the
++	 * VFS inode's i_blocks is not part of the btree update. A path that
++	 * reaches the btree without one has to do it here.
++	 *
++	 * Without this the in-memory inode's i_blocks never grows for an
++	 * encoded write. The file's contents are still right and its bi_sectors
++	 * is still right, so nothing fails - until the next thing that takes
++	 * sectors away from the file (the O_TRUNC a writer opens with, a
++	 * truncate, an overwrite) accounts against a count that never grew, and
++	 * bcachefs logs it and counts an fsck error. What a user sees in the
++	 * meantime is `stat` reporting no blocks for a file that has them.
++	 */
++	bch2_i_sectors_acct(c, inode, NULL, op->i_sectors_delta);
++
++	/*
++	 * Anything that means "this payload cannot be stored as it stands" is a
++	 * fallback, not an error the peer should see: a full write point
++	 * (retried with fresh buckets by the write path, and only surfacing if
++	 * there is really no room), or a payload that turned out not to be a
++	 * whole extent. Everything else keeps its meaning.
++	 */
++	if (bch2_err_matches(op->error, BCH_ERR_encoded) ||
++	    bch2_err_matches(op->error, BCH_ERR_data_write_encoded_not_whole_extent) ||
++	    bch2_err_matches(op->error, BCH_ERR_data_write_need_fresh_buckets))
++		ret = -ENODATA;
++	else
++		ret = bch2_err_class(op->error);
++
++	if (!ret)
++		ret = bch2_encoded_write_times_update(c, inode);
++err:
++	bch2_disk_reservation_put(c, &op->res);
++	bch2_bio_free_pages_pool(c, bio);
++	kfree(w->bvecs);
++	kfree(w);
++	return ret;
++}
++
++/* ------------------------------------------------------- the encoded_extent_ops -- */
++
++static int bch2_encoded_extent_probe(struct file *file, u64 offset, size_t len,
++				     struct encoded_extent_desc *desc)
++{
++	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
++	struct bch_inode_info *inode = to_bch_ei(file_inode(file));
++	struct bch_encoded_unit unit;
++	int ret;
++
++	ret = bch2_trans_run(c, __bch2_encoded_probe(trans, inode_inum(inode),
++						     offset, &unit));
++	if (ret)
++		return bch2_encoded_err(ret);
++
++	desc->unit_offset	= unit.logical_offset;
++	desc->unit_len		= bch2_encoded_unit_len(&unit);
++	desc->unencoded_offset	= offset - unit.logical_offset;
++	desc->compression	= unit.crc.compression_type;
++	desc->encrypted		= false;
++	return 0;
++}
++
++static int bch2_encoded_extent_read(struct file *file, u64 offset, size_t len,
++				    void *dst, size_t *dst_len,
++				    struct encoded_extent_desc *desc)
++{
++	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
++	struct bch_inode_info *inode = to_bch_ei(file_inode(file));
++	struct bch_encoded_unit unit;
++	size_t payload_len = 0;
++	int ret;
++
++	ret = bch2_encoded_read_unit(c, inode_inum(inode), offset, dst, *dst_len,
++				     &payload_len, &unit);
++	if (ret)
++		return bch2_encoded_err(ret);
++
++	desc->unit_offset	= unit.logical_offset;
++	desc->unit_len		= bch2_encoded_unit_len(&unit);
++	desc->unencoded_offset	= offset - unit.logical_offset;
++	desc->compression	= unit.crc.compression_type;
++	desc->encrypted		= false;
++	*dst_len = payload_len;
++	return 0;
++}
++
++/*
++ * Store the encoded unit. A successful write has reached the btree and the
++ * journal, not the disk, which is what the sync that follows settles: see
++ * encoded_extent_sync().
++ */
++static int bch2_encoded_extent_write(struct file *file, u64 offset,
++				     const void *src, size_t len,
++				     const struct encoded_extent_desc *desc,
++				     enum encoded_extent_stable how,
++				     enum encoded_extent_stable *committed)
++{
++	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
++	struct bch_inode_info *inode = to_bch_ei(file_inode(file));
++	int ret;
++
++	if (desc->encrypted)
++		return -ENODATA;
++
++	/*
++	 * The unit is written into the btree, not through the page cache, so
++	 * every folio cached for the range is stale the moment it lands. This is
++	 * what O_DIRECT invalidates for and for the same reason: without it a
++	 * reader that goes through the cache - a local one, or the MDS serving
++	 * a READ from this node - is handed the old contents of a file that has
++	 * already changed. Holding the pagecache block keeps a concurrent
++	 * buffered write from re-dirtying the range behind the invalidation.
++	 */
++	guard(bch2_pagecache_block)(inode);
++	if (unlikely(inode->v.i_mapping->nrpages)) {
++		ret = bch2_write_invalidate_inode_pages_range(inode->v.i_mapping,
++					offset, offset + desc->unit_len - 1);
++		if (ret)
++			return ret;
++	}
++
++	ret = bch2_encoded_err(
++		bch2_encoded_write_unit(c, inode, offset, src, len, desc));
++	if (ret)
++		return ret;
++
++	return encoded_extent_sync(file, desc->unit_offset, desc->unit_len,
++				   how, committed);
++}
++
++static u32 bch2_encoded_extent_unit_max(struct inode *inode)
++{
++	struct bch_fs *c = inode->i_sb->s_fs_info;
++
++	/*
++	 * A unit is read with one bio, and the bio vector pool stops at
++	 * BIO_MAX_VECS pages: asking for more BUGs inside bvec_alloc(), in a
++	 * request path, which takes the serving thread with it - the client
++	 * reads that as a timeout, retries, and dies again, while every other
++	 * read falls back to the MDS. bcachefs's own data paths clamp to the
++	 * same limit for the same reason (fs/data/write.c).
++	 *
++	 * So this is the largest unit the service can serve, and a filesystem
++	 * formatted larger is clamped rather than killed. It is not merely a
++	 * smaller layout: bch2_encoded_read_unit() refuses anything above it, so
++	 * on such a filesystem encoded reads go to the MDS until it is
++	 * reformatted with --encoded_extent_max=1M or less. That is why this
++	 * says so out loud, once, at the point where the number is decided.
++	 */
++	if (c->opts.encoded_extent_max > BIO_MAX_VECS * PAGE_SIZE) {
++		pr_err_once("bcachefs: encoded_extent_max is %u bytes, but the "
++			    "encoded-extent data service can read at most %lu "
++			    "(one bio, BIO_MAX_VECS pages): no layout will be "
++			    "offered for this filesystem and clients will read "
++			    "through the MDS. Reformat with "
++			    "--encoded_extent_max=%lu or less for full service.\n",
++			    c->opts.encoded_extent_max,
++			    (unsigned long)BIO_MAX_VECS * PAGE_SIZE,
++			    (unsigned long)BIO_MAX_VECS * PAGE_SIZE);
++		/*
++		 * 0: this filesystem cannot be served encoded at all. The read
++		 * path cannot build a bio for a unit that large, and because
++		 * the refusal is keyed on the option, advertising a smaller
++		 * ceiling would mean refusing every range - a layout that can
++		 * never be used. So there is no layout: the client reads
++		 * through the MDS, which is correct, and the message above
++		 * says why. A caller that asks anyway is refused by the read
++		 * op (bch2_encoded_read_unit()) and by the data service, which
++		 * treats a zero unit_max as "not served".
++		 */
++		return 0;
++	}
++
++	return c->opts.encoded_extent_max;
++}
++
++static u32 bch2_encoded_extent_unit_align(struct inode *inode)
++{
++	struct bch_fs *c = inode->i_sb->s_fs_info;
++
++	return c->opts.block_size;
++}
++
++/* ------------------------------------------------------------- the codecs -- */
++
++/*
++ * bcachefs's zstd extents, as the peer needs them. The framing is bcachefs's
++ * and not a bare zstd frame: data/compress.c puts the exact compressed length
++ * in a little-endian u32 in front of the frame, because zstd's decoder needs
++ * the exact size and the on-disk payload is sector-padded. A peer that used a
++ * plain zstd frame here would produce extents bcachefs itself cannot read, so
++ * this is exactly the code the filesystem's own codec path runs, with the
++ * workspace coming from the call instead of from a mount.
++ *
++ * The name is deliberately not the bare "zstd" that the btrfs backend
++ * registers: the registry refuses two codecs with the same name under one
++ * layout type, and the framing is not the same, so the two must be told apart.
++ */
++
++/* bcachefs rescales its own level (data/compress.c); this is a mid-range one. */
++#define BCH2_ENCODED_ZSTD_LEVEL		3
++
++static int bch2_encoded_zstd_decode(const void *src, size_t src_len,
++				    void *dst, size_t dst_cap, size_t *dst_len)
++{
++	size_t workspace_size = zstd_dctx_workspace_bound();
++	ZSTD_DCtx *ctx;
++	void *workspace;
++	size_t real_src_len, ret;
++
++	if (src_len < sizeof(u32))
++		return -EIO;
++
++	real_src_len = le32_to_cpup(src);
++	if (real_src_len > src_len - sizeof(u32))
++		return -EIO;
++
++	workspace = kvmalloc(workspace_size, GFP_NOFS);
++	if (!workspace)
++		return -ENOMEM;
++
++	ctx = zstd_init_dctx(workspace, workspace_size);
++	if (!ctx) {
++		kvfree(workspace);
++		return -EIO;
++	}
++
++	ret = zstd_decompress_dctx(ctx, dst, dst_cap,
++				   src + sizeof(u32), real_src_len);
++	kvfree(workspace);
++
++	if (zstd_is_error(ret))
++		return -EIO;
++	if (!ret)
++		return -EIO;
++
++	/*
++	 * How much plaintext came out is the caller's to check against the unit
++	 * length it was promised - that check is what binds a payload to the
++	 * pages it may fill.
++	 */
++	*dst_len = ret;
++	return 0;
++}
++
++static int bch2_encoded_zstd_encode(const void *src, size_t src_len,
++				    void *dst, size_t dst_cap, size_t *dst_len)
++{
++	zstd_parameters params = zstd_get_params(BCH2_ENCODED_ZSTD_LEVEL, src_len);
++	ZSTD_CCtx *ctx;
++	void *workspace;
++	size_t workspace_size, ret;
++
++	/*
++	 * Room for the length prefix, and for zstd's tendency to write a little
++	 * past the end of its output buffer - the same slop the filesystem's own
++	 * compressor leaves (data/compress.c).
++	 */
++	if (dst_cap <= sizeof(u32) + 7)
++		return -E2BIG;
++
++	workspace_size = zstd_cctx_workspace_bound(&params.cParams);
++	workspace = kvmalloc(workspace_size, GFP_NOFS);
++	if (!workspace)
++		return -ENOMEM;
++
++	ctx = zstd_init_cctx(workspace, workspace_size);
++	if (!ctx) {
++		kvfree(workspace);
++		return -EIO;
++	}
++
++	ret = zstd_compress_cctx(ctx, dst + sizeof(u32),
++				 dst_cap - sizeof(u32) - 7,
++				 src, src_len, &params);
++	kvfree(workspace);
++
++	if (zstd_is_error(ret) || !ret)
++		return -EIO;
++
++	*(__le32 *) dst = cpu_to_le32(ret);
++	*dst_len = ret + sizeof(u32);
++	return 0;
++}
++
++static const struct encoded_extent_codec bch2_encoded_zstd_codec = {
++	.owner		= THIS_MODULE,
++	.compression	= BCH_COMPRESSION_TYPE_zstd,
++	.name		= "bcachefs-zstd",
++	.decode		= bch2_encoded_zstd_decode,
++	.encode		= bch2_encoded_zstd_encode,
++};
++
++static const struct encoded_extent_codec * const bch2_encoded_codecs[] = {
++	&bch2_encoded_zstd_codec,
++};
++
++/* What a peer sees of this filesystem's encoded extents: the ops and the codec
++ * table above, which is where a descriptor's codec position is resolved - this
++ * filesystem's positions, not every registrant's. */
++const struct encoded_extent_ops bch2_encoded_extent_ops = {
++	.codecs		= bch2_encoded_codecs,
++	.nr_codecs	= ARRAY_SIZE(bch2_encoded_codecs),
++	.unit_max	= bch2_encoded_extent_unit_max,
++	.unit_align	= bch2_encoded_extent_unit_align,
++	.read		= bch2_encoded_extent_read,
++	.write		= bch2_encoded_extent_write,
++	.probe		= bch2_encoded_extent_probe,
++};
++
++/*
++ * How a peer that does not have this codec finds the module that does: it asks
++ * for the alias, and modprobe loads bcachefs.ko. This is the whole reason the
++ * name a codec registers under has to be the name a layout carries.
++ */
++MODULE_ALIAS_ENCODED_EXTENT_CODEC("bcachefs-zstd");
++
++/*
++ * Registered under the layout type this backend is served with. A codec
++ * bcachefs stores but has not registered (lz4, gzip) has a perfectly valid
++ * number in a descriptor but no name a peer can resolve, so those extents fall
++ * back to ordinary I/O - which is the correct degradation, and is why this
++ * table rather than the on-disk numbering decides what is served encoded.
++ */
++int bch2_encoded_extent_codecs_init(void)
++{
++	return encoded_extent_codec_register(LAYOUT_BCACHEFS_ENCODED,
++					     bch2_encoded_codecs,
++					     ARRAY_SIZE(bch2_encoded_codecs));
++}
++
++void bch2_encoded_extent_codecs_exit(void)
++{
++	encoded_extent_codec_unregister(LAYOUT_BCACHEFS_ENCODED,
++					bch2_encoded_codecs);
++}
++
++#endif /* CONFIG_ENCODED_EXTENT_CODECS */
+diff --git a/fs/errcode.h b/fs/errcode.h
+index 2f3aada8d..b495bd67a 100644
+--- a/fs/errcode.h
++++ b/fs/errcode.h
+@@ -631,7 +631,15 @@
+ 	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_disk_label_too_big, 608)	\
+ 	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_stripe_alloc, 609)	\
+ 	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_usable_block, 610)	\
+-	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_ec_bucket, 611)
++	x(BCH_ERR_ec_alloc_failed,	ec_alloc_failed_no_ec_bucket, 611)	\
++	x(BCH_ERR_data_write,		data_write_encoded_not_whole_extent, 612) \
++	x(EOPNOTSUPP,			encoded, 613)				\
++	x(BCH_ERR_encoded,		encoded_no_extent, 614)			\
++	x(BCH_ERR_encoded,		encoded_encrypted, 615)			\
++	x(BCH_ERR_encoded,		encoded_reflink, 616)			\
++	x(BCH_ERR_encoded,		encoded_bad_size, 617)			\
++	x(BCH_ERR_encoded,		encoded_metadata_invalid, 618)		\
++	x(BCH_ERR_encoded,		encoded_policy_mismatch, 619)
+ 
+ enum bch_errcode {
+ 	BCH_ERR_START		= 2048,
+diff --git a/fs/init/error.c b/fs/init/error.c
+index 88ab481d5..0ff0b6fc1 100644
+--- a/fs/init/error.c
++++ b/fs/init/error.c
+@@ -563,7 +563,15 @@ int __bch2_fsck_err(struct bch_fs *c,
+ 	bool inconsistent = false, exiting = false;
+ 	struct fsck_err_state *s =
+ 		count_fsck_err_locked(c, err, buf.buf, &repeat, &print, &suppress);
+-	if (repeat) {
++	/*
++	 * Replay the verdict we reached the first time - but only if we reached
++	 * one. s->ret is written at the bottom of this function, which every
++	 * goto err_unlock jumps over: a first occurrence that bailed out of
++	 * do_fsck_ask_yn() leaves the state allocated with s->ret == 0. Zero is
++	 * "not decided yet", not a verdict, so fall through and decide now -
++	 * otherwise we'd return it and trip the BUG_ON(!ret) below.
++	 */
++	if (repeat && s->ret) {
+ 		ret = s->ret;
+ 		goto err_unlock;
+ 	}
+diff --git a/fs/init/fs.c b/fs/init/fs.c
+index 6a4db5b3f..42ccdad8d 100644
+--- a/fs/init/fs.c
++++ b/fs/init/fs.c
+@@ -1780,8 +1780,21 @@ struct bch_fs *bch2_fs_open(darray_const_str *devices,
+ 
+ /* Global interfaces/init */
+ 
++/*
++ * The codec table fs/encoded_extent.c publishes to peers under the pNFS
++ * encoded-extent layout type. Its lifetime is the module's, which is what keeps
++ * a codec from being unloaded under a live layout.
++ */
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++int bch2_encoded_extent_codecs_init(void);
++void bch2_encoded_extent_codecs_exit(void);
++#endif
++
+ static void bcachefs_exit(void)
+ {
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++	bch2_encoded_extent_codecs_exit();
++#endif
+ 	bch2_debug_exit();
+ 	bch2_vfs_exit();
+ 	bch2_chardev_exit();
+@@ -1806,6 +1819,11 @@ static int __init bcachefs_init(void)
+ 	    bch2_debug_init())
+ 		goto err;
+ 
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++	if (bch2_encoded_extent_codecs_init())
++		goto err;
++#endif
++
+ 	return 0;
+ err:
+ 	bcachefs_exit();
+diff --git a/fs/vfs/fs.c b/fs/vfs/fs.c
+index 285820d21..5f42adbaa 100644
+--- a/fs/vfs/fs.c
++++ b/fs/vfs/fs.c
+@@ -2283,7 +2283,22 @@ err:
+ 	return ret;
+ }
+ 
++/*
++ * The encoded-extent serving ops (fs/encoded_extent.c): what lets bcachefs be
++ * exported under the pNFS encoded-extent layout type, so a peer moves
++ * compressed extents and does the codec work itself. Only present when the
++ * kernel has the encoded-extent interface at all (CONFIG_ENCODED_EXTENT_CODECS,
++ * selected by the layout type), so bcachefs-tools still builds against a stock
++ * kernel.
++ */
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++extern const struct encoded_extent_ops bch2_encoded_extent_ops;
++#endif
++
+ static const struct export_operations bch_export_ops = {
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++	.encoded_extent_ops	= &bch2_encoded_extent_ops,
++#endif
+ 	.encode_fh	= bch2_encode_fh,
+ 	.fh_to_dentry	= bch2_fh_to_dentry,
+ 	.fh_to_parent	= bch2_fh_to_parent,

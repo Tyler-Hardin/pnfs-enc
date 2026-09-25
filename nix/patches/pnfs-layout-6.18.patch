@@ -1,0 +1,5022 @@
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 0bfdaecaa..62b2e2e2f 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -18,6 +18,14 @@ config VALIDATE_FS_PARSER
+ config FS_IOMAP
+ 	bool
+ 
++# The registry of filesystem encoded-extent codecs: which codecs a
++# filesystem's encoded extents may use, addressed by layout type and name.
++# Selected by the features that hand encoded extents to a peer (see
++# fs/nfs/Kconfig and fs/nfsd/Kconfig); a filesystem registers into it only
++# when it is enabled.
++config ENCODED_EXTENT_CODECS
++	bool
++
+ # Stackable filesystems
+ config FS_STACK
+ 	bool
+diff --git a/fs/Makefile b/fs/Makefile
+index e3523ab2e..048e5995f 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -19,6 +19,7 @@ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		file_attr.o
+ 
+ obj-$(CONFIG_BUFFER_HEAD)	+= buffer.o mpage.o
++obj-$(CONFIG_ENCODED_EXTENT_CODECS) += encoded_extent.o
+ obj-$(CONFIG_PROC_FS)		+= proc_namespace.o
+ obj-$(CONFIG_LEGACY_DIRECT_IO)	+= direct-io.o
+ obj-y				+= notify/
+diff --git a/fs/btrfs/Makefile b/fs/btrfs/Makefile
+index 743d7677b..ab7a44167 100644
+--- a/fs/btrfs/Makefile
++++ b/fs/btrfs/Makefile
+@@ -29,6 +29,7 @@ btrfs-y += super.o ctree.o extent-tree.o print-tree.o root-tree.o dir-item.o \
+ 	   extent_io.o volumes.o async-thread.o ioctl.o locking.o orphan.o \
+ 	   export.o tree-log.o free-space-cache.o zlib.o lzo.o zstd.o \
+ 	   compression.o delayed-ref.o relocation.o delayed-inode.o scrub.o \
++	   encoded_extent.o \
+ 	   backref.o ulist.o qgroup.o send.o dev-replace.o raid56.o \
+ 	   uuid-tree.o props.o free-space-tree.o tree-checker.o space-info.o \
+ 	   block-rsv.o delalloc-space.o block-group.o discard.o reflink.o \
+diff --git a/fs/btrfs/btrfs_inode.h b/fs/btrfs/btrfs_inode.h
+index b6b46f951..5cb57838c 100644
+--- a/fs/btrfs/btrfs_inode.h
++++ b/fs/btrfs/btrfs_inode.h
+@@ -12,6 +12,7 @@
+ #include <linux/mutex.h>
+ #include <linux/rwsem.h>
+ #include <linux/fs.h>
++#include <linux/encoded_extent.h>
+ #include <linux/mm.h>
+ #include <linux/compiler.h>
+ #include <linux/fscrypt.h>
+@@ -641,6 +642,15 @@ int btrfs_run_delalloc_range(struct btrfs_inode *inode, struct folio *locked_fol
+ int btrfs_writepage_cow_fixup(struct folio *folio);
+ int btrfs_encoded_io_compression_from_extent(struct btrfs_fs_info *fs_info,
+ 					     int compress_type);
++int btrfs_encoded_read_file(struct file *file,
++			    struct btrfs_ioctl_encoded_io_args *args,
++			    struct iov_iter *iter);
++int btrfs_encoded_write_file(struct file *file,
++			     struct btrfs_ioctl_encoded_io_args *args,
++			     struct iov_iter *iter);
++extern const struct encoded_extent_ops btrfs_encoded_extent_ops;
++int btrfs_encoded_extent_codecs_init(void);
++void btrfs_encoded_extent_codecs_exit(void);
+ int btrfs_encoded_read_regular_fill_pages(struct btrfs_inode *inode,
+ 					  u64 disk_bytenr, u64 disk_io_size,
+ 					  struct page **pages, void *uring_ctx);
+diff --git a/fs/btrfs/compression.h b/fs/btrfs/compression.h
+index 062ebd9c2..dcf768d72 100644
+--- a/fs/btrfs/compression.h
++++ b/fs/btrfs/compression.h
+@@ -39,6 +39,15 @@ static_assert((BTRFS_MAX_COMPRESSED % PAGE_SIZE) == 0);
+ /* Maximum size of data before compression */
+ #define BTRFS_MAX_UNCOMPRESSED		(SZ_128K)
+ 
++/*
++ * The zstd window btrfs compresses within. It is part of the on-disk format in
++ * the sense that a reader is given exactly this much window and cannot decode a
++ * frame that needs more, so anything that produces a btrfs zstd extent - the
++ * encoder here, and a peer's encoder for an encoded write - must stay inside it.
++ */
++#define ZSTD_BTRFS_MAX_WINDOWLOG	17
++#define ZSTD_BTRFS_MAX_INPUT		(1U << ZSTD_BTRFS_MAX_WINDOWLOG)
++
+ #define	BTRFS_ZLIB_DEFAULT_LEVEL		3
+ 
+ struct compressed_bio {
+diff --git a/fs/btrfs/encoded_extent.c b/fs/btrfs/encoded_extent.c
+new file mode 100644
+index 000000000..8ff34aea6
+--- /dev/null
++++ b/fs/btrfs/encoded_extent.c
+@@ -0,0 +1,452 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Encoded extent I/O for btrfs, as an encoded_extent_ops backend.
++ *
++ * btrfs has had this data path since BTRFS_IOC_ENCODED_READ/ENCODED_WRITE were
++ * added for send/receive --compressed-data: move a compressed, checksummed
++ * extent - the bytes as they are on disk, verified, not decompressed - between
++ * a userspace buffer and the filesystem. This file exposes the same thing to
++ * in-kernel callers, so that a serving path (pNFS's read_pagelist/write_pagelist)
++ * can move encoded extents with the client doing the codec work.
++ *
++ * The two ioctls' bodies are factored out into btrfs_encoded_read_file() and
++ * btrfs_encoded_write_file() here; the ioctls keep the userspace half (cap
++ * check, copy_from_user, iovec import, accounting) and call them. Nothing
++ * about the I/O itself changed.
++ *
++ * Checksums stay btrfs's: it verifies them on read before handing the encoded
++ * bytes back, and computes them on write, so a caller never touches csum code
++ * and a client cannot store an extent whose checksum does not describe it.
++ * Compression is stored per extent as a type, which is all a reader needs.
++ *
++ * This file is also where btrfs's codecs are registered, because this is the
++ * boundary at which they leave the filesystem: the codec numbers in a
++ * descriptor are btrfs's own, and the codec table is what lets a peer decode an
++ * extent without knowing them. See the codec section at the end.
++ */
++
++#include <linux/encoded_extent.h>
++#include <linux/fsnotify.h>
++#include <linux/module.h>
++#include <linux/nfs4.h>
++#include <linux/slab.h>
++#include <linux/uio.h>
++#include <linux/zstd.h>
++
++#include "ctree.h"
++#include "btrfs_inode.h"
++#include "compression.h"
++#include "extent_map.h"
++#include "file.h"
++
++/*
++ * The in-kernel entry points. @args is the ioctl's argument block, already
++ * validated and with its metadata filled in; @iter carries the encoded data.
++ */
++int btrfs_encoded_read_file(struct file *file,
++			    struct btrfs_ioctl_encoded_io_args *args,
++			    struct iov_iter *iter)
++{
++	struct btrfs_inode *inode = BTRFS_I(file_inode(file));
++	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	struct extent_io_tree *io_tree = &inode->io_tree;
++	struct extent_state *cached_state = NULL;
++	u64 disk_bytenr, disk_io_size;
++	loff_t pos = args->offset;
++	struct kiocb kiocb;
++	ssize_t ret;
++
++	if (iov_iter_count(iter) == 0)
++		return 0;
++
++	ret = rw_verify_area(READ, file, &pos, args->len);
++	if (ret < 0)
++		return ret;
++
++	init_sync_kiocb(&kiocb, file);
++	kiocb.ki_pos = pos;
++
++	ret = btrfs_encoded_read(&kiocb, iter, args, &cached_state,
++				 &disk_bytenr, &disk_io_size);
++	if (ret == -EIOCBQUEUED) {
++		bool unlocked = false;
++		u64 start, lockend, count;
++
++		start = ALIGN_DOWN(kiocb.ki_pos, fs_info->sectorsize);
++		lockend = start + BTRFS_MAX_UNCOMPRESSED - 1;
++
++		if (args->compression)
++			count = disk_io_size;
++		else
++			count = args->len;
++
++		ret = btrfs_encoded_read_regular(&kiocb, iter, start, lockend,
++						 &cached_state, disk_bytenr,
++						 disk_io_size, count,
++						 args->compression, &unlocked);
++
++		if (!unlocked) {
++			btrfs_unlock_extent(io_tree, start, lockend, &cached_state);
++			btrfs_inode_unlock(inode, BTRFS_ILOCK_SHARED);
++		}
++	}
++
++	if (ret >= 0)
++		fsnotify_access(file);
++
++	return ret;
++}
++
++int btrfs_encoded_write_file(struct file *file,
++			     struct btrfs_ioctl_encoded_io_args *args,
++			     struct iov_iter *iter)
++{
++	loff_t pos = args->offset;
++	struct kiocb kiocb;
++	ssize_t ret;
++
++	if (iov_iter_count(iter) == 0)
++		return 0;
++
++	ret = rw_verify_area(WRITE, file, &pos, args->len);
++	if (ret < 0)
++		return ret;
++
++	init_sync_kiocb(&kiocb, file);
++	ret = kiocb_set_rw_flags(&kiocb, 0, WRITE);
++	if (ret)
++		return ret;
++	kiocb.ki_pos = pos;
++
++	file_start_write(file);
++
++	ret = btrfs_do_write_iter(&kiocb, iter, args);
++	if (ret > 0)
++		fsnotify_modify(file);
++
++	file_end_write(file);
++
++	return ret;
++}
++
++/* ------------------------------------------------- the encoded_extent_ops -- */
++
++static int btrfs_encoded_extent_read(struct file *file, u64 offset, size_t len,
++				     void *dst, size_t *dst_len,
++				     struct encoded_extent_desc *desc)
++{
++	struct btrfs_ioctl_encoded_io_args args = {
++		.offset		= offset,
++		.len		= len,
++		.unencoded_len	= *dst_len,
++	};
++	struct kvec kvec = { .iov_base = dst, .iov_len = *dst_len };
++	struct iov_iter iter;
++	int ret;
++
++	/*
++	 * A kvec iterator, not iov_iter_init(): the destination is a kernel
++	 * buffer, and iov_iter_init() builds an iterator over *user* iovecs, so
++	 * btrfs's copy_page_to_iter() would go through copy_to_user() on a
++	 * kernel address and fail with -EFAULT.
++	 */
++	iov_iter_kvec(&iter, ITER_DEST, &kvec, 1, *dst_len);
++
++	ret = btrfs_encoded_read_file(file, &args, &iter);
++	if (ret < 0)
++		return ret;
++
++	/*
++	 * No compression means the extent was a hole or stored uncompressed:
++	 * there is no codec work to offload, so the caller uses ordinary I/O.
++	 */
++	if (args.compression == BTRFS_ENCODED_IO_COMPRESSION_NONE)
++		return -ENODATA;
++
++	desc->unit_offset	= offset - args.unencoded_offset;
++	desc->unit_len		= args.unencoded_len;
++	desc->unencoded_offset	= args.unencoded_offset;
++	desc->compression	= args.compression;
++	desc->encrypted		= false;
++
++	*dst_len = ret;
++	return 0;
++}
++
++/*
++ * Store the encoded unit. A successful write has reached the page cache, not
++ * the disk, which is what the sync that follows settles: see
++ * encoded_extent_sync().
++ */
++static int btrfs_encoded_extent_write(struct file *file, u64 offset,
++				      const void *src, size_t len,
++				      const struct encoded_extent_desc *desc,
++				      enum encoded_extent_stable how,
++				      enum encoded_extent_stable *committed)
++{
++	struct btrfs_ioctl_encoded_io_args args = {
++		.offset			= offset,
++		.len			= desc->unit_len,
++		.unencoded_len		= desc->unit_len,
++		.unencoded_offset	= desc->unencoded_offset,
++		.compression		= desc->compression,
++		.encryption		= BTRFS_ENCODED_IO_ENCRYPTION_NONE,
++	};
++	struct kvec kvec = { .iov_base = (void *) src, .iov_len = len };
++	struct iov_iter iter;
++	int ret;
++
++	if (desc->encrypted)
++		return -ENODATA;
++	if (len > BTRFS_MAX_COMPRESSED)
++		return -E2BIG;
++
++	iov_iter_kvec(&iter, ITER_SOURCE, &kvec, 1, len);
++
++	ret = btrfs_encoded_write_file(file, &args, &iter);
++	if (ret < 0)
++		return ret;
++
++	return encoded_extent_sync(file, desc->unit_offset, desc->unit_len,
++				   how, committed);
++}
++
++static int btrfs_encoded_extent_probe(struct file *file, u64 offset, size_t len,
++				      struct encoded_extent_desc *desc)
++{
++	struct btrfs_inode *inode = BTRFS_I(file_inode(file));
++	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	struct extent_map *em;
++	int ret;
++
++	ret = btrfs_inode_lock(inode, BTRFS_ILOCK_SHARED);
++	if (ret)
++		return ret;
++
++	em = btrfs_get_extent(inode, NULL, offset, len);
++	if (IS_ERR(em)) {
++		ret = PTR_ERR(em);
++		goto out_unlock;
++	}
++
++	ret = -ENODATA;
++	if (em->disk_bytenr == EXTENT_MAP_HOLE ||
++	    em->disk_bytenr == EXTENT_MAP_INLINE)
++		goto out_free;
++
++	ret = btrfs_encoded_io_compression_from_extent(
++			fs_info, btrfs_extent_map_compression(em));
++	if (ret < 0)
++		goto out_free;
++
++	/*
++	 * No compression means there is no codec work to offload, so this is
++	 * the same "not served encoded" answer the read op gives: a probe that
++	 * said yes here would send the caller looking for a codec it does not
++	 * need and cannot use.
++	 */
++	if (ret == BTRFS_ENCODED_IO_COMPRESSION_NONE) {
++		ret = -ENODATA;
++		goto out_free;
++	}
++
++	desc->unit_offset	= em->start - em->offset;
++	desc->unit_len		= em->ram_bytes;
++	desc->unencoded_offset	= offset - desc->unit_offset;
++	desc->compression	= ret;
++	desc->encrypted		= false;
++	ret = 0;
++
++out_free:
++	btrfs_free_extent_map(em);
++out_unlock:
++	btrfs_inode_unlock(inode, BTRFS_ILOCK_SHARED);
++	return ret;
++}
++
++static u32 btrfs_encoded_extent_unit_max(struct inode *inode)
++{
++	return BTRFS_MAX_COMPRESSED;
++}
++
++static u32 btrfs_encoded_extent_unit_align(struct inode *inode)
++{
++	return BTRFS_I(inode)->root->fs_info->sectorsize;
++}
++
++/* --------------------------------------------------------------- codecs -- */
++
++/*
++ * The codecs btrfs may store an encoded extent with, which is what makes this
++ * the owner of the naming: the numbers here are the ones the read and probe
++ * paths above put in a descriptor, and the names are what a peer resolves them
++ * back from. btrfs also stores zlib and lzo, and their numbers are just as
++ * valid to a descriptor; they are simply not registered, so those extents are
++ * not served encoded and fall back to ordinary I/O - which is the correct
++ * degradation, and is why this table rather than the backend's numbering is
++ * what decides.
++ *
++ * The framing is btrfs's, so a peer decodes exactly what btrfs would decode and
++ * encodes what btrfs's reader accepts. The window is the part that is not
++ * obvious: btrfs's decoder is given ZSTD_BTRFS_MAX_INPUT and will not read a
++ * frame that needs more, so the encoder must not produce one.
++ *
++ * The level is the encoder's own choice and nothing else's: a zstd frame
++ * carries no level, so a peer - or btrfs itself, reading the extent later - does
++ * not need to know it. This is the client spending its own CPU to save the
++ * server's, which is the point of the whole path, so it is the cheap end.
++ */
++#define BTRFS_ENCODED_ZSTD_LEVEL	1
++
++static int btrfs_encoded_zstd_decode(const void *src, size_t src_len,
++				     void *dst, size_t dst_cap, size_t *dst_len)
++{
++	zstd_dstream *stream;
++	zstd_in_buffer in = { .src = src, .size = src_len, .pos = 0 };
++	zstd_out_buffer out = { .dst = dst, .size = dst_cap, .pos = 0 };
++	size_t workspace_size, ret, prev;
++	void *workspace;
++
++	workspace_size = zstd_dstream_workspace_bound(ZSTD_BTRFS_MAX_INPUT);
++	workspace = kvmalloc(workspace_size, GFP_NOFS);
++	if (!workspace)
++		return -ENOMEM;
++
++	stream = zstd_init_dstream(ZSTD_BTRFS_MAX_INPUT, workspace,
++				   workspace_size);
++	if (!stream) {
++		kvfree(workspace);
++		return -EIO;
++	}
++
++	/*
++	 * A btrfs encoded extent is one or more zstd frames, so this runs until
++	 * the input or the output is exhausted. How much plaintext came out is
++	 * the caller's to check against the unit length it was promised - that
++	 * check is what binds a payload to the pages it may fill.
++	 */
++	do {
++		prev = in.pos + out.pos;
++		ret = zstd_decompress_stream(stream, &out, &in);
++		if (zstd_is_error(ret)) {
++			kvfree(workspace);
++			return -EIO;
++		}
++	} while (in.pos < in.size && out.pos < out.size &&
++		 in.pos + out.pos != prev);
++
++	*dst_len = out.pos;
++	kvfree(workspace);
++	return 0;
++}
++
++static int btrfs_encoded_zstd_encode(const void *src, size_t src_len,
++				     void *dst, size_t dst_cap, size_t *dst_len)
++{
++	zstd_parameters params = zstd_get_params(BTRFS_ENCODED_ZSTD_LEVEL,
++						 src_len);
++	zstd_in_buffer in = { .src = src, .size = src_len, .pos = 0 };
++	zstd_out_buffer out = { .dst = dst, .size = dst_cap, .pos = 0 };
++	zstd_cstream *cstream;
++	void *workspace;
++	size_t workspace_size, ret;
++
++	if (params.cParams.windowLog > ZSTD_BTRFS_MAX_WINDOWLOG)
++		params.cParams.windowLog = ZSTD_BTRFS_MAX_WINDOWLOG;
++
++	workspace_size = zstd_cstream_workspace_bound(&params.cParams);
++	workspace = kvmalloc(workspace_size, GFP_NOFS);
++	if (!workspace)
++		return -ENOMEM;
++
++	cstream = zstd_init_cstream(&params, src_len, workspace, workspace_size);
++	if (!cstream) {
++		kvfree(workspace);
++		return -EIO;
++	}
++
++	do {
++		ret = zstd_compress_stream(cstream, &out, &in);
++		if (zstd_is_error(ret)) {
++			kvfree(workspace);
++			return -EIO;
++		}
++		if (out.pos == out.size && in.pos < in.size) {
++			kvfree(workspace);
++			return -E2BIG;
++		}
++	} while (in.pos < in.size);
++
++	do {
++		ret = zstd_end_stream(cstream, &out);
++		if (zstd_is_error(ret)) {
++			kvfree(workspace);
++			return -EIO;
++		}
++		if (ret && out.pos == out.size) {
++			kvfree(workspace);
++			return -E2BIG;
++		}
++	} while (ret);
++
++	*dst_len = out.pos;
++	kvfree(workspace);
++	return 0;
++}
++
++static const struct encoded_extent_codec btrfs_encoded_zstd_codec = {
++	.owner		= THIS_MODULE,
++	.compression	= BTRFS_ENCODED_IO_COMPRESSION_ZSTD,
++	.name		= "zstd",
++	.decode		= btrfs_encoded_zstd_decode,
++	.encode		= btrfs_encoded_zstd_encode,
++};
++
++static const struct encoded_extent_codec * const btrfs_encoded_extent_codecs[] = {
++	&btrfs_encoded_zstd_codec,
++};
++
++/* What a peer sees of this filesystem's encoded extents: the flags, the ops, and
++ * the codec table above, which is where a descriptor's codec position is
++ * resolved - this filesystem's positions, not every registrant's. */
++const struct encoded_extent_ops btrfs_encoded_extent_ops = {
++	.codecs		= btrfs_encoded_extent_codecs,
++	.nr_codecs	= ARRAY_SIZE(btrfs_encoded_extent_codecs),
++	.unit_max	= btrfs_encoded_extent_unit_max,
++	.unit_align	= btrfs_encoded_extent_unit_align,
++	.read		= btrfs_encoded_extent_read,
++	.write		= btrfs_encoded_extent_write,
++	.probe		= btrfs_encoded_extent_probe,
++};
++
++/*
++ * How a peer that does not have this codec finds the module that does: it asks
++ * for the alias, and modprobe loads this module. (btrfs is usually built in,
++ * where the alias simply does not exist and there is nothing to load.)
++ */
++MODULE_ALIAS_ENCODED_EXTENT_CODEC("zstd");
++
++/*
++ * Registered under the layout type the spike exports under; a real btrfs
++ * encoded extent reaches a peer over whatever layout type an export negotiates,
++ * and this is the one wired to this table. The registration's lifetime is the
++ * module's, which is what keeps a codec from being unloaded under a layout.
++ */
++int btrfs_encoded_extent_codecs_init(void)
++{
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++	return encoded_extent_codec_register(LAYOUT_BCACHEFS_ENCODED,
++			btrfs_encoded_extent_codecs,
++			ARRAY_SIZE(btrfs_encoded_extent_codecs));
++#else
++	return 0;
++#endif
++}
++
++void btrfs_encoded_extent_codecs_exit(void)
++{
++#if IS_ENABLED(CONFIG_ENCODED_EXTENT_CODECS)
++	encoded_extent_codec_unregister(LAYOUT_BCACHEFS_ENCODED,
++					btrfs_encoded_extent_codecs);
++#endif
++}
+diff --git a/fs/btrfs/export.c b/fs/btrfs/export.c
+index 230d9326b..6642e488c 100644
+--- a/fs/btrfs/export.c
++++ b/fs/btrfs/export.c
+@@ -299,6 +299,8 @@ static int btrfs_get_name(struct dentry *parent, char *name,
+ }
+ 
+ const struct export_operations btrfs_export_ops = {
++	/* Move compressed, checksummed extents as stored; see encoded_extent.c */
++	.encoded_extent_ops = &btrfs_encoded_extent_ops,
+ 	.encode_fh	= btrfs_encode_fh,
+ 	.fh_to_dentry	= btrfs_fh_to_dentry,
+ 	.fh_to_parent	= btrfs_fh_to_parent,
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index b702f625c..3a85036ee 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -4410,24 +4410,17 @@ static int btrfs_ioctl_encoded_read(struct file *file, void __user *argp,
+ 	size_t copy_end_kernel = offsetofend(struct btrfs_ioctl_encoded_io_args,
+ 					     flags);
+ 	size_t copy_end;
+-	struct btrfs_inode *inode = BTRFS_I(file_inode(file));
+-	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+-	struct extent_io_tree *io_tree = &inode->io_tree;
+ 	struct iovec iovstack[UIO_FASTIOV];
+ 	struct iovec *iov = iovstack;
+ 	struct iov_iter iter;
+-	loff_t pos;
+-	struct kiocb kiocb;
+ 	ssize_t ret;
+-	u64 disk_bytenr, disk_io_size;
+-	struct extent_state *cached_state = NULL;
+ 
+ 	if (!capable(CAP_SYS_ADMIN)) {
+ 		ret = -EPERM;
+ 		goto out_acct;
+ 	}
+ 
+-	if (fs_info->sectorsize > PAGE_SIZE) {
++	if (btrfs_sb(file_inode(file)->i_sb)->sectorsize > PAGE_SIZE) {
+ 		ret = -ENOTTY;
+ 		goto out_acct;
+ 	}
+@@ -4469,42 +4462,10 @@ static int btrfs_ioctl_encoded_read(struct file *file, void __user *argp,
+ 		ret = 0;
+ 		goto out_iov;
+ 	}
+-	pos = args.offset;
+-	ret = rw_verify_area(READ, file, &pos, args.len);
+-	if (ret < 0)
+-		goto out_iov;
+-
+-	init_sync_kiocb(&kiocb, file);
+-	kiocb.ki_pos = pos;
+-
+-	ret = btrfs_encoded_read(&kiocb, &iter, &args, &cached_state,
+-				 &disk_bytenr, &disk_io_size);
+-
+-	if (ret == -EIOCBQUEUED) {
+-		bool unlocked = false;
+-		u64 start, lockend, count;
+-
+-		start = ALIGN_DOWN(kiocb.ki_pos, fs_info->sectorsize);
+-		lockend = start + BTRFS_MAX_UNCOMPRESSED - 1;
+ 
+-		if (args.compression)
+-			count = disk_io_size;
+-		else
+-			count = args.len;
+-
+-		ret = btrfs_encoded_read_regular(&kiocb, &iter, start, lockend,
+-						 &cached_state, disk_bytenr,
+-						 disk_io_size, count,
+-						 args.compression, &unlocked);
+-
+-		if (!unlocked) {
+-			btrfs_unlock_extent(io_tree, start, lockend, &cached_state);
+-			btrfs_inode_unlock(inode, BTRFS_ILOCK_SHARED);
+-		}
+-	}
++	ret = btrfs_encoded_read_file(file, &args, &iter);
+ 
+ 	if (ret >= 0) {
+-		fsnotify_access(file);
+ 		if (copy_to_user(argp + copy_end,
+ 				 (char *)&args + copy_end_kernel,
+ 				 sizeof(args) - copy_end_kernel))
+@@ -4527,8 +4488,6 @@ static int btrfs_ioctl_encoded_write(struct file *file, void __user *argp, bool
+ 	struct iovec iovstack[UIO_FASTIOV];
+ 	struct iovec *iov = iovstack;
+ 	struct iov_iter iter;
+-	loff_t pos;
+-	struct kiocb kiocb;
+ 	ssize_t ret;
+ 
+ 	if (!capable(CAP_SYS_ADMIN)) {
+@@ -4599,24 +4558,9 @@ static int btrfs_ioctl_encoded_write(struct file *file, void __user *argp, bool
+ 		ret = 0;
+ 		goto out_iov;
+ 	}
+-	pos = args.offset;
+-	ret = rw_verify_area(WRITE, file, &pos, args.len);
+-	if (ret < 0)
+-		goto out_iov;
+ 
+-	init_sync_kiocb(&kiocb, file);
+-	ret = kiocb_set_rw_flags(&kiocb, 0, WRITE);
+-	if (ret)
+-		goto out_iov;
+-	kiocb.ki_pos = pos;
+-
+-	file_start_write(file);
++	ret = btrfs_encoded_write_file(file, &args, &iter);
+ 
+-	ret = btrfs_do_write_iter(&kiocb, &iter, &args);
+-	if (ret > 0)
+-		fsnotify_modify(file);
+-
+-	file_end_write(file);
+ out_iov:
+ 	kfree(iov);
+ out_acct:
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index 157d55134..755780092 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -2589,6 +2589,9 @@ static const struct init_sequence mod_init_seq[] = {
+ 	}, {
+ 		.init_func = btrfs_print_mod_info,
+ 		.exit_func = NULL,
++	}, {
++		.init_func = btrfs_encoded_extent_codecs_init,
++		.exit_func = btrfs_encoded_extent_codecs_exit,
+ 	}, {
+ 		.init_func = btrfs_run_sanity_tests,
+ 		.exit_func = NULL,
+diff --git a/fs/btrfs/zstd.c b/fs/btrfs/zstd.c
+index c9cddcfa3..27cbed31a 100644
+--- a/fs/btrfs/zstd.c
++++ b/fs/btrfs/zstd.c
+@@ -23,8 +23,6 @@
+ #include "compression.h"
+ #include "super.h"
+ 
+-#define ZSTD_BTRFS_MAX_WINDOWLOG 17
+-#define ZSTD_BTRFS_MAX_INPUT (1U << ZSTD_BTRFS_MAX_WINDOWLOG)
+ #define ZSTD_BTRFS_DEFAULT_LEVEL 3
+ #define ZSTD_BTRFS_MIN_LEVEL -15
+ #define ZSTD_BTRFS_MAX_LEVEL 15
+diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
+new file mode 100644
+index 000000000..0cbca4eb8
+--- /dev/null
++++ b/fs/encoded_extent.c
+@@ -0,0 +1,266 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Encoded extent codecs: the table that connects the filesystem which stores an
++ * encoded extent to the peer that decodes it.
++ *
++ * A filesystem registers the codecs its encoded extents may use, under the
++ * layout type (the format) and with its own numbering for each. A peer looks one
++ * up by the name the wire carries. Neither side needs the other's numbering, and
++ * a name the peer cannot resolve is simply a range it does not serve encoded.
++ *
++ * A layout type may have more than one registrant - two filesystems can be
++ * exported under the same layout type - but a codec name means one thing within
++ * a layout type, so a second registration that would shadow a name is refused.
++ * That is the only conflict the table has: everything else about two
++ * filesystems' codecs coexists.
++ *
++ * The registration is a pointer to the caller's static array rather than a copy,
++ * so a module's array must outlive its registration, which module_init and
++ * module_exit give it. Lookups take a reference to the codec's module so that
++ * the exit path cannot run under a user of a codec.
++ *
++ * One lock for the whole table: registration is a module load and lookups are a
++ * layout or a single unit of I/O, so there is nothing to gain from anything
++ * finer.
++ */
++#include <linux/encoded_extent.h>
++#include <linux/ctype.h>
++#include <linux/kmod.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++struct encoded_extent_codec_set {
++	struct list_head	list;
++	u32			layout_type;
++	const struct encoded_extent_codec * const *codecs;
++	unsigned int		nr_codecs;
++};
++
++static LIST_HEAD(codec_sets);
++static DEFINE_MUTEX(codec_lock);
++
++/*
++ * Every set registered under @layout_type, in registration order - which is the
++ * order a peer sees the names in, and so the numbering its descriptors use.
++ */
++#define for_each_codec_set(set, layout_type)				\
++	list_for_each_entry(set, &codec_sets, list)			\
++		if (set->layout_type == (layout_type))
++
++/*
++ * A name has to mean one codec within a layout type, or a peer resolving it
++ * would get the other filesystem's decoder.
++ */
++static bool codec_name_taken(u32 layout_type, const char *name)
++{
++	struct encoded_extent_codec_set *set;
++	unsigned int i;
++
++	for_each_codec_set(set, layout_type)
++		for (i = 0; i < set->nr_codecs; i++)
++			if (!strcmp(set->codecs[i]->name, name))
++				return true;
++	return false;
++}
++
++int encoded_extent_codec_register(u32 layout_type,
++		const struct encoded_extent_codec * const *codecs,
++		unsigned int nr_codecs)
++{
++	struct encoded_extent_codec_set *set;
++	unsigned int i;
++	int ret = 0;
++
++	if (!codecs || !nr_codecs)
++		return -EINVAL;
++
++	/*
++	 * Every registered codec is offered to peers by name, so one without a
++	 * name is not a codec this table can describe.
++	 */
++	for (i = 0; i < nr_codecs; i++)
++		if (!codecs[i] || !codecs[i]->name)
++			return -EINVAL;
++
++	set = kzalloc(sizeof(*set), GFP_KERNEL);
++	if (!set)
++		return -ENOMEM;
++
++	mutex_lock(&codec_lock);
++	for (i = 0; i < nr_codecs && !ret; i++)
++		if (codec_name_taken(layout_type, codecs[i]->name))
++			ret = -EEXIST;
++	if (!ret) {
++		set->layout_type = layout_type;
++		set->codecs = codecs;
++		set->nr_codecs = nr_codecs;
++		list_add_tail(&set->list, &codec_sets);
++	}
++	mutex_unlock(&codec_lock);
++
++	if (ret)
++		kfree(set);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(encoded_extent_codec_register);
++
++void encoded_extent_codec_unregister(u32 layout_type,
++		const struct encoded_extent_codec * const *codecs)
++{
++	struct encoded_extent_codec_set *set;
++
++	mutex_lock(&codec_lock);
++	list_for_each_entry(set, &codec_sets, list)
++		if (set->layout_type == layout_type && set->codecs == codecs) {
++			list_del(&set->list);
++			kfree(set);
++			break;
++		}
++	mutex_unlock(&codec_lock);
++}
++EXPORT_SYMBOL_GPL(encoded_extent_codec_unregister);
++
++/* A codec of @name registered for @layout_type, or NULL; a reference on it. */
++static const struct encoded_extent_codec *encoded_extent_codec_find(
++		u32 layout_type, const char *name)
++{
++	struct encoded_extent_codec_set *set;
++	const struct encoded_extent_codec *codec = NULL;
++	unsigned int i;
++
++	if (!name)
++		return NULL;
++
++	mutex_lock(&codec_lock);
++	for_each_codec_set(set, layout_type)
++		for (i = 0; i < set->nr_codecs; i++)
++			if (!strcmp(set->codecs[i]->name, name)) {
++				codec = set->codecs[i];
++				if (!try_module_get(codec->owner))
++					codec = NULL;
++				goto out;
++			}
++out:
++	mutex_unlock(&codec_lock);
++
++	return codec;
++}
++
++/*
++ * Asking for a codec's provider module.
++ *
++ * A codec name is the only thing that names the module implementing it, so an
++ * unresolved name is worth one request_module() and a second look. Two things
++ * have to be true before that happens. The name came off the wire, and it ends
++ * up in a module alias, so it is only used if every character could be part of
++ * one. And it is only asked for once in a while: a peer that names a hundred
++ * codecs, or a layout that keeps being fetched, must not turn into a hundred
++ * modprobes - so an attempt is remembered for a while, and forgotten as soon as
++ * the name resolves. A provider that loads later by any other route is found by
++ * the ordinary lookup, so nothing here is load-bearing for that case.
++ */
++#define ENCODED_EXTENT_CODEC_RETRY_INTERVAL	(30 * HZ)
++#define ENCODED_EXTENT_CODEC_ATTEMPTS		8
++
++struct encoded_extent_codec_attempt {
++	char		name[ENCODED_EXTENT_CODEC_NAME_MAX + 1];
++	unsigned long	when;
++};
++
++static DEFINE_MUTEX(codec_attempt_lock);
++static struct encoded_extent_codec_attempt
++	codec_attempts[ENCODED_EXTENT_CODEC_ATTEMPTS];
++static unsigned int codec_attempt_next;
++static atomic_long_t codec_load_attempts = ATOMIC_LONG_INIT(0);
++
++/* Could this name be part of a module alias? The wire says nothing about it. */
++static bool codec_name_loadable(const char *name)
++{
++	unsigned int i;
++
++	for (i = 0; name[i]; i++) {
++		unsigned char c = name[i];
++
++		if (!isalnum(c) && c != '-' && c != '_')
++			return false;
++	}
++
++	return i > 0 && i <= ENCODED_EXTENT_CODEC_NAME_MAX;
++}
++
++/* Remember this attempt; false if the same name was tried recently. */
++static bool codec_attempt_begin(const char *name)
++{
++	unsigned int i, slot = codec_attempt_next;
++	unsigned long now = jiffies;
++	bool retry = true;
++
++	mutex_lock(&codec_attempt_lock);
++	for (i = 0; i < ARRAY_SIZE(codec_attempts); i++) {
++		if (!strcmp(codec_attempts[i].name, name)) {
++			slot = i;
++			retry = time_after(now, codec_attempts[i].when +
++					ENCODED_EXTENT_CODEC_RETRY_INTERVAL);
++			break;
++		}
++	}
++
++	if (retry) {
++		strscpy(codec_attempts[slot].name, name,
++			sizeof(codec_attempts[slot].name));
++		codec_attempts[slot].when = now;
++		codec_attempt_next = (slot + 1) % ARRAY_SIZE(codec_attempts);
++	}
++	mutex_unlock(&codec_attempt_lock);
++
++	return retry;
++}
++
++/* The provider is there now: do not hold the name against a later request. */
++static void codec_attempt_forget(const char *name)
++{
++	unsigned int i;
++
++	mutex_lock(&codec_attempt_lock);
++	for (i = 0; i < ARRAY_SIZE(codec_attempts); i++)
++		if (!strcmp(codec_attempts[i].name, name))
++			codec_attempts[i].name[0] = '\0';
++	mutex_unlock(&codec_attempt_lock);
++}
++
++const struct encoded_extent_codec *encoded_extent_codec_find_or_load(
++		u32 layout_type, const char *name)
++{
++	const struct encoded_extent_codec *codec;
++
++	codec = encoded_extent_codec_find(layout_type, name);
++	if (codec || !name || !codec_name_loadable(name))
++		return codec;
++
++	if (codec_attempt_begin(name)) {
++		atomic_long_inc(&codec_load_attempts);
++		request_module(ENCODED_EXTENT_CODEC_MODULE_PREFIX "%s", name);
++		codec = encoded_extent_codec_find(layout_type, name);
++		if (codec)
++			codec_attempt_forget(name);
++	}
++
++	return codec;
++}
++EXPORT_SYMBOL_GPL(encoded_extent_codec_find_or_load);
++
++unsigned long encoded_extent_codec_load_attempts(void)
++{
++	return atomic_long_read(&codec_load_attempts);
++}
++EXPORT_SYMBOL_GPL(encoded_extent_codec_load_attempts);
++
++void encoded_extent_codec_put(const struct encoded_extent_codec *codec)
++{
++	if (codec)
++		module_put(codec->owner);
++}
++EXPORT_SYMBOL_GPL(encoded_extent_codec_put);
+diff --git a/fs/nfs/Kconfig b/fs/nfs/Kconfig
+index 07932ce92..31bd0b59a 100644
+--- a/fs/nfs/Kconfig
++++ b/fs/nfs/Kconfig
+@@ -130,6 +130,20 @@ config PNFS_FLEXFILE_LAYOUT
+ 	depends on NFS_V4_1
+ 	default NFS_V4
+ 
++config PNFS_BCACHEFS_LAYOUT
++	bool "pNFS client support for bcachefs encoded-extent layouts"
++	depends on NFS_V4
++	select ENCODED_EXTENT_CODECS
++	help
++	  This enables a pNFS layout driver whose data path moves bcachefs
++	  encoded extents - the compressed, checksummed blobs as they are on
++	  disk - and decodes them in the client, instead of the server
++	  decoding them and the client re-compressing writes. The layout type
++	  and the data service's protocol are bcachefs-specific; everything
++	  else about the mount is stock NFS.
++
++	  If unsure, say N.
++
+ config NFS_V4_1_IMPLEMENTATION_ID_DOMAIN
+ 	string "NFSv4.1 Implementation ID Domain"
+ 	depends on NFS_V4_1
+diff --git a/fs/nfs/Makefile b/fs/nfs/Makefile
+index 9fb2f2cac..f58d3f05b 100644
+--- a/fs/nfs/Makefile
++++ b/fs/nfs/Makefile
+@@ -36,3 +36,5 @@ nfsv4-$(CONFIG_NFS_V4_2)	+= nfs42proc.o nfs42xattr.o
+ obj-$(CONFIG_PNFS_FILE_LAYOUT) += filelayout/
+ obj-$(CONFIG_PNFS_BLOCK) += blocklayout/
+ obj-$(CONFIG_PNFS_FLEXFILE_LAYOUT) += flexfilelayout/
++nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_layout.o
++nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
+diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
+new file mode 100644
+index 000000000..05d0d3c2e
+--- /dev/null
++++ b/fs/nfs/bcachefs_ds.c
+@@ -0,0 +1,721 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * The client side of the encoded-extent data service.
++ *
++ * The layout body says where the data service is and how to name the file to
++ * it; this is the transport that asks it questions. It is deliberately the
++ * smallest RPC client that works: one rpc_clnt per mount, created lazily from
++ * the first layout's address, speaking the wire in
++ * linux/encoded_extent_ds.h, with no callback channel and no rpcbind (the
++ * port came in the layout).
++ *
++ * A failed call comes back as a negative errno - -ENODATA for "not stored
++ * encoded" - and the caller falls back to ordinary NFS I/O, which is always
++ * correct. There is no probe anywhere in this client: reading is the question,
++ * and -ENODATA is the answer.
++ */
++
++#include <linux/sunrpc/clnt.h>
++#include <linux/sunrpc/addr.h>
++#include <linux/vmalloc.h>
++#include <linux/encoded_extent.h>
++#include <linux/encoded_extent_ds.h>
++#include <linux/nfs_fs.h>
++
++#include "nfs4_fs.h"
++#include "pnfs.h"
++#include "internal.h"
++#include "bcachefs_ds.h"
++
++/* ------------------------------------------------------------ the program -- */
++
++struct bc_ds_read_args {
++	const struct bc_layout	*bl;
++	u64			offset;
++	u32			buf_size;
++	/* The caller's payload buffer, as pages: see bc_ds_enc_read(). */
++	struct page		**pages;
++};
++
++struct bc_ds_write_args {
++	const struct bc_layout	*bl;
++	u64			offset;
++	struct encoded_extent_desc desc;
++	/* Position of the codec in the layout's list, what the wire carries. */
++	u32			codec;
++	/* How durable this unit has to be; NFS's levels, see the wire header. */
++	u32			stable;
++	struct page		**pages;
++	u32			payload_len;
++};
++
++struct bc_ds_write_reply {
++	s32			status;
++	/* What the service reached, and the verifier a later commit must match. */
++	u32			committed;
++	u8			verf[ENCODED_DS_WRITEVERF];
++};
++
++struct bc_ds_read_reply {
++	s32			status;
++	struct encoded_extent_desc desc;
++	u32			codec;
++	/*
++	 * Where the encoded payload lands - the caller's buffer, which the
++	 * reply was received straight into - and what it can take. @payload_len
++	 * is what the reply announced.
++	 */
++	void			*payload;
++	size_t			capacity;
++	size_t			payload_len;
++};
++
++/*
++ * Argument and reply sizes in XDR words - all of these are words, including
++ * rpc_prepare_reply_pages()'s hdrsize, which is shifted into bytes inside. The
++ * address is one opaque, and the reply is a status, a descriptor, and - for
++ * READ - a payload that does not go through the reply buffer at all.
++ * BC_DS_READ_HEAD_WORDS is both what call_allocate() sizes that buffer from
++ * (p_replen) and what the receive is told is in front of the pages, so the two
++ * have to be the same number or the payload lands in the wrong place.
++ */
++#define BC_DS_ADDR_WORDS	(1 + XDR_QUADLEN(ENCODED_DS_MAX_FH))
++#define BC_DS_READ_HEAD_WORDS	(1 + 8 + 1)
++
++static void
++bc_ds_encode_addr(struct xdr_stream *xdr, const struct bc_layout *bl)
++{
++	xdr_stream_encode_opaque(xdr, bl->fh, bl->fh_len);
++}
++
++static void
++bc_ds_encode_desc(struct xdr_stream *xdr, const struct encoded_extent_desc *desc,
++		  u32 codec)
++{
++	xdr_stream_encode_u64(xdr, desc->unit_offset);
++	xdr_stream_encode_u64(xdr, desc->unit_len);
++	xdr_stream_encode_u64(xdr, desc->unencoded_offset);
++	xdr_stream_encode_u32(xdr, codec);
++	xdr_stream_encode_u32(xdr, desc->encrypted ? 1 : 0);
++}
++
++static int
++bc_ds_decode_desc(struct xdr_stream *xdr, struct encoded_extent_desc *desc,
++		  u32 *codec)
++{
++	u32 encrypted;
++
++	if (xdr_stream_decode_u64(xdr, &desc->unit_offset) < 0)
++		return -EIO;
++	if (xdr_stream_decode_u64(xdr, &desc->unit_len) < 0)
++		return -EIO;
++	if (xdr_stream_decode_u64(xdr, &desc->unencoded_offset) < 0)
++		return -EIO;
++	if (xdr_stream_decode_u32(xdr, codec) < 0)
++		return -EIO;
++	if (xdr_stream_decode_u32(xdr, &encrypted) < 0)
++		return -EIO;
++	desc->encrypted = encrypted != 0;
++	return 0;
++}
++
++static void
++bc_ds_enc_write(struct rpc_rqst *req, struct xdr_stream *xdr, const void *data)
++{
++	const struct bc_ds_write_args *args = data;
++
++	bc_ds_encode_addr(xdr, args->bl);
++	xdr_stream_encode_u64(xdr, args->offset);
++	bc_ds_encode_desc(xdr, &args->desc, args->codec);
++	xdr_stream_encode_u32(xdr, args->stable);
++	/*
++	 * The payload is a whole encoded unit, which does not fit in the
++	 * request head, so it goes in pages: the same shape as an NFSv3 WRITE
++	 * argument (length, then the pages).
++	 */
++	if (xdr_stream_encode_u32(xdr, args->payload_len) != XDR_UNIT)
++		return;
++	xdr_write_pages(xdr, args->pages, 0, args->payload_len);
++}
++
++static int
++bc_ds_dec_write(struct rpc_rqst *req, struct xdr_stream *xdr, void *data)
++{
++	struct bc_ds_write_reply *reply = data;
++	u32 status;
++
++	if (xdr_stream_decode_u32(xdr, &status) < 0)
++		return -EIO;
++	if (xdr_stream_decode_u32(xdr, &reply->committed) < 0)
++		return -EIO;
++	if (xdr_stream_decode_opaque_fixed(xdr, reply->verf,
++					   ENCODED_DS_WRITEVERF) < 0)
++		return -EIO;
++	reply->status = (s32)status;
++	return 0;
++}
++
++static void
++bc_ds_enc_read(struct rpc_rqst *req, struct xdr_stream *xdr, const void *data)
++{
++	const struct bc_ds_read_args *args = data;
++
++	bc_ds_encode_addr(xdr, args->bl);
++	xdr_stream_encode_u64(xdr, args->offset);
++	xdr_stream_encode_u32(xdr, args->buf_size);
++	/*
++	 * A whole encoded unit is more than a reply head's buffer will hold, and
++	 * the unit may be up to the wire's 2 MiB, so the receive goes straight
++	 * into the caller's pages - the same shape as an NFS READ reply, and the
++	 * reason p_replen covers only the head. @buf_size is both what the
++	 * service is asked for and what those pages can take.
++	 */
++	rpc_prepare_reply_pages(req, args->pages, 0, args->buf_size,
++				BC_DS_READ_HEAD_WORDS);
++}
++
++static int
++bc_ds_dec_read(struct rpc_rqst *req, struct xdr_stream *xdr, void *data)
++{
++	struct bc_ds_read_reply *reply = data;
++	u32 status, len;
++
++	if (xdr_stream_decode_u32(xdr, &status) < 0)
++		return -EIO;
++	if (bc_ds_decode_desc(xdr, &reply->desc, &reply->codec) < 0)
++		return -EIO;
++	reply->status = (s32)status;
++
++	if (reply->status)
++		return 0;
++
++	/*
++	 * The payload is already in the caller's buffer - the reply's pages are
++	 * its pages - so there is nothing to copy out, and what is left is to
++	 * check the length the head announced: against the buffer those pages
++	 * are, and against the reply that actually arrived, since the pages were
++	 * attached for the whole buffer and a short reply would otherwise be
++	 * read as if the bytes after it were data.
++	 */
++	if (xdr_stream_decode_u32(xdr, &len) < 0)
++		return -EIO;
++	if (len > reply->capacity)
++		return -E2BIG;
++	if (xdr_stream_pos(xdr) + len > xdr->buf->len)
++		return -EIO;
++
++	reply->payload_len = len;
++	return 0;
++}
++
++static const struct rpc_procinfo bc_ds_procs[] = {
++	[ENCODED_DS_WRITE] = {
++		.p_proc		= ENCODED_DS_WRITE,
++		.p_encode	= bc_ds_enc_write,
++		.p_decode	= bc_ds_dec_write,
++		.p_arglen	= BC_DS_ADDR_WORDS + 13,
++		.p_replen	= 2 + ENCODED_DS_WRITEVERF / XDR_UNIT,
++		.p_statidx	= ENCODED_DS_WRITE,
++		.p_name		= "WRITE",
++	},
++	[ENCODED_DS_READ] = {
++		.p_proc		= ENCODED_DS_READ,
++		.p_encode	= bc_ds_enc_read,
++		.p_decode	= bc_ds_dec_read,
++		.p_arglen	= BC_DS_ADDR_WORDS + 4,
++		.p_replen	= BC_DS_READ_HEAD_WORDS,
++		.p_statidx	= ENCODED_DS_READ,
++		.p_name		= "READ",
++	},
++	[ENCODED_DS_NULL] = {
++		.p_proc		= ENCODED_DS_NULL,
++		.p_statidx	= ENCODED_DS_NULL,
++		.p_name		= "NULL",
++	},
++	/*
++	 * PROBE exists for the userspace client (dsprobe.c) and for the service's
++	 * own checks: it asks whether a range would be served encoded, which is a
++	 * question the kernel client never has to ask - it just reads, and takes
++	 * -ENODATA for an answer. The slot stays because the table is indexed by
++	 * procedure number, with nothing in it to encode or decode.
++	 */
++	[ENCODED_DS_PROBE] = {
++		.p_proc		= ENCODED_DS_PROBE,
++		.p_statidx	= ENCODED_DS_PROBE,
++		.p_name		= "PROBE",
++	},
++};
++
++/*
++ * call_start() bumps version->counts[idx] and cl_stats->rpccnt on every call,
++ * without checking either for NULL, so both have to exist.
++ */
++static unsigned int bc_ds_counts[ENCODED_DS_NR_PROCS];
++
++static const struct rpc_version bc_ds_version = {
++	.number		= ENCODED_DS_VERSION,
++	.nrprocs	= ARRAY_SIZE(bc_ds_procs),
++	.procs		= bc_ds_procs,
++	.counts		= bc_ds_counts,
++};
++
++static const struct rpc_version *bc_ds_versions[] = {
++	[ENCODED_DS_VERSION] = &bc_ds_version,
++};
++
++static struct rpc_stat bc_ds_stats;
++
++static const struct rpc_program bc_ds_program = {
++	.name		= "encoded_ds",
++	.number		= ENCODED_DS_PROGRAM,
++	.nrvers		= ARRAY_SIZE(bc_ds_versions),
++	.version	= bc_ds_versions,
++	.stats		= &bc_ds_stats,
++};
++
++/* ------------------------------------------------------------- the client -- */
++
++struct bc_clnt_free {
++	struct work_struct	work;
++	struct rpc_clnt		*clnt;
++};
++
++static void bc_clnt_free_work(struct work_struct *work)
++{
++	struct bc_clnt_free *f = container_of(work, struct bc_clnt_free, work);
++
++	rpc_shutdown_client(f->clnt);
++	kfree(f);
++}
++
++/*
++ * RPC tasks do not hold a reference on their client, and rpc_shutdown_client()
++ * only drops the caller's, so a client has to be handed to this work item while
++ * the caller's reference is still held: the tasks in flight hold their own
++ * (bc_ds_clnt_get()) and the shutdown waits for them before the client is freed.
++ *
++ * The allocation is atomic because one caller, bc_free_layout_hdr(), runs under
++ * the inode lock; an allocation that fails leaks the client rather than freeing
++ * it from a context that cannot sleep, which is the right way round.
++ */
++void bc_ds_clnt_shutdown_async(struct rpc_clnt *clnt)
++{
++	struct bc_clnt_free *f = kmalloc(sizeof(*f), GFP_ATOMIC);
++
++	if (!f)
++		return;
++
++	INIT_WORK(&f->work, bc_clnt_free_work);
++	f->clnt = clnt;
++	schedule_work(&f->work);
++}
++
++/*
++ * Condemn the header's client so the next request builds a new one, which is a
++ * new connection.
++ *
++ * A soft RPC timeout gives up on the call without forcing the transport down
++ * (rpc_check_timeout(), net/sunrpc/clnt.c), and this driver keeps one client
++ * per layout header for as long as the layout lives. So a connection that goes
++ * away without a reset being seen - which is what a service restart, or any
++ * half-open TCP connection, leaves behind - costs one timeout for every unit
++ * for the rest of the layout's life: nothing ever reconnects, because sunrpc
++ * still believes the transport is connected, and the layout never recovers.
++ * That is the "the service answers, but this mount has stopped reading through
++ * it" state the perf section documents.
++ *
++ * Dropping the client here costs the timeouts already paid and nothing else:
++ * bc_ds_mark_down() sets a window when it calls this, so no new request uses
++ * the service until the window has passed, and the request that failed has
++ * already been given back to the MDS.
++ *
++ * This is reached from an RPC completion, so the client goes to a work item
++ * rather than being shut down here - see bc_ds_clnt_shutdown_async().
++ */
++void bc_ds_clnt_drop(struct bc_layout_hdr *blh)
++{
++	struct rpc_clnt *clnt;
++
++	mutex_lock(&blh->clnt_mutex);
++	clnt = blh->clnt;
++	blh->clnt = NULL;
++	mutex_unlock(&blh->clnt_mutex);
++
++	if (clnt)
++		bc_ds_clnt_shutdown_async(clnt);
++}
++
++static struct rpc_clnt *
++bc_ds_clnt_get(struct bc_layout_hdr *blh, const struct bc_layout *bl)
++{
++	struct nfs_client *clp = NFS_SERVER(blh->plh.plh_inode)->nfs_client;
++	struct rpc_create_args args = { };
++	struct sockaddr_storage ss;
++	struct rpc_timeout timeout = {
++		.to_initval	= 15 * HZ,
++		.to_maxval	= 15 * HZ,
++		.to_retries	= 1,
++	};
++	struct rpc_clnt *clnt;
++	int salen;
++
++	mutex_lock(&blh->clnt_mutex);
++	clnt = blh->clnt;
++	if (clnt)
++		goto out;
++
++	/*
++	 * A client is not built for a service that is inside the down window:
++	 * the request that got here was already in flight when the timeout
++	 * happened, and the answer for it is the MDS. The window is what makes
++	 * the recovery bounded - one client, and one connection, per timeout;
++	 * the caller sees this as the error it would have seen 15s later.
++	 */
++	if (bc_ds_is_down(blh)) {
++		clnt = ERR_PTR(-ETIMEDOUT);
++		goto out;
++	}
++
++	salen = rpc_pton(&init_net, bl->addr, bl->addr_len,
++			 (struct sockaddr *)&ss, sizeof(ss));
++	if (!salen) {
++		clnt = ERR_PTR(-EINVAL);
++		goto out;
++	}
++	switch (ss.ss_family) {
++	case AF_INET:
++		((struct sockaddr_in *)&ss)->sin_port = htons(bl->port);
++		break;
++#if IS_ENABLED(CONFIG_IPV6)
++	case AF_INET6:
++		((struct sockaddr_in6 *)&ss)->sin6_port = htons(bl->port);
++		break;
++#endif
++	default:
++		clnt = ERR_PTR(-EAFNOSUPPORT);
++		goto out;
++	}
++
++	args.net	= clp->cl_net;
++	args.protocol	= IPPROTO_TCP;
++	args.address	= (struct sockaddr *)&ss;
++	args.addrsize	= salen;
++	args.timeout	= &timeout;
++	args.servername	= "encoded_ds";
++	args.nodename	= clp->cl_rpcclient->cl_nodename;
++	args.program	= &bc_ds_program;
++	args.version	= ENCODED_DS_VERSION;
++	/*
++	 * Authenticate as the mount does, not anonymously. The data service runs
++	 * nfsd's own access checks, so it has to see the same principal the MDS
++	 * does; AUTH_NULL makes every request anonymous and is refused outright
++	 * by any export with an explicit sec=. The layout is only offered for
++	 * AUTH_UNIX mounts, so this is the mount's AUTH_UNIX credential. (GSS is
++	 * a separate piece of work - see doc/security.md in the product tree.)
++	 */
++	args.authflavor	= clp->cl_rpcclient->cl_auth->au_flavor;
++	args.cred	= clp->cl_rpcclient->cl_cred;
++	args.flags	= RPC_CLNT_CREATE_NOPING;
++
++	clnt = rpc_create(&args);
++	if (IS_ERR(clnt))
++		goto out;
++	blh->clnt = clnt;
++out:
++	/*
++	 * The reference returned here is the call's, not the header's, and it is
++	 * taken under the mutex that bc_ds_clnt_drop() clears the header's under.
++	 * That way a call cannot be set up on a client that has just been
++	 * condemned, and the client cannot be freed - by a drop, or by the layout
++	 * going away - while the call is being built or while its reply is still
++	 * arriving. The completion releases it: rpc_release_client() in
++	 * ->rpc_release.
++	 */
++	if (!IS_ERR(clnt))
++		rpc_hold_client(clnt);
++	mutex_unlock(&blh->clnt_mutex);
++	return clnt;
++}
++
++/* --------------------------------------------------------- asynchronous -- */
++
++struct bc_ds_read_call {
++	struct rpc_message	msg;
++	struct bc_ds_read_args	args;
++	struct bc_ds_read_reply	reply;
++	/* The reply's pages, freed in ->rpc_release. */
++	struct page		**pages;
++	unsigned int		npages;
++	/* The call's reference on the client; released in ->rpc_release. */
++	struct rpc_clnt		*clnt;
++	bc_ds_done_fn		done;
++	void			*ctx;
++};
++
++/*
++ * The pages of a buffer a reply is received into. rpc_prepare_reply_pages()
++ * takes pages, not an address, which is why the buffer has to start on a page
++ * boundary: payload byte 0 lands at offset 0 of the first page.
++ *
++ * kvmalloc() may have returned either allocator's memory and their page lookups
++ * differ. A page that cannot be found means the buffer is not what the caller
++ * thinks it is, so the call is refused rather than received into.
++ */
++static struct page **bc_ds_reply_pages(void *buf, size_t size,
++				       unsigned int *nr_pages)
++{
++	unsigned int i, n = DIV_ROUND_UP(size, PAGE_SIZE);
++	struct page **pages;
++
++	pages = kvmalloc_array(n, sizeof(*pages), GFP_NOFS);
++	if (!pages)
++		return NULL;
++
++	for (i = 0; i < n; i++) {
++		void *p = buf + i * PAGE_SIZE;
++
++		pages[i] = is_vmalloc_addr(p) ? vmalloc_to_page(p)
++					      : virt_to_page(p);
++		if (!pages[i]) {
++			kvfree(pages);
++			return NULL;
++		}
++	}
++
++	*nr_pages = n;
++	return pages;
++}
++
++static void
++bc_ds_read_call_done(struct rpc_task *task, void *calldata)
++{
++	struct bc_ds_read_call *call = calldata;
++	int status = task->tk_status;
++
++	if (!status && call->reply.status)
++		status = call->reply.status;
++	if (!status && !call->reply.payload_len)
++		status = -EIO;
++	/*
++	 * A soft RPC task that runs out of retransmits reports -EIO with
++	 * -ETIMEDOUT as its RPC status (net/sunrpc/clnt.c, rpc_check_timeout()).
++	 * The layout layer decides whether to keep using the service from this
++	 * one value, so the timeout has to survive the trip up: see
++	 * bc_ds_mark_down().
++	 */
++	if (task->tk_rpc_status == -ETIMEDOUT)
++		status = -ETIMEDOUT;
++
++	call->done(call->ctx, status, call->reply.codec, &call->reply.desc,
++		   call->reply.payload, call->reply.payload_len);
++}
++
++static void
++bc_ds_read_call_release(void *calldata)
++{
++	struct bc_ds_read_call *call = calldata;
++
++	kvfree(call->pages);
++	rpc_release_client(call->clnt);
++	kfree(call);
++}
++
++static const struct rpc_call_ops bc_ds_read_call_ops = {
++	.rpc_call_done	= bc_ds_read_call_done,
++	.rpc_release	= bc_ds_read_call_release,
++};
++
++int
++bc_ds_read_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		 u64 offset, void *payload, size_t capacity,
++		 bc_ds_done_fn done, void *ctx)
++{
++	struct bc_ds_read_call *call;
++	struct rpc_clnt *clnt;
++	int ret;
++
++	call = kzalloc(sizeof(*call), GFP_NOFS);
++	if (!call)
++		return -ENOMEM;
++
++	clnt = bc_ds_clnt_get(blh, bl);
++	if (IS_ERR(clnt)) {
++		ret = PTR_ERR(clnt);
++		kfree(call);
++		return ret;
++	}
++
++	/*
++	 * The reply is received into the caller's own buffer: hand its pages to
++	 * the reply instead of letting the payload go through the reply head's
++	 * buffer, which is what bounds a unit by the wire rather than by that
++	 * buffer's size. Nothing is copied, in either direction.
++	 */
++	call->pages = bc_ds_reply_pages(payload, capacity, &call->npages);
++	if (!call->pages) {
++		rpc_release_client(clnt);
++		kfree(call);
++		return -ENOMEM;
++	}
++
++	call->args.bl		= bl;
++	call->args.offset	= offset;
++	call->args.buf_size	= capacity;
++	call->args.pages	= call->pages;
++	call->reply.payload	= payload;
++	call->reply.capacity	= capacity;
++	call->clnt		= clnt;
++	call->done		= done;
++	call->ctx		= ctx;
++	call->msg.rpc_proc	= &clnt->cl_procinfo[ENCODED_DS_READ];
++	call->msg.rpc_argp	= &call->args;
++	call->msg.rpc_resp	= &call->reply;
++
++	/*
++	 * A call that could not be started - no memory for the task, or a client
++	 * rpc_run_task() refuses outright - has to be reported, because nothing
++	 * else will ever run: the completion is what carries the status, and a
++	 * call that has no task has no completion. Returning here is what turns
++	 * that into the fallback the caller already knows how to do.
++	 */
++	ret = rpc_call_async(clnt, &call->msg, RPC_TASK_SOFT,
++			     &bc_ds_read_call_ops, call);
++	if (ret) {
++		kvfree(call->pages);
++		rpc_release_client(clnt);
++		kfree(call);
++	}
++	return ret;
++}
++
++struct bc_ds_write_call {
++	struct rpc_message	msg;
++	struct bc_ds_write_args	args;
++	struct bc_ds_write_reply reply;
++	struct page		**pages;
++	unsigned int		npages;
++	/* The call's reference on the client; released in ->rpc_release. */
++	struct rpc_clnt		*clnt;
++	void			(*done)(void *ctx, int status, u32 committed,
++					const u8 *verf);
++	void			*ctx;
++};
++
++static void
++bc_ds_write_call_done(struct rpc_task *task, void *calldata)
++{
++	struct bc_ds_write_call *call = calldata;
++	int status = task->tk_status;
++
++	if (!status && call->reply.status)
++		status = call->reply.status;
++	/* As on the read side: a timeout keeps its own name. */
++	if (task->tk_rpc_status == -ETIMEDOUT)
++		status = -ETIMEDOUT;
++
++	call->done(call->ctx, status, call->reply.committed, call->reply.verf);
++}
++
++static void
++bc_ds_write_call_release(void *calldata)
++{
++	struct bc_ds_write_call *call = calldata;
++	unsigned int i;
++
++	for (i = 0; i < call->npages; i++)
++		__free_page(call->pages[i]);
++	kfree(call->pages);
++	rpc_release_client(call->clnt);
++	kfree(call);
++}
++
++static const struct rpc_call_ops bc_ds_write_call_ops = {
++	.rpc_call_done	= bc_ds_write_call_done,
++	.rpc_release	= bc_ds_write_call_release,
++};
++
++int
++bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		  u64 offset, const void *payload, size_t payload_len,
++		  const struct encoded_extent_desc *desc, u32 codec,
++		  u32 stable,
++		  void (*done)(void *ctx, int status, u32 committed,
++			       const u8 *verf),
++		  void *ctx)
++{
++	struct bc_ds_write_call *call;
++	struct rpc_clnt *clnt;
++	unsigned int i, allocated = 0;
++	size_t sent = 0;
++	int ret;
++
++	call = kzalloc(sizeof(*call), GFP_NOFS);
++	if (!call)
++		return -ENOMEM;
++
++	/*
++	 * The request head cannot carry a unit, so the payload goes in pages,
++	 * and they have to outlive the call: they are freed in ->rpc_release.
++	 */
++	call->npages = DIV_ROUND_UP(payload_len, PAGE_SIZE);
++	call->pages = kcalloc(call->npages, sizeof(*call->pages), GFP_NOFS);
++	if (!call->pages) {
++		kfree(call);
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < call->npages; i++) {
++		size_t n = min_t(size_t, payload_len - sent, PAGE_SIZE);
++		void *kaddr;
++
++		call->pages[i] = alloc_page(GFP_NOFS);
++		if (!call->pages[i]) {
++			ret = -ENOMEM;
++			goto out_free;
++		}
++		allocated++;
++		kaddr = kmap_local_page(call->pages[i]);
++		memcpy(kaddr, payload + sent, n);
++		kunmap_local(kaddr);
++		sent += n;
++	}
++
++	clnt = bc_ds_clnt_get(blh, bl);
++	if (IS_ERR(clnt)) {
++		ret = PTR_ERR(clnt);
++		goto out_free;
++	}
++
++	call->args.bl		= bl;
++	call->args.offset	= offset;
++	call->args.desc		= *desc;
++	call->args.codec	= codec;
++	call->args.stable	= stable;
++	call->args.payload_len	= payload_len;
++	call->args.pages	= call->pages;
++	call->clnt		= clnt;
++	call->done		= done;
++	call->ctx		= ctx;
++	call->msg.rpc_proc	= &clnt->cl_procinfo[ENCODED_DS_WRITE];
++	call->msg.rpc_argp	= &call->args;
++	call->msg.rpc_resp	= &call->reply;
++
++	/* As on the read side: a call that never started has no completion. */
++	ret = rpc_call_async(clnt, &call->msg, RPC_TASK_SOFT,
++			     &bc_ds_write_call_ops, call);
++	if (ret) {
++		for (i = 0; i < call->npages; i++)
++			__free_page(call->pages[i]);
++		kfree(call->pages);
++		rpc_release_client(clnt);
++		kfree(call);
++	}
++	return ret;
++
++out_free:
++	for (i = 0; i < allocated; i++)
++		__free_page(call->pages[i]);
++	kfree(call->pages);
++	kfree(call);
++	return ret;
++}
+diff --git a/fs/nfs/bcachefs_ds.h b/fs/nfs/bcachefs_ds.h
+new file mode 100644
+index 000000000..76cd1808f
+--- /dev/null
++++ b/fs/nfs/bcachefs_ds.h
+@@ -0,0 +1,168 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Shared state for the pNFS encoded-extent client: the layout driver
++ * (bcachefs_layout.c) and the data-service client (bcachefs_ds.c).
++ *
++ * The layout body carries where the data service is and how to name the file to
++ * it; everything the driver learns from the server lands here. The data service
++ * client hangs an rpc_clnt off the layout header, so one mount talks to one
++ * data service over one transport.
++ */
++#ifndef _NFS_BCACHEFS_DS_H
++#define _NFS_BCACHEFS_DS_H
++
++#include <linux/encoded_extent.h>
++#include <linux/encoded_extent_ds.h>
++#include <linux/nfs4.h>
++
++/*
++ * The layout body's version. It is checked rather than assumed, so a peer built
++ * against a different body shape falls back to MDS I/O instead of misparsing:
++ * bump it whenever what the body carries changes.
++ */
++#define BC_LAYOUT_VERSION	4
++
++#define BC_ADDR_MAX		64
++
++struct rpc_clnt;
++
++struct bc_layout_hdr {
++	struct pnfs_layout_hdr	plh;
++	struct mutex		clnt_mutex;
++	struct rpc_clnt		*clnt;
++	/*
++	 * When a call to the data service times out, the mount stays off it
++	 * until this time passes. A timeout costs the client 15-30s and a request
++	 * is one call per unit, so without this a service that goes away turns
++	 * every read into a string of timeouts instead of the fallback to the MDS
++	 * the design promises - which is what the failure-mode test found before
++	 * this existed. Only a timeout sets it: a refusal the service sent back
++	 * says the service is answering. See bc_ds_mark_down().
++	 */
++	unsigned long		ds_down_until;
++};
++
++/*
++ * What the layout body carried: where the data service is, and the file handle
++ * that names the file to it. The handle is the MDS's, and the service resolves
++ * it with nfsd's own verification, so the export comes from the handle and the
++ * presenting client rather than from anything the layout says. The block size,
++ * encoded extent ceiling and codec set come from the data service itself, so
++ * they cannot go stale against its own view - here they arrived in the layout,
++ * because the MDS is the data service.
++ */
++struct bc_layout {
++	struct pnfs_layout_segment lseg;
++
++	char			addr[BC_ADDR_MAX];
++	u32			addr_len;
++	u32			port;
++
++	u32			fh_len;
++	u8			fh[ENCODED_DS_MAX_FH];
++
++	/*
++	 * The encoded extent ceiling and alignment the server's filesystem
++	 * applies, per inode, so they belong to the segment rather than the
++	 * mount.
++	 */
++	u32			unit_max;
++	u32			unit_align;
++
++	/*
++	 * The codecs the export may serve this file with, resolved from the
++	 * names the layout carried. A descriptor names a codec by position in
++	 * this list, so a position with no resolution is a range this client
++	 * cannot decode and does not serve encoded. @write_codec is the one the
++	 * client compresses with - the first it can encode, since which codec
++	 * to write with is the client's choice as long as the data service
++	 * accepts it.
++	 */
++	const struct encoded_extent_codec *codec[ENCODED_DS_MAX_CODECS];
++	u32			nr_codecs;
++	u32			write_codec;
++
++	/*
++	 * The names as the layout carried them, next to the resolutions above.
++	 * Nothing on the data path reads these - they are what the server said
++	 * it may serve the file with, which is the only place that is visible,
++	 * and the tests check which filesystem's codecs a file was offered.
++	 */
++	char			codec_name[ENCODED_DS_MAX_CODECS]
++					[ENCODED_DS_MAX_CODEC_NAME + 1];
++};
++
++typedef void (*bc_ds_done_fn)(void *ctx, int status, u32 codec,
++			      const struct encoded_extent_desc *desc,
++			      void *payload, size_t payload_len);
++
++/*
++ * Whether the service is inside the window a timeout set. Single requests check
++ * this before they start one (bc_read_pagelist(), bc_write_pagelist()), and so
++ * does bc_ds_clnt_get(): a request that reaches the client with the window set
++ * is one that was already in flight when the timeout happened, and paying
++ * another timeout for it - or opening another connection to a service that is
++ * not answering - is what the window exists to avoid.
++ */
++bool bc_ds_is_down(struct bc_layout_hdr *blh);
++
++/*
++ * Release the header's reference on its data-service client, from a work item:
++ * rpc_shutdown_client() sleeps, and it has to see the caller's own RPC task
++ * finish, so it can never be called from inside one. Used both when the header
++ * goes away (bc_free_layout_hdr()) and when a client is condemned
++ * (bc_ds_clnt_drop()).
++ */
++void bc_ds_clnt_shutdown_async(struct rpc_clnt *clnt);
++
++/*
++ * Throw away the header's data-service client, so that the next request builds
++ * a new one. Called when a call times out: see the comment on the definition
++ * for why the client is what has to go, and why this is safe to call from an
++ * RPC completion.
++ */
++void bc_ds_clnt_drop(struct bc_layout_hdr *blh);
++
++/*
++ * Fetch the encoded unit covering @offset into @payload (capacity @capacity),
++ * asynchronously; @done runs in the RPC task context with the unit's descriptor,
++ * the position of its codec in the layout's list, and the payload, and the
++ * caller owns the buffer throughout. A negative status is the data service's own
++ * errno (-ENODATA meaning "not stored encoded"), or the transport's.
++ *
++ * The payload is received straight into @payload: its pages are what the reply
++ * is received into (rpc_prepare_reply_pages(), the way an NFS READ reply lands
++ * in the pages it is reading into), so a unit is bounded by ENCODED_DS_MAX_PAYLOAD
++ * and by what the caller allocated, not by the size of a reply head's buffer,
++ * and nothing is copied on the way. Two things follow for the caller:
++ *
++ *   - @payload must start on a page boundary, because byte 0 of the payload is
++ *     received at offset 0 of the first page;
++ *   - @capacity is both what the service is asked to send and the most this
++ *     buffer will take; the service clamps it to the unit its file has, so a
++ *     unit that does not fit is refused by the backend rather than truncated.
++ *
++ * Asynchronous because the data path has to be: a synchronous call inside
++ * read_pagelist serialises every unit behind a round trip, and nothing else in
++ * the pgio can proceed.
++ */
++int bc_ds_read_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		     u64 offset, void *payload, size_t capacity,
++		     bc_ds_done_fn done, void *ctx);
++
++/*
++ * Store one encoded unit, asynchronously; @codec is the position of the codec it
++ * was encoded with, @stable is how durable the caller needs it to be (see
++ * enum encoded_extent_stable), and @done gets the service's status together
++ * with the level it actually reached and its write verifier - the value a later
++ * commit of this unit will be checked against, which the caller must keep.
++ */
++int bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		      u64 offset, const void *payload, size_t payload_len,
++		      const struct encoded_extent_desc *desc, u32 codec,
++		      u32 stable,
++		      void (*done)(void *ctx, int status, u32 committed,
++				   const u8 *verf),
++		      void *ctx);
++
++#endif /* _NFS_BCACHEFS_DS_H */
+diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
+new file mode 100644
+index 000000000..ed61f77f2
+--- /dev/null
++++ b/fs/nfs/bcachefs_layout.c
+@@ -0,0 +1,1177 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * pNFS layout driver for bcachefs encoded extents: the client side.
++ *
++ * The layout type says: this file's data is served as bcachefs encoded extents
++ * by a data service, not as plaintext NFS READ/WRITE. Page cache, readahead,
++ * writeback, mmap, dcache revalidation, attribute coherence, locking and
++ * recovery are all stock NFS - the layout driver only owns the data path.
++ *
++ * Where the encoded data path goes, and what the surrounding contract is:
++ *
++ *   ->pg_read_ops / ->pg_write_ops
++ *		coalescing and alignment. A request that does not line up with
++ *		an encoded extent is reset to the MDS with
++ *		nfs_pageio_reset_read_mds()/write_mds(), which is exactly what
++ *		blocklayout does with unaligned requests, and is also the
++ *		fallback when the data service declines a range.
++ *
++ *   ->read_pagelist
++ *		the encoded read. hdr->args.pages/page_array are the pages to
++ *		fill and hdr->args.offset/count the range; the driver may do
++ *		arbitrary I/O from here - blocklayout issues bios - and
++ *		completes through pnfs_ld_read_done(). Returning
++ *		PNFS_NOT_ATTEMPTED sends the request through the MDS instead,
++ *		which is both this skeleton's behaviour and the correct
++ *		fallback for a hole, an inline or encrypted extent, or a
++ *		refused encoded put.
++ *
++ *   ->write_pagelist
++ *		the encoded write: compress the dirty pages client-side with the
++ *		codec the layout negotiated, send the encoded extent, complete
++ *		through pnfs_ld_write_done(). Same fallback.
++ *
++ * What that buys over a filesystem of our own: the hard parts of the client
++ * are NFS's, and the only new code is the data path - which is also the only
++ * part that is genuinely new.
++ */
++
++#include <linux/module.h>
++#include <linux/debugfs.h>
++#include <linux/jiffies.h>
++#include <linux/nfs_fs.h>
++#include <linux/nfs4.h>
++#include <linux/encoded_extent_ds.h>
++
++#include "nfs4_fs.h"
++#include "pnfs.h"
++#include "internal.h"
++#include "bcachefs_ds.h"
++
++/*
++ * Counters, in debugfs, of the points where this driver either steps in or
++ * declines to. A layout driver has no other user-visible surface: whether the
++ * client negotiated our layout type, whether the data path was reached and how
++ * often it fell back are otherwise only visible in dprintk output. Tests and
++ * bug reports both need them, and so does measuring the fallback rate in the
++ * field, which is the number that says whether the data path is earning its
++ * keep.
++ */
++static struct dentry *bc_debugfs_dir;
++static atomic_t bc_stat_lseg_alloc = ATOMIC_INIT(0);
++static atomic_t bc_stat_lseg_alloc_err = ATOMIC_INIT(0);
++static atomic_t bc_stat_read_pagelist = ATOMIC_INIT(0);
++static atomic_t bc_stat_write_pagelist = ATOMIC_INIT(0);
++static atomic_t bc_stat_unit_max = ATOMIC_INIT(0);
++static atomic_t bc_stat_unit_align = ATOMIC_INIT(0);
++static atomic_t bc_stat_layout_codecs = ATOMIC_INIT(0);
++static atomic_t bc_stat_codec_missing = ATOMIC_INIT(0);
++/* Provider modules asked for, in the core's counter, mirrored for the tests. */
++static atomic_t bc_stat_codec_requests = ATOMIC_INIT(0);
++static atomic_t bc_stat_write_codec = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_read_not_encoded = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_read_ok = ATOMIC_INIT(0);
++/* Negative: the failing call's errno. Positive: a decoded length mismatch. */
++static atomic_t bc_stat_ds_last_read_err = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_last_unit_len = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_last_payload_len = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_read_err = ATOMIC_INIT(0);
++/*
++ * Encoded bytes the service handed over, and the part of them the request had no
++ * use for. The service answers with the whole unit an offset falls in, so a
++ * request smaller than a unit asks for that unit again for every request inside
++ * it and throws the rest away - which is what the pgio sizing exists to stop,
++ * and what these two count. 64-bit and lock-guarded, like the service's own
++ * counters: these run to megabytes.
++ */
++static u64 bc_ds_read_bytes, bc_ds_read_wasted;
++static DEFINE_SPINLOCK(bc_read_bytes_lock);
++static atomic_t bc_stat_ds_write_ok = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_write_err = ATOMIC_INIT(0);
++/* Times the mount decided the service was not answering, and requests that then
++ * went straight to the MDS without paying a timeout first. */
++static atomic_t bc_stat_ds_down = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_down_skips = ATOMIC_INIT(0);
++
++/*
++ * How long to stay off a data service that is not answering. Long enough that
++ * the per-request fallback is the MDS rather than a timeout, short enough that
++ * the service coming back is noticed without anything having to tell us.
++ */
++#define BC_DS_DOWN_SECS		30
++
++/*
++ * Whether the service is inside the window bc_ds_mark_down() set. Single
++ * requests check this before they start one, and so does bc_ds_clnt_get():
++ * a request that arrives at the client while the window is set is one that was
++ * already in flight when the timeout happened, and the promise is that it goes
++ * to the MDS rather than paying a timeout the service has already been given.
++ */
++bool bc_ds_is_down(struct bc_layout_hdr *blh)
++{
++	return time_before(jiffies, READ_ONCE(blh->ds_down_until));
++}
++
++static void bc_ds_mark_down(struct bc_layout_hdr *blh, int status)
++{
++	/*
++	 * The window only exists to stop a request paying a timeout the service
++	 * has already been given. So it is a timeout, and nothing else: an
++	 * error the service sent back - a full filesystem, a stale handle, a
++	 * range it does not have - says the service is answering, and turning
++	 * those into thirty seconds of not using it would be wrong in both
++	 * directions. bc_ds_read_async() and bc_ds_write_async() report a
++	 * timeout as -ETIMEDOUT whatever the RPC layer's tk_status is.
++	 */
++	if (status != -ETIMEDOUT)
++		return;
++
++	if (time_before(jiffies, READ_ONCE(blh->ds_down_until)))
++		return;
++	WRITE_ONCE(blh->ds_down_until, jiffies + BC_DS_DOWN_SECS * HZ);
++	atomic_inc(&bc_stat_ds_down);
++	/*
++	 * The timeout also condemns the client that carried it, so the next
++	 * request after the window builds a new one - a new connection - rather
++	 * than paying this timeout again for the rest of the layout's life.
++	 * Nothing else reconnects: a soft RPC timeout gives up without forcing
++	 * the transport down. The window checked above is what keeps this to one
++	 * client per BC_DS_DOWN_SECS when a whole request's worth of calls times
++	 * out at once. See bc_ds_clnt_drop().
++	 */
++	bc_ds_clnt_drop(blh);
++}
++static atomic_t bc_stat_ds_last_write_err = ATOMIC_INIT(0);
++/*
++ * Durability, as seen from the client: how many writes asked to be durable
++ * (hdr->args.stable), how many replies said they were, and the last reply's
++ * level. The pair is what says the driver passes the request down and the
++ * answer back rather than asserting either.
++ */
++static atomic_t bc_stat_ds_write_stable = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_write_file_sync = ATOMIC_INIT(0);
++static atomic_t bc_stat_ds_last_committed = ATOMIC_INIT(0);
++static atomic_t bc_stat_sync = ATOMIC_INIT(0);
++
++/*
++ * The last layout's file handle, in debugfs, for tests. It otherwise only
++ * exists inside an lseg the kernel owns, and the refusal tests need a real
++ * handle to present to the data service - and to mutate, to show that a handle
++ * for a file outside the export is refused. Debug-only and read-only: nothing
++ * in the driver reads it back.
++ */
++static DEFINE_MUTEX(bc_fh_dump_lock);
++static u8 bc_fh_dump[ENCODED_DS_MAX_FH];
++static u32 bc_fh_dump_len;
++
++static void bc_fh_dump_update(const struct bc_layout *bl)
++{
++	mutex_lock(&bc_fh_dump_lock);
++	bc_fh_dump_len = min_t(u32, bl->fh_len, sizeof(bc_fh_dump));
++	memcpy(bc_fh_dump, bl->fh, bc_fh_dump_len);
++	mutex_unlock(&bc_fh_dump_lock);
++}
++
++static ssize_t bc_fh_dump_read(struct file *file, char __user *ubuf,
++			       size_t count, loff_t *ppos)
++{
++	size_t size = 3 * ENCODED_DS_MAX_FH + 64;
++	char *buf = kzalloc(size, GFP_KERNEL);
++	ssize_t len = 0;
++
++	if (!buf)
++		return -ENOMEM;
++
++	mutex_lock(&bc_fh_dump_lock);
++	len += scnprintf(buf + len, size - len, "fh_len %u\n", bc_fh_dump_len);
++	len += scnprintf(buf + len, size - len, "fh ");
++	bin2hex(buf + len, bc_fh_dump, bc_fh_dump_len);
++	len += 2 * bc_fh_dump_len;
++	len += scnprintf(buf + len, size - len, "\n");
++	mutex_unlock(&bc_fh_dump_lock);
++
++	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
++	kfree(buf);
++	return len;
++}
++
++static const struct file_operations bc_fh_dump_fops = {
++	.read		= bc_fh_dump_read,
++	.llseek		= default_llseek,
++};
++
++/*
++ * The codec names the last layout carried, in position order: the server's list
++ * for that file, which is a property of the filesystem it is on - two
++ * filesystems under one layout type name different codecs, and this is how a
++ * test tells which one a file was offered. A name this client could not
++ * resolve is still printed; the resolution is a separate question.
++ */
++static DEFINE_MUTEX(bc_codec_dump_lock);
++static char bc_codec_dump[ENCODED_DS_MAX_CODECS][ENCODED_DS_MAX_CODEC_NAME + 1];
++static u32 bc_codec_dump_nr;
++
++static void bc_codec_dump_update(const struct bc_layout *bl)
++{
++	u32 i;
++
++	mutex_lock(&bc_codec_dump_lock);
++	bc_codec_dump_nr = min_t(u32, bl->nr_codecs, ENCODED_DS_MAX_CODECS);
++	for (i = 0; i < bc_codec_dump_nr; i++)
++		strscpy(bc_codec_dump[i], bl->codec_name[i],
++			sizeof(bc_codec_dump[i]));
++	mutex_unlock(&bc_codec_dump_lock);
++}
++
++static ssize_t bc_codec_dump_read(struct file *file, char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	char *buf = kzalloc(ENCODED_DS_MAX_CODECS *
++			    (ENCODED_DS_MAX_CODEC_NAME + 16), GFP_KERNEL);
++	ssize_t len = 0;
++	u32 i;
++
++	if (!buf)
++		return -ENOMEM;
++
++	mutex_lock(&bc_codec_dump_lock);
++	for (i = 0; i < bc_codec_dump_nr; i++)
++		len += scnprintf(buf + len, ENCODED_DS_MAX_CODECS *
++				 (ENCODED_DS_MAX_CODEC_NAME + 16) - len,
++				 "%u %s\n", i, bc_codec_dump[i]);
++	mutex_unlock(&bc_codec_dump_lock);
++
++	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
++	kfree(buf);
++	return len;
++}
++
++static const struct file_operations bc_codec_dump_fops = {
++	.read		= bc_codec_dump_read,
++	.llseek		= default_llseek,
++};
++
++/*
++ * The last write reply's verifier, in debugfs, for tests. It is the value the
++ * client checks a later commit against, so it is the one piece of the reply a
++ * counter cannot show: a test asks whether it is there at all, and whether a
++ * server restart changed it, which is how the client learns that uncommitted
++ * data is gone.
++ */
++static DEFINE_MUTEX(bc_verf_dump_lock);
++static u8 bc_write_verf[ENCODED_DS_WRITEVERF];
++
++static void bc_write_verf_update(const u8 *verf)
++{
++	mutex_lock(&bc_verf_dump_lock);
++	memcpy(bc_write_verf, verf, ENCODED_DS_WRITEVERF);
++	mutex_unlock(&bc_verf_dump_lock);
++}
++
++static ssize_t bc_write_verf_read(struct file *file, char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	char buf[2 * ENCODED_DS_WRITEVERF + 8];
++	ssize_t len = 0;
++
++	mutex_lock(&bc_verf_dump_lock);
++	bin2hex(buf, bc_write_verf, ENCODED_DS_WRITEVERF);
++	mutex_unlock(&bc_verf_dump_lock);
++	len = 2 * ENCODED_DS_WRITEVERF;
++	len += scnprintf(buf + len, sizeof(buf) - len, "\n");
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static const struct file_operations bc_write_verf_fops = {
++	.read		= bc_write_verf_read,
++	.llseek		= default_llseek,
++};
++
++static struct pnfs_layout_hdr *
++bc_alloc_layout_hdr(struct inode *inode, gfp_t gfp_flags)
++{
++	struct bc_layout_hdr *blh = kzalloc(sizeof(*blh), gfp_flags);
++
++	if (blh)
++		mutex_init(&blh->clnt_mutex);
++
++	return blh ? &blh->plh : NULL;
++}
++
++static void bc_free_layout_hdr(struct pnfs_layout_hdr *lo)
++{
++	struct bc_layout_hdr *blh = container_of(lo, struct bc_layout_hdr, plh);
++
++	/*
++	 * The client goes to a work item: this is reached under ->i_lock, and
++	 * rpc_shutdown_client() sleeps. If the allocation fails the client is
++	 * leaked rather than freed from atomic context, which is the right way
++	 * round.
++	 */
++	if (blh->clnt)
++		bc_ds_clnt_shutdown_async(blh->clnt);
++	kfree_rcu(blh, plh.plh_rcu);
++}
++
++/*
++ * Release the codecs a segment resolved; the lookups hold a reference so that a
++ * codec cannot be unloaded while a layout is still using it.
++ */
++static void bc_layout_put_codecs(struct bc_layout *bl)
++{
++	unsigned int i;
++
++	for (i = 0; i < bl->nr_codecs; i++) {
++		encoded_extent_codec_put(bl->codec[i]);
++		bl->codec[i] = NULL;
++	}
++	bl->nr_codecs = 0;
++}
++
++static struct pnfs_layout_segment *
++bc_alloc_lseg(struct pnfs_layout_hdr *lo, struct nfs4_layoutget_res *lgr,
++	      gfp_t gfp_flags)
++{
++	struct bc_layout *bl;
++	struct xdr_stream stream;
++	struct xdr_buf buf;
++	struct folio *scratch;
++	void *v;
++	__be32 *p;
++	ssize_t len;
++	u32 version, i, missing = 0;
++
++	scratch = folio_alloc(gfp_flags, 0);
++	if (!scratch)
++		return ERR_PTR(-ENOMEM);
++
++	bl = kzalloc(sizeof(*bl), gfp_flags);
++	if (!bl) {
++		folio_put(scratch);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	/* The layout body is ours, so it is decoded here, in place. */
++	xdr_init_decode_pages(&stream, &buf, lgr->layoutp->pages,
++			      lgr->layoutp->len);
++	xdr_set_scratch_folio(&stream, scratch);
++
++	p = xdr_inline_decode(&stream, 4 + 4);
++	if (!p)
++		goto out_err;
++	version = be32_to_cpup(p++);
++	bl->port = be32_to_cpup(p++);
++	if (version != BC_LAYOUT_VERSION)
++		goto out_err;
++
++	len = xdr_stream_decode_opaque_inline(&stream, &v, sizeof(bl->addr));
++	if (len < 0)
++		goto out_err;
++	bl->addr_len = len;
++	memcpy(bl->addr, v, len);
++
++	len = xdr_stream_decode_opaque_inline(&stream, &v, sizeof(bl->fh));
++	if (len < 0)
++		goto out_err;
++	bl->fh_len = len;
++	memcpy(bl->fh, v, len);
++
++	p = xdr_inline_decode(&stream, 4 + 4);
++	if (!p)
++		goto out_err;
++	bl->unit_max = be32_to_cpup(p++);
++	bl->unit_align = be32_to_cpup(p);
++
++	/*
++	 * The codecs the export may serve this file with. Each is resolved to a
++	 * local implementation now, once per segment, so the data path only
++	 * ever indexes this array - and a name this client does not have stays
++	 * in place as a hole, because the positions are the server's numbering
++	 * and must not shift.
++	 */
++	p = xdr_inline_decode(&stream, 4);
++	if (!p)
++		goto out_err;
++	bl->nr_codecs = be32_to_cpup(p);
++	if (bl->nr_codecs > ENCODED_DS_MAX_CODECS)
++		goto out_err;
++
++	for (i = 0; i < bl->nr_codecs; i++) {
++		char name[ENCODED_DS_MAX_CODEC_NAME + 1];
++
++		len = xdr_stream_decode_opaque_inline(&stream, &v,
++						      ENCODED_DS_MAX_CODEC_NAME);
++		if (len < 0)
++			goto out_err;
++		memcpy(name, v, len);
++		name[len] = '\0';
++		memcpy(bl->codec_name[i], name, len + 1);
++
++		/*
++		 * A name this client cannot resolve is asked for as a module
++		 * once before it is left as a hole: a codec's provider is a
++		 * module, the layout only names the codec, and the module that
++		 * implements it advertises MODULE_ALIAS_ENCODED_EXTENT_CODEC()
++		 * - so the first layout for a codec can load it. Whether it
++		 * resolves or not, the hole stays a hole: the positions are the
++		 * server's numbering and must not shift, and the ranges that
++		 * use a name we do not have fall back to the MDS.
++		 */
++		bl->codec[i] = encoded_extent_codec_find_or_load(
++						LAYOUT_BCACHEFS_ENCODED, name);
++		if (!bl->codec[i])
++			missing++;
++	}
++
++	/* The first codec we can encode with is the one writes use. */
++	bl->write_codec = ENCODED_DS_MAX_CODECS;
++	for (i = 0; i < bl->nr_codecs; i++)
++		if (bl->codec[i] && bl->codec[i]->encode) {
++			bl->write_codec = i;
++			break;
++		}
++
++	folio_put(scratch);
++	atomic_inc(&bc_stat_lseg_alloc);
++	atomic_set(&bc_stat_unit_max, bl->unit_max);
++	atomic_set(&bc_stat_unit_align, bl->unit_align);
++	atomic_set(&bc_stat_layout_codecs, bl->nr_codecs);
++	atomic_add(missing, &bc_stat_codec_missing);
++	atomic_set(&bc_stat_write_codec,
++		   bl->write_codec < bl->nr_codecs ? (int)bl->write_codec : -1);
++	atomic_set(&bc_stat_codec_requests,
++		   (int)encoded_extent_codec_load_attempts());
++	bc_fh_dump_update(bl);
++	bc_codec_dump_update(bl);
++	return &bl->lseg;
++
++out_err:
++	bc_layout_put_codecs(bl);
++	folio_put(scratch);
++	kfree(bl);
++	atomic_inc(&bc_stat_lseg_alloc_err);
++	return ERR_PTR(-EIO);
++}
++
++static void bc_free_lseg(struct pnfs_layout_segment *lseg)
++{
++	struct bc_layout *bl = container_of(lseg, struct bc_layout, lseg);
++
++	bc_layout_put_codecs(bl);
++	kfree(bl);
++}
++
++/*
++ * How big a request should be, from what the layout says a unit is. A request
++ * has to cover a whole unit: the service answers with the unit an offset falls
++ * in, so a request smaller than a unit asks for that unit again for every
++ * request inside it and the same bytes cross the wire twice - which is what was
++ * happening to every read on bcachefs, whose units are 256 KiB against a 128 KiB
++ * NFS read size. The same holds the other way for writes: a request smaller than
++ * a unit stores a smaller unit than the backend would take, which is a btree
++ * transaction per request instead of per unit.
++ *
++ * Beyond that there is nothing to gain by making requests bigger. The NFS
++ * layer's own window is what keeps several in flight, and a coarser request
++ * just means fewer of them - measured: an eight-unit read request was slower
++ * than a one-unit one on every shape, and a two-deep walk inside a request was
++ * faster only for direct I/O, which issues one request at a time.
++ *
++ * When there is no layout - the request is going to the MDS - the pgio keeps
++ * the size the MDS path gave it, which is why this is applied only after the
++ * layout is resolved.
++ */
++/*
++ * How many units a request should cover.
++ *
++ * The service answers with the whole unit an offset falls in, so a request that
++ * ends inside a unit makes the *next* request fetch that unit again. Measured
++ * on a production deployment whose units are ~944 KB and whose requests were one
++ * unit long: 1.8 service calls per stored unit, ds_read_wasted 0.68 - about 45%
++ * of the service's work, and of a single stream's time, spent re-fetching units
++ * the neighbouring request had already pulled. Covering N units amortises it,
++ * waste falling as ~1/N, at the cost of N units of page cache per request in
++ * flight and a proportionally longer unit walk inside the request (the walk is
++ * one unit deep, so a request's units are still fetched one after another).
++ *
++ * 1 is the previous behaviour - one request, one unit - and also the control, so
++ * it stays the default until a real workload says otherwise; the right value
++ * depends on the stored unit size, the storage's latency and how much readahead
++ * the mount is given, and it is writable in debugfs so it can be swept without
++ * a rebuild or a remount. See doc/gotchas.md.
++ */
++#define BC_PG_UNITS_MAX		16
++#define BC_PG_BSIZE_MAX		(8U << 20)
++static unsigned int bc_pg_units = 1;
++
++static size_t
++bc_pg_bsize(struct nfs_pageio_descriptor *pgio, size_t mds_bsize)
++{
++	struct bc_layout *bl;
++	size_t unit_max, units;
++
++	if (!pgio->pg_lseg)
++		return 0;
++	bl = container_of(pgio->pg_lseg, struct bc_layout, lseg);
++	if (!bl->unit_max)
++		return 0;
++
++	/*
++	 * The debugfs file is not validated on write, so the clamp is where the
++	 * value is trusted, and unit_max is clamped the same way before the
++	 * multiplication so that neither can overflow it.
++	 */
++	unit_max = min_t(size_t, bl->unit_max, (size_t)ENCODED_DS_MAX_PAYLOAD);
++	units = clamp_t(size_t, READ_ONCE(bc_pg_units), 1, BC_PG_UNITS_MAX);
++
++	return min_t(size_t, max_t(size_t, unit_max * units, mds_bsize),
++		     (size_t)BC_PG_BSIZE_MAX);
++}
++
++static void
++bc_pg_init_read(struct nfs_pageio_descriptor *pgio, struct nfs_page *req)
++{
++	size_t bsize;
++
++	/*
++	 * TODO: if this request cannot be served as part of an encoded extent
++	 * (sub-block, or a range the data service has no encoded extent for),
++	 * reset to the MDS here, as blocklayout does.
++	 */
++	pnfs_generic_pg_init_read(pgio, req);
++
++	bsize = bc_pg_bsize(pgio, NFS_SERVER(pgio->pg_inode)->rsize);
++	if (bsize)
++		pgio->pg_mirrors[0].pg_bsize = bsize;
++}
++
++static void
++bc_pg_init_write(struct nfs_pageio_descriptor *pgio, struct nfs_page *req)
++{
++	loff_t size = i_size_read(pgio->pg_inode);
++	loff_t off = req_offset(req);
++	u64 wb_size = size > off ? size - off : req->wb_bytes;
++	size_t bsize;
++
++	pnfs_generic_pg_init_write(pgio, req, wb_size);
++
++	/*
++	 * A write should cover a whole unit as well: the unit is what the client
++	 * compresses and the service stores, so a request smaller than one makes
++	 * the backend do a unit's worth of work - a btree transaction, the
++	 * checksum, the copy - for a fraction of a unit's bytes.
++	 */
++	bsize = bc_pg_bsize(pgio, NFS_SERVER(pgio->pg_inode)->wsize);
++	if (bsize)
++		pgio->pg_mirrors[0].pg_bsize = bsize;
++}
++
++static const struct nfs_pageio_ops bc_pg_read_ops = {
++	.pg_init	= bc_pg_init_read,
++	.pg_test	= pnfs_generic_pg_test,
++	.pg_doio	= pnfs_generic_pg_readpages,
++	.pg_cleanup	= pnfs_generic_pg_cleanup,
++};
++
++static const struct nfs_pageio_ops bc_pg_write_ops = {
++	.pg_init	= bc_pg_init_write,
++	.pg_test	= pnfs_generic_pg_test,
++	.pg_doio	= pnfs_generic_pg_writepages,
++	.pg_cleanup	= pnfs_generic_pg_cleanup,
++};
++
++/* The pages of a request, in order, starting at args.pgbase + skip. */
++static void
++bc_copy_to_pages(struct nfs_pgio_header *hdr, size_t skip, const void *src,
++		 size_t len)
++{
++	unsigned int pgindex = (hdr->args.pgbase + skip) >> PAGE_SHIFT;
++	unsigned int pgoff = (hdr->args.pgbase + skip) & (PAGE_SIZE - 1);
++
++	while (len) {
++		struct page *page = hdr->args.pages[pgindex];
++		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
++
++		memcpy_to_page(page, pgoff, src, n);
++		src += n;
++		len -= n;
++		pgoff = 0;
++		pgindex++;
++	}
++}
++
++static void
++bc_copy_from_pages(struct nfs_pgio_header *hdr, size_t skip, void *dst,
++		   size_t len)
++{
++	unsigned int pgindex = (hdr->args.pgbase + skip) >> PAGE_SHIFT;
++	unsigned int pgoff = (hdr->args.pgbase + skip) & (PAGE_SIZE - 1);
++
++	while (len) {
++		struct page *page = hdr->args.pages[pgindex];
++		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
++
++		memcpy_from_page(dst, page, pgoff, n);
++		dst += n;
++		len -= n;
++		pgoff = 0;
++		pgindex++;
++	}
++}
++
++/* ------------------------------------------------------------ the read -- */
++
++/*
++ * The most encoded payload one READ may ask for: the layout's whole unit, unless
++ * the unit is larger than the wire allows. ENCODED_DS_MAX_PAYLOAD is the
++ * service's own ceiling, and the reply is received into the caller's pages, so
++ * this is a limit of the protocol rather than of a reply buffer. A unit that
++ * does not fit is refused by the backend - it checks the length against the
++ * buffer it was given - rather than truncated, so the range falls back to the
++ * MDS, which is always correct.
++ */
++static size_t bc_ds_payload_max(const struct bc_layout *bl)
++{
++	return min_t(size_t, bl->unit_max ?: ENCODED_DS_MAX_PAYLOAD,
++		     (size_t)ENCODED_DS_MAX_PAYLOAD);
++}
++
++/*
++ * One read request, in flight. A request can cover several whole units (a
++ * 1 MiB read is eight of them), so the units are fetched one at a time and the
++ * completion of each issues the next: asynchronous, so the rest of the pgio -
++ * and every other request on this mount - keeps moving while a unit is in
++ * flight.
++ */
++struct bc_read_io {
++	struct nfs_pgio_header	*hdr;
++	struct bc_layout	*bl;
++	struct bc_layout_hdr	*blh;
++	void			*payload;	/* one encoded unit */
++	void			*plain;		/* decoded, unit_max */
++	u64			offset;		/* next byte to fetch */
++	u64			end;
++};
++
++static void
++bc_read_finish(struct bc_read_io *io, int status)
++{
++	struct nfs_pgio_header *hdr = io->hdr;
++	struct bc_layout_hdr *blh = io->blh;
++
++	kvfree(io->plain);
++	kvfree(io->payload);
++	kfree(io);
++
++	if (status) {
++		if (status == -ENODATA)
++			atomic_inc(&bc_stat_ds_read_not_encoded);
++		else {
++			atomic_inc(&bc_stat_ds_read_err);
++			atomic_set(&bc_stat_ds_last_read_err, status);
++		}
++		bc_ds_mark_down(blh, status);
++		/*
++		 * Give it back. pnfs_ld_read_done() with pnfs_error set sends
++		 * the request through the MDS instead, which is always correct.
++		 */
++		hdr->pnfs_error = status;
++		pnfs_ld_read_done(hdr);
++		return;
++	}
++
++	atomic_inc(&bc_stat_ds_read_ok);
++	hdr->res.count = hdr->args.count;
++	hdr->res.eof = false;
++	hdr->pnfs_error = 0;
++	hdr->task.tk_status = 0;
++	pnfs_ld_read_done(hdr);
++}
++
++static void
++bc_read_done(void *ctx, int status, u32 codec,
++	     const struct encoded_extent_desc *desc,
++	     void *payload, size_t payload_len)
++{
++	const struct encoded_extent_codec *c;
++	struct bc_read_io *io = ctx;
++	u64 unit_end, len;
++	size_t declen;
++	int ret;
++
++	if (status)
++		goto out_status;
++
++	if (desc->encrypted)
++		goto out_not_encoded;
++
++	/*
++	 * The descriptor names its codec by position in the layout's list. A
++	 * position this client did not resolve - a codec it does not have - is
++	 * a range it cannot decode, so it goes back to the MDS rather than
++	 * being guessed at.
++	 */
++	if (codec >= io->bl->nr_codecs || !io->bl->codec[codec] ||
++	    !io->bl->codec[codec]->decode)
++		goto out_not_encoded;
++	c = io->bl->codec[codec];
++
++	unit_end = desc->unit_offset + desc->unit_len;
++	if (io->offset < desc->unit_offset || io->offset >= unit_end)
++		goto out_not_encoded;
++
++	/* A unit larger than the segment allowed would overrun @plain. */
++	if (desc->unit_len > io->bl->unit_max)
++		goto out_failed;
++
++	atomic_set(&bc_stat_ds_last_unit_len, desc->unit_len);
++	atomic_set(&bc_stat_ds_last_payload_len, payload_len);
++
++	ret = c->decode(payload, payload_len, io->plain, desc->unit_len,
++			&declen);
++	if (ret || declen != desc->unit_len)
++		goto out_failed;
++
++	len = min(io->end, unit_end) - io->offset;
++	bc_copy_to_pages(io->hdr, io->offset - io->hdr->args.offset,
++			 io->plain + (io->offset - desc->unit_offset), len);
++	spin_lock(&bc_read_bytes_lock);
++	bc_ds_read_bytes += len;
++	bc_ds_read_wasted += desc->unit_len - len;
++	spin_unlock(&bc_read_bytes_lock);
++
++	io->offset += len;
++	if (io->offset < io->end) {
++		ret = bc_ds_read_async(io->blh, io->bl, io->offset, io->payload,
++				       bc_ds_payload_max(io->bl),
++				       bc_read_done, io);
++		if (!ret)
++			return;
++		/*
++		 * The next call was refused outright - no client is built while
++		 * the service is marked down, or a task could not be started -
++		 * so the rest of the range goes back with that reason rather
++		 * than waiting for one that is not coming.
++		 */
++		status = ret;
++		goto out_status;
++	}
++
++	bc_read_finish(io, 0);
++	return;
++
++out_failed:
++	status = -EIO;
++out_status:
++	bc_read_finish(io, status);
++	return;
++out_not_encoded:
++	bc_read_finish(io, -ENODATA);
++}
++
++static enum pnfs_try_status
++bc_read_pagelist(struct nfs_pgio_header *hdr)
++{
++	struct bc_layout *bl;
++	struct bc_layout_hdr *blh;
++	struct bc_read_io *io;
++	size_t bufsize;
++	int ret;
++
++	atomic_inc(&bc_stat_read_pagelist);
++
++	if (!hdr->lseg)
++		return PNFS_NOT_ATTEMPTED;
++
++	bl = container_of(hdr->lseg, struct bc_layout, lseg);
++	blh = container_of(bl->lseg.pls_layout, struct bc_layout_hdr, plh);
++
++	/*
++	 * The service did not answer recently: send this request to the MDS
++	 * rather than spending a timeout finding out again. See bc_ds_mark_down().
++	 */
++	if (bc_ds_is_down(blh)) {
++		atomic_inc(&bc_stat_ds_down_skips);
++		return PNFS_NOT_ATTEMPTED;
++	}
++
++	io = kzalloc(sizeof(*io), GFP_NOFS);
++	if (!io)
++		return PNFS_NOT_ATTEMPTED;
++
++	bufsize = bl->unit_max ?: ENCODED_DS_MAX_PAYLOAD;
++	io->hdr = hdr;
++	io->bl = bl;
++	io->blh = blh;
++	io->offset = hdr->args.offset;
++	io->end = hdr->args.offset + hdr->args.count;
++	/*
++	 * The plaintext buffer holds a whole unit, which is the most the service
++	 * may decode one into; the encoded payload is bounded by bc_ds_payload_max().
++	 * They are the same number unless a layout promises a unit larger than the
++	 * wire allows, in which case the units that do not fit are refused and
++	 * fall back.
++	 */
++	io->payload = kvmalloc(bc_ds_payload_max(bl), GFP_NOFS);
++	io->plain = kvmalloc(bufsize, GFP_NOFS);
++	if (!io->payload || !io->plain)
++		goto out_free;
++
++	/*
++	 * The payload is received straight into this buffer's pages, so it has
++	 * to start on a page boundary: byte 0 of the payload is offset 0 of the
++	 * first page, and an unaligned buffer would be received into the page
++	 * before it. Every allocator returns page-aligned memory for a size this
++	 * large, so this is a guard rather than a hope, and a buffer that failed
++	 * it would be a bug worth knowing about - see bc_ds_read_async().
++	 */
++	if (WARN_ON_ONCE(!PAGE_ALIGNED(io->payload)))
++		goto out_free;
++
++	ret = bc_ds_read_async(blh, bl, io->offset, io->payload,
++			       bc_ds_payload_max(bl), bc_read_done, io);
++	if (ret)
++		goto out_free;
++
++	return PNFS_ATTEMPTED;
++
++out_free:
++	kvfree(io->payload);
++	kvfree(io->plain);
++	kfree(io);
++	return PNFS_NOT_ATTEMPTED;
++}
++
++/* ----------------------------------------------------------- the write -- */
++
++struct bc_write_io {
++	struct nfs_pgio_header	*hdr;
++	struct bc_layout	*bl;
++	struct bc_layout_hdr	*blh;
++	void			*plain;
++	void			*comp;
++	u64			offset;
++	size_t			left;
++	size_t			unit;		/* the unit in flight */
++	/*
++	 * What the data service said it reached, across the units sent so far,
++	 * and its write verifier - the value a later commit of this range is
++	 * checked against, so it has to come back exactly as it arrived.
++	 */
++	u32			committed;
++	u8			verf[ENCODED_DS_WRITEVERF];
++};
++
++static void bc_write_step(struct bc_write_io *io);
++
++static void
++bc_write_finish(struct bc_write_io *io, int status)
++{
++	struct nfs_pgio_header *hdr = io->hdr;
++	struct bc_layout_hdr *blh = io->blh;
++	u32 committed = io->committed;
++	u8 verf[ENCODED_DS_WRITEVERF];
++
++	memcpy(verf, io->verf, ENCODED_DS_WRITEVERF);
++	kvfree(io->plain);
++	kvfree(io->comp);
++	kfree(io);
++
++	if (status) {
++		atomic_inc(&bc_stat_ds_write_err);
++		atomic_set(&bc_stat_ds_last_write_err, status);
++		bc_ds_mark_down(blh, status);
++		/* Same hand-back as the read side: through the MDS. */
++		hdr->pnfs_error = status;
++		pnfs_ld_write_done(hdr);
++		return;
++	}
++
++	atomic_inc(&bc_stat_ds_write_ok);
++	hdr->res.count = hdr->args.count;
++	hdr->pnfs_error = 0;
++	hdr->task.tk_status = 0;
++	/*
++	 * Report what the service reached, not what was asked for. It stored the
++	 * unit through the filesystem's own write path, which is a page cache
++	 * write unless it synced, so a durable answer is the only one that may
++	 * be passed on: claiming FILE_SYNC for an unsynced write is how an
++	 * acknowledged write is lost on a power cut.
++	 *
++	 * A DATA_SYNC answer is reported as UNSTABLE, one step down, because it
++	 * promises the data and not the metadata and this driver has no commit
++	 * hook of its own to finish the second half. The client then commits
++	 * through the MDS, which is the same filesystem here and flushes the
++	 * range either way. Anything a service should not have said is treated
++	 * the same way.
++	 */
++	BUILD_BUG_ON(ENCODED_DS_WRITEVERF != sizeof(hdr->verf.verifier.data));
++	if (committed == NFS_FILE_SYNC)
++		atomic_inc(&bc_stat_ds_write_file_sync);
++	atomic_set(&bc_stat_ds_last_committed, committed);
++	hdr->verf.committed = committed == NFS_FILE_SYNC ?
++			      NFS_FILE_SYNC : NFS_UNSTABLE;
++	memcpy(hdr->verf.verifier.data, verf, ENCODED_DS_WRITEVERF);
++	bc_write_verf_update(verf);
++	pnfs_ld_write_done(hdr);
++}
++
++static void
++bc_write_done(void *ctx, int status, u32 committed, const u8 *verf)
++{
++	struct bc_write_io *io = ctx;
++
++	if (status) {
++		bc_write_finish(io, status);
++		return;
++	}
++
++	/*
++	 * The whole write is only as durable as its least durable unit, and the
++	 * verifier is the service's for the whole run - all the units went to
++	 * the same service, so the last one's is the one a commit will see. Both
++	 * are only remembered here; the completion reports them once.
++	 */
++	if (committed < io->committed)
++		io->committed = committed;
++	memcpy(io->verf, verf, ENCODED_DS_WRITEVERF);
++
++	io->offset += io->unit;
++	io->left -= io->unit;
++	bc_write_step(io);
++}
++
++static void
++bc_write_step(struct bc_write_io *io)
++{
++	const struct encoded_extent_codec *c = io->bl->codec[io->bl->write_codec];
++	struct encoded_extent_desc desc;
++	size_t done, complen;
++	int ret;
++
++	if (!io->left) {
++		bc_write_finish(io, 0);
++		return;
++	}
++
++	io->unit = min_t(size_t, io->left, io->bl->unit_max);
++	done = io->hdr->args.count - io->left;
++
++	memset(&desc, 0, sizeof(desc));
++	desc.unit_offset = io->offset;
++	desc.unit_len = io->unit;
++
++	bc_copy_from_pages(io->hdr, done, io->plain, io->unit);
++	complen = io->bl->unit_max;
++	ret = c->encode(io->plain, io->unit, io->comp, io->bl->unit_max,
++			&complen);
++	if (ret) {
++		bc_write_finish(io, ret);
++		return;
++	}
++	if (!complen) {
++		bc_write_finish(io, -EIO);
++		return;
++	}
++
++	ret = bc_ds_write_async(io->blh, io->bl, io->offset, io->comp, complen,
++				&desc, io->bl->write_codec,
++				(u32)io->hdr->args.stable, bc_write_done, io);
++	if (ret)
++		bc_write_finish(io, ret);
++}
++
++/*
++ * The encoded write: whole, aligned units only, compressed here, stored by the
++ * data service. Anything else - an unaligned or partial request, a unit the
++ * service will not take - is handed back to the MDS, so ordinary NFS writes are
++ * what happens whenever this cannot.
++ */
++static enum pnfs_try_status
++bc_write_pagelist(struct nfs_pgio_header *hdr, int sync)
++{
++	struct bc_layout *bl;
++	struct bc_layout_hdr *blh;
++	struct bc_write_io *io;
++
++	atomic_inc(&bc_stat_write_pagelist);
++
++	if (!hdr->lseg)
++		return PNFS_NOT_ATTEMPTED;
++
++	if (hdr->args.stable != NFS_UNSTABLE)
++		atomic_inc(&bc_stat_ds_write_stable);
++
++	bl = container_of(hdr->lseg, struct bc_layout, lseg);
++	blh = container_of(bl->lseg.pls_layout, struct bc_layout_hdr, plh);
++
++	/* As on the read side: a service that just failed does not get asked
++	 * again for every unit of every request. */
++	if (bc_ds_is_down(blh)) {
++		atomic_inc(&bc_stat_ds_down_skips);
++		return PNFS_NOT_ATTEMPTED;
++	}
++
++	if (!bl->unit_align || !bl->unit_max ||
++	    bl->write_codec >= bl->nr_codecs ||
++	    hdr->args.offset % bl->unit_align ||
++	    hdr->args.count % bl->unit_align ||
++	    hdr->args.pgbase % bl->unit_align)
++		return PNFS_NOT_ATTEMPTED;
++
++	io = kzalloc(sizeof(*io), GFP_NOFS);
++	if (!io)
++		return PNFS_NOT_ATTEMPTED;
++
++	io->hdr = hdr;
++	io->bl = bl;
++	io->blh = blh;
++	io->offset = hdr->args.offset;
++	io->left = hdr->args.count;
++	/*
++	 * Every unit is asked for the level this request needs, so the run starts
++	 * at that level and each reply can only lower it.
++	 */
++	io->committed = (u32)hdr->args.stable;
++	io->plain = kvmalloc(bl->unit_max, GFP_NOFS);
++	io->comp = kvmalloc(bl->unit_max, GFP_NOFS);
++	if (!io->plain || !io->comp) {
++		kvfree(io->plain);
++		kvfree(io->comp);
++		kfree(io);
++		return PNFS_NOT_ATTEMPTED;
++	}
++
++	bc_write_step(io);
++	return PNFS_ATTEMPTED;
++}
++
++/*
++ * Reached from nfs_wb_all() on flush of a written file. The generic NFS version
++ * below it sends LAYOUTCOMMIT if a write through the data service marked the
++ * inode for one - which is how the server's own view of the file gets a chance
++ * to catch up. This only counts that we got there.
++ */
++static int
++bc_sync(struct inode *inode, bool datasync)
++{
++	atomic_inc(&bc_stat_sync);
++	return pnfs_nfs_generic_sync(inode, datasync);
++}
++
++static struct pnfs_layoutdriver_type bc_layout_type = {
++	.id			= LAYOUT_BCACHEFS_ENCODED,
++	.name			= "LAYOUT_BCACHEFS_ENCODED",
++	.owner			= THIS_MODULE,
++	.flags			= PNFS_LAYOUTGET_ON_OPEN,
++	.max_layoutget_response	= 4096,
++	.alloc_layout_hdr	= bc_alloc_layout_hdr,
++	.free_layout_hdr	= bc_free_layout_hdr,
++	.alloc_lseg		= bc_alloc_lseg,
++	.free_lseg		= bc_free_lseg,
++	.pg_read_ops		= &bc_pg_read_ops,
++	.pg_write_ops		= &bc_pg_write_ops,
++	.read_pagelist		= bc_read_pagelist,
++	.write_pagelist		= bc_write_pagelist,
++	/*
++	 * pnfs_sync_inode() calls this without a NULL check, and it is reached
++	 * from nfs_wb_all() on every flush of a file on this mount; leaving it
++	 * out is a call to address zero on the first write. The generic NFS
++	 * version commits any outstanding layout segment, which for a driver
++	 * with no prepare/cleanup_layoutcommit is a no-op.
++	 */
++	.sync			= bc_sync,
++};
++
++static int __init bc_layout_init(void)
++{
++	int ret;
++
++	bc_debugfs_dir = debugfs_create_dir("pnfs_bcachefs", NULL);
++	if (!IS_ERR_OR_NULL(bc_debugfs_dir)) {
++		debugfs_create_atomic_t("lseg_alloc", 0444, bc_debugfs_dir,
++					&bc_stat_lseg_alloc);
++		debugfs_create_atomic_t("lseg_alloc_err", 0444, bc_debugfs_dir,
++					&bc_stat_lseg_alloc_err);
++		debugfs_create_atomic_t("read_pagelist", 0444, bc_debugfs_dir,
++					&bc_stat_read_pagelist);
++		debugfs_create_atomic_t("write_pagelist", 0444, bc_debugfs_dir,
++					&bc_stat_write_pagelist);
++		debugfs_create_atomic_t("unit_max", 0444, bc_debugfs_dir,
++					&bc_stat_unit_max);
++		/* Writable: units per request, the experiment's one knob. */
++		debugfs_create_u32("pg_units", 0644, bc_debugfs_dir,
++				   &bc_pg_units);
++		debugfs_create_atomic_t("unit_align", 0444, bc_debugfs_dir,
++					&bc_stat_unit_align);
++		debugfs_create_atomic_t("layout_codecs", 0444, bc_debugfs_dir,
++					&bc_stat_layout_codecs);
++		debugfs_create_atomic_t("codec_missing", 0444, bc_debugfs_dir,
++					&bc_stat_codec_missing);
++		debugfs_create_atomic_t("codec_requests", 0444, bc_debugfs_dir,
++					&bc_stat_codec_requests);
++		debugfs_create_atomic_t("write_codec", 0444, bc_debugfs_dir,
++					&bc_stat_write_codec);
++		debugfs_create_atomic_t("ds_read_not_encoded", 0444, bc_debugfs_dir,
++					&bc_stat_ds_read_not_encoded);
++		debugfs_create_atomic_t("ds_read_err", 0444, bc_debugfs_dir,
++					&bc_stat_ds_read_err);
++		debugfs_create_atomic_t("ds_read_ok", 0444, bc_debugfs_dir,
++					&bc_stat_ds_read_ok);
++		debugfs_create_u64("ds_read_bytes", 0444, bc_debugfs_dir,
++				   &bc_ds_read_bytes);
++		debugfs_create_u64("ds_read_wasted", 0444, bc_debugfs_dir,
++				   &bc_ds_read_wasted);
++		debugfs_create_atomic_t("ds_last_read_err", 0444, bc_debugfs_dir,
++					&bc_stat_ds_last_read_err);
++		debugfs_create_atomic_t("ds_last_unit_len", 0444, bc_debugfs_dir,
++					&bc_stat_ds_last_unit_len);
++		debugfs_create_atomic_t("ds_last_payload_len", 0444, bc_debugfs_dir,
++					&bc_stat_ds_last_payload_len);
++		debugfs_create_atomic_t("ds_write_ok", 0444, bc_debugfs_dir,
++					&bc_stat_ds_write_ok);
++		debugfs_create_atomic_t("ds_write_err", 0444, bc_debugfs_dir,
++					&bc_stat_ds_write_err);
++		debugfs_create_atomic_t("ds_down", 0444, bc_debugfs_dir,
++					&bc_stat_ds_down);
++		debugfs_create_atomic_t("ds_down_skips", 0444, bc_debugfs_dir,
++					&bc_stat_ds_down_skips);
++		debugfs_create_atomic_t("ds_last_write_err", 0444, bc_debugfs_dir,
++					&bc_stat_ds_last_write_err);
++		debugfs_create_atomic_t("ds_write_stable", 0444, bc_debugfs_dir,
++					&bc_stat_ds_write_stable);
++		debugfs_create_atomic_t("ds_write_file_sync", 0444, bc_debugfs_dir,
++					&bc_stat_ds_write_file_sync);
++		debugfs_create_atomic_t("ds_last_committed", 0444, bc_debugfs_dir,
++					&bc_stat_ds_last_committed);
++		debugfs_create_atomic_t("sync", 0444, bc_debugfs_dir,
++					&bc_stat_sync);
++		debugfs_create_file("layout_fh", 0444, bc_debugfs_dir, NULL,
++				    &bc_fh_dump_fops);
++		debugfs_create_file("codec_names", 0444, bc_debugfs_dir, NULL,
++				    &bc_codec_dump_fops);
++		debugfs_create_file("write_verf", 0444, bc_debugfs_dir, NULL,
++				    &bc_write_verf_fops);
++	}
++
++	ret = pnfs_register_layoutdriver(&bc_layout_type);
++	if (ret) {
++		debugfs_remove_recursive(bc_debugfs_dir);
++		bc_debugfs_dir = NULL;
++	}
++	return ret;
++}
++
++static void __exit bc_layout_exit(void)
++{
++	pnfs_unregister_layoutdriver(&bc_layout_type);
++	debugfs_remove_recursive(bc_debugfs_dir);
++	bc_debugfs_dir = NULL;
++}
++
++module_init(bc_layout_init);
++module_exit(bc_layout_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("pNFS layout driver for bcachefs encoded extents");
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 3db8f13d8..0e855beb9 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -529,7 +529,8 @@ pnfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
+ {
+ 	struct pnfs_ds_commit_info *fl_cinfo = cinfo->ds;
+ 
+-	if (!lseg || !fl_cinfo->ops || !fl_cinfo->ops->mark_request_commit)
++	if (!lseg || !fl_cinfo || !fl_cinfo->ops ||
++	    !fl_cinfo->ops->mark_request_commit)
+ 		return false;
+ 	fl_cinfo->ops->mark_request_commit(req, lseg, cinfo, ds_commit_idx);
+ 	return true;
+diff --git a/fs/nfsd/Kconfig b/fs/nfsd/Kconfig
+index e134dce45..33c4d00ae 100644
+--- a/fs/nfsd/Kconfig
++++ b/fs/nfsd/Kconfig
+@@ -138,6 +138,38 @@ config NFSD_FLEXFILELAYOUT
+ 
+ 	  If unsure, say N.
+ 
++config NFSD_ENCODED_DS
++	bool "Encoded-extent data service for exported filesystems"
++	depends on NFSD_V4
++	help
++	  This enables a small RPC service that moves a filesystem's compressed,
++	  checksummed extents to a peer that does the codec work itself,
++	  addressed the way NFS addresses files: an export path plus a file
++	  handle, resolved with exportfs. The payload is described by the
++	  filesystem's own encoded-extent operations, so the checksums and the
++	  on-disk format stay the filesystem's business.
++
++	  It is a trusted-network service, like an NFS server whose clients are
++	  all trusted: anyone who can reach the port can read and write what the
++	  exports resolve, but cannot store a payload the filesystem would not
++	  have written itself.
++
++	  If unsure, say N.
++
++config NFSD_BCACHEFS_LAYOUT
++	bool "NFSv4.1 server support for pNFS bcachefs encoded-extent layouts"
++	depends on NFSD_V4
++	select NFSD_PNFS
++	select NFSD_ENCODED_DS
++	select ENCODED_EXTENT_CODECS
++	help
++	  This enables exporting a pNFS layout type whose data path moves
++	  bcachefs encoded extents and lets the client decode them, instead of
++	  the server decoding reads and re-compressing writes. The data path
++	  itself is bcachefs's; this only negotiates the layout.
++
++	  If unsure, say N.
++
+ config NFSD_V4_2_INTER_SSC
+ 	bool "NFSv4.2 inter server to server COPY"
+ 	depends on NFSD_V4 && NFS_V4_2
+diff --git a/fs/nfsd/Makefile b/fs/nfsd/Makefile
+index 55744bb78..343fbf99c 100644
+--- a/fs/nfsd/Makefile
++++ b/fs/nfsd/Makefile
+@@ -20,6 +20,8 @@ nfsd-$(CONFIG_NFSD_V3_ACL) += nfs3acl.o
+ nfsd-$(CONFIG_NFSD_V4)	+= nfs4proc.o nfs4xdr.o nfs4state.o nfs4idmap.o \
+ 			   nfs4acl.o nfs4callback.o nfs4recover.o nfs4xdr_gen.o
+ nfsd-$(CONFIG_NFSD_PNFS) += nfs4layouts.o
++nfsd-$(CONFIG_NFSD_ENCODED_DS) += encoded_ds.o
++nfsd-$(CONFIG_NFSD_BCACHEFS_LAYOUT) += bcachefs_layout.o
+ nfsd-$(CONFIG_NFSD_BLOCKLAYOUT) += blocklayout.o blocklayoutxdr.o
+ nfsd-$(CONFIG_NFSD_SCSILAYOUT) += blocklayout.o blocklayoutxdr.o
+ nfsd-$(CONFIG_NFSD_FLEXFILELAYOUT) += flexfilelayout.o flexfilelayoutxdr.o
+diff --git a/fs/nfsd/bcachefs_layout.c b/fs/nfsd/bcachefs_layout.c
+new file mode 100644
+index 000000000..9590fb386
+--- /dev/null
++++ b/fs/nfsd/bcachefs_layout.c
+@@ -0,0 +1,244 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * pNFS layout type for bcachefs encoded extents: the server side.
++ *
++ * A pNFS layout type says "this file's data is served by a data service with a
++ * layout-specific protocol, not by NFS READ/WRITE". Everything else about the
++ * file - namespace, attributes, coherence, state, locks, recovery - stays
++ * stock NFS, which is the point of using a layout type instead of a filesystem
++ * of our own.
++ *
++ * The data service is a small RPC program of its own (linux/encoded_extent_ds.h
++ * describes the wire). This file only negotiates the layout: it hands the
++ * client everything it needs to reach the data service for this file - the
++ * address the client reached *us* at (flexfiles' trick for an MDS that is also
++ * the DS) and the file handle - and nothing else. The extent map, block size,
++ * encoded extent ceiling and codec set come from the data service itself, so
++ * they cannot go stale against its own view.
++ *
++ * Deliberate deviations from what a pNFS layout is "supposed" to be:
++ *
++ *   - no deviceid, so no GETDEVICEINFO and no deviceid hash for what is one
++ *     server; the addressing rides in our own layout body. The stubs below
++ *     exist only so an insistent client gets an error, not a NULL deref;
++ *   - LAYOUTCOMMIT is a no-op: the data service writes through the filesystem,
++ *     so the inode's size and times are already right, exactly flexfiles'
++ *     situation. (The MDS's own cached attribute view is the open question the
++ *     spike notes call out; a real LAYOUTCOMMIT is where that gets fixed.)
++ *   - recalls are disabled: the data service is the only copy, not a cache
++ *     tier, so there is nothing to recall.
++ */
++
++#include <linux/slab.h>
++#include <linux/dcache.h>
++#include <linux/nfs4.h>
++#include <linux/nfsd/debug.h>
++#include <linux/sunrpc/addr.h>
++#include <linux/encoded_extent.h>
++#include <linux/encoded_extent_ds.h>
++
++#include "pnfs.h"
++#include "vfs.h"
++
++#define NFSDDBG_FACILITY	NFSDDBG_PNFS
++
++#define NFSD_BC_LAYOUT_VERSION	4
++#define NFSD_BC_ADDR_MAX	64
++
++/*
++ * The data service's port comes from the data service itself (encoded_ds.c):
++ * it binds the port, so it owns the number. 0 means no data service is
++ * running, and a client that gets a layout with no address falls back to MDS
++ * I/O. The declarations are in encoded_extent_ds.h.
++ */
++
++struct nfsd4_bc_layout {
++	u8		fh[ENCODED_DS_MAX_FH];
++	u32		fh_len;
++	u32		port;
++	char		addr[NFSD_BC_ADDR_MAX];
++	u32		addr_len;
++
++	/*
++	 * The encoded extent ceiling and alignment for this file, from the
++	 * filesystem that exports it. The MDS is also the data service here, so
++	 * these are the same values the data service will apply: nothing goes
++	 * stale, and the client can size its requests without a round trip.
++	 * (If the two are ever split, this - not the extent map - is what would
++	 * have to become a call to the data service.)
++	 */
++	u32		unit_max;
++	u32		unit_align;
++
++	/*
++	 * The codecs this export may serve extents with, named, in the order the
++	 * data service's descriptors index them. This is how a peer learns which
++	 * codecs it may be asked to run without knowing anything about the
++	 * exporting filesystem's own numbering for them; see
++	 * include/linux/encoded_extent.h. Empty means the filesystem registered
++	 * no codecs, so nothing is served encoded and the client uses the MDS.
++	 */
++	const char	*codec[ENCODED_DS_MAX_CODECS];
++	u32		nr_codecs;
++};
++
++static __be32
++nfsd4_bc_proc_layoutget(struct svc_rqst *rqstp, struct inode *inode,
++			const struct svc_fh *fhp, struct nfsd4_layoutget *args)
++{
++	struct nfsd4_layout_seg *seg = &args->lg_seg;
++	const struct encoded_extent_ops *ops;
++	struct nfsd4_bc_layout *bl;
++	unsigned int i;
++
++	ops = inode->i_sb->s_export_op->encoded_extent_ops;
++	if (!ops)
++		return nfserr_serverfault;
++
++	/*
++	 * A backend that says it cannot serve this filesystem at all - a unit
++	 * larger than its read path can carry, which it has already logged
++	 * about - gets no layout. Handing one out would send the client to a
++	 * service that refuses every range, and NFS4ERR_LAYOUTTRYLATER is
++	 * exactly "use the MDS for now, ask me again later".
++	 */
++	if (!ops->unit_max(inode))
++		return nfserr_layouttrylater;
++
++	/*
++	 * The data service authenticates AUTH_NULL/AUTH_UNIX and checks the
++	 * caller against nfsd's client list; it does not speak RPCSEC_GSS yet.
++	 * Rather than hand a GSS mount a layout it would then fall back from on
++	 * every range - or, worse, be tempted to serve over AUTH_UNIX - decline
++	 * the layout outright: the client uses MDS I/O and the data service is
++	 * never in the picture for that mount. AUTH_UNIX is the flavor the
++	 * service both authenticates and authorizes.
++	 */
++	if (rqstp->rq_cred.cr_flavor != RPC_AUTH_UNIX)
++		return nfserr_layouttrylater;
++
++	/*
++	 * A layout is what tells a client where the data service is, so this is
++	 * where it has to exist; a failure here means port 0 in the layout and
++	 * a client that falls back to MDS I/O, which is correct.
++	 */
++	encoded_ds_start();
++
++	bl = kzalloc(sizeof(*bl), GFP_KERNEL);
++	if (!bl)
++		return nfserrno(-ENOMEM);
++	args->lg_content = bl;
++
++	bl->fh_len = fhp->fh_handle.fh_size;
++	if (bl->fh_len > sizeof(bl->fh))
++		bl->fh_len = sizeof(bl->fh);
++	memcpy(bl->fh, &fhp->fh_handle.fh_raw, bl->fh_len);
++
++	bl->port = encoded_ds_get_port();
++	bl->addr_len = rpc_ntop((struct sockaddr *) &rqstp->rq_daddr,
++				bl->addr, sizeof(bl->addr));
++	if (bl->addr_len >= sizeof(bl->addr))
++		bl->addr_len = 0;
++
++	bl->unit_max = ops->unit_max(inode);
++	bl->unit_align = ops->unit_align(inode);
++	/*
++	 * This filesystem's own codecs, in its own order: the peer resolves the
++	 * positions against the names it is given here, and there may be another
++	 * filesystem under the same layout type whose codecs are numbered
++	 * differently.
++	 */
++	bl->nr_codecs = min(ops->nr_codecs, (unsigned int)ARRAY_SIZE(bl->codec));
++	for (i = 0; i < bl->nr_codecs; i++)
++		bl->codec[i] = ops->codecs[i]->name;
++
++	/*
++	 * Whole file. Which ranges are servable encoded is the data service's
++	 * answer, not the layout's: an encoded extent is whatever the
++	 * filesystem stored, and a hole, an inline or encrypted extent, or a
++	 * nocow inode is not.
++	 */
++	seg->offset = 0;
++	seg->length = NFS4_MAX_UINT64;
++
++	return nfs_ok;
++}
++
++static __be32
++nfsd4_bc_encode_layoutget(struct xdr_stream *xdr,
++			  const struct nfsd4_layoutget *lgp)
++{
++	const struct nfsd4_bc_layout *bl = lgp->lg_content;
++	u32 len, i;
++
++	/*
++	 * lo_content is an opaque, and the layout driver is the thing that
++	 * knows its length: the generic encoder writes the layout4 header and
++	 * then hands us the stream, so the length prefix is ours to write
++	 * (flexfiles does the same). Without it the client reads the first
++	 * four body bytes as the length and sees a two-byte layout.
++	 */
++	len = 4 + 4 +				/* version, port */
++	      4 + xdr_align_size(bl->addr_len) +
++	      4 + xdr_align_size(bl->fh_len) +
++	      4 + 4 +				/* unit_max, unit_align */
++	      4;				/* nr_codecs */
++	for (i = 0; i < bl->nr_codecs; i++)
++		len += 4 + xdr_align_size(strlen(bl->codec[i]));
++
++	if (xdr_stream_encode_u32(xdr, len) != XDR_UNIT)
++		return nfserr_resource;
++	if (xdr_stream_encode_u32(xdr, NFSD_BC_LAYOUT_VERSION) != XDR_UNIT)
++		return nfserr_resource;
++	if (xdr_stream_encode_u32(xdr, bl->port) != XDR_UNIT)
++		return nfserr_resource;
++	if (xdr_stream_encode_opaque(xdr, bl->addr, bl->addr_len) < 0)
++		return nfserr_resource;
++	if (xdr_stream_encode_opaque(xdr, bl->fh, bl->fh_len) < 0)
++		return nfserr_resource;
++	if (xdr_stream_encode_u32(xdr, bl->unit_max) != XDR_UNIT)
++		return nfserr_resource;
++	if (xdr_stream_encode_u32(xdr, bl->unit_align) != XDR_UNIT)
++		return nfserr_resource;
++	if (xdr_stream_encode_u32(xdr, bl->nr_codecs) != XDR_UNIT)
++		return nfserr_resource;
++	for (i = 0; i < bl->nr_codecs; i++)
++		if (xdr_stream_encode_opaque(xdr, bl->codec[i],
++					     strlen(bl->codec[i])) < 0)
++			return nfserr_resource;
++
++	return nfs_ok;
++}
++
++/* No deviceid is ever handed out, so a well-behaved client never asks. */
++static __be32
++nfsd4_bc_proc_getdeviceinfo(struct super_block *sb, struct svc_rqst *rqstp,
++			    struct nfs4_client *clp,
++			    struct nfsd4_getdeviceinfo *gdp)
++{
++	return nfserr_inval;
++}
++
++static __be32
++nfsd4_bc_encode_getdeviceinfo(struct xdr_stream *xdr,
++			      const struct nfsd4_getdeviceinfo *gdp)
++{
++	return nfserr_inval;
++}
++
++static __be32
++nfsd4_bc_proc_layoutcommit(struct inode *inode, struct svc_rqst *rqstp,
++			   struct nfsd4_layoutcommit *lcp)
++{
++	return nfs_ok;
++}
++
++const struct nfsd4_layout_ops bc_layout_ops = {
++	.notify_types		= 0,
++	.disable_recalls	= true,
++	.proc_getdeviceinfo	= nfsd4_bc_proc_getdeviceinfo,
++	.encode_getdeviceinfo	= nfsd4_bc_encode_getdeviceinfo,
++	.proc_layoutget		= nfsd4_bc_proc_layoutget,
++	.encode_layoutget	= nfsd4_bc_encode_layoutget,
++	.proc_layoutcommit	= nfsd4_bc_proc_layoutcommit,
++};
+diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
+new file mode 100644
+index 000000000..6eadfe312
+--- /dev/null
++++ b/fs/nfsd/encoded_ds.c
+@@ -0,0 +1,1062 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * The encoded-extent data service: move a filesystem's compressed, checksummed
++ * extents to a peer that does the codec work itself.
++ *
++ * This is the server half of the pNFS layout type in bcachefs_layout.c, but it
++ * is deliberately not pNFS-shaped. It is a small RPC program of its own, so it
++ * rides on sunrpc - transport, request slots, reconnects, timeouts, a thread
++ * pool - and can be developed and tested without touching the NFS protocol.
++ * The wire is linux/encoded_extent_ds.h.
++ *
++ * Files are addressed the way NFS addresses them, an export path plus the file
++ * handle the MDS handed out, and resolved with exportfs. So this works for any
++ * filesystem that can be exported, and everything filesystem-specific is one
++ * vtable (linux/encoded_extent.h). Checksums stay the filesystem's: it verifies
++ * them on read and computes them on write, so no csum code is copied here and a
++ * client cannot store an extent whose checksum does not describe it.
++ *
++ * The codec is named, not numbered, on the wire: the layout carries the names
++ * the export's filesystem registered and a descriptor carries a position in
++ * that list, so this file is one of the only two places the filesystem's own
++ * numbering is translated - see the codec section below.
++ *
++ * Authorization: the service runs nfsd's own checks, not a policy of its own.
++ * Its RPC program shares nfsd's authentication class ("nfsd"), so
++ * svc_set_client() resolves the caller against the same client list the exports
++ * use; each file is then resolved and opened through nfsd_open(), which finds
++ * the export by fsid for that client, checks the handle is inside the export
++ * (nfsd_acceptable), drops to the client's credentials with root/all-squash,
++ * and checks the inode mode and the export's read-only flag. A caller reaching
++ * this port gets exactly the access the MDS would give it for the same file,
++ * and no more. RPCSEC_GSS is not implemented on the data path, so a mount that
++ * requires it is never offered a layout at all (see bcachefs_layout.c) rather
++ * than being quietly downgraded to AUTH_UNIX.
++ *
++ * The other half of the contract is the backend's: what a caller cannot do is
++ * store something the filesystem would not have written itself. Every write
++ * goes through the filesystem's own block allocation, checksum and validation,
++ * and a payload the backend will not describe is refused rather than stored.
++ *
++ * Status: the program number is unregistered and experimental.
++ */
++
++#include <linux/module.h>
++#include <linux/cred.h>
++#include <linux/debugfs.h>
++#include <linux/exportfs.h>
++#include <linux/file.h>
++#include <linux/freezer.h>
++#include <linux/fs.h>
++#include <linux/fs_struct.h>
++#include <linux/namei.h>
++#include <linux/nfs4.h>
++#include <linux/sunrpc/auth.h>
++#include <linux/sunrpc/svc.h>
++#include <linux/sunrpc/svcsock.h>
++#include <linux/encoded_extent.h>
++#include <linux/encoded_extent_ds.h>
++
++#include "nfsd.h"	/* NFSD_MAXVERS, via netns.h below */
++#include "nfsfh.h"	/* key_len(), the knfsd handle layout, nfsd_open() */
++#include "netns.h"	/* nfsd_copy_write_verifier() */
++#include "vfs.h"	/* nfsd_open(): fh_verify + the client's own open */
++
++/*
++ * One whole encoded extent plus the descriptor and XDR overhead around it.
++ * sunrpc sizes both the request and the reply page budget from this number, and
++ * RPCSVC_MAXPAYLOAD_TCP (4 MiB) is the transport's own ceiling. A backend whose
++ * unit_max is larger than this cannot be served in one call and falls back;
++ * btrfs (128 KiB) and bcachefs (up to 2 MiB) both fit.
++ */
++#define ENCODED_DS_BUFSIZE	(ENCODED_DS_MAX_PAYLOAD + 2 * PAGE_SIZE)
++
++/* status, descriptor, opaque header, payload, in XDR words. */
++#define ENCODED_DS_READ_WORDS	(1 + 8 + 1 + ENCODED_DS_MAX_PAYLOAD / XDR_UNIT)
++
++static unsigned short encoded_ds_port = 2050;
++module_param(encoded_ds_port, ushort, 0444);
++MODULE_PARM_DESC(encoded_ds_port,
++	"TCP port the encoded-extent data service listens on (0 = pick one)");
++
++static unsigned int encoded_ds_nthreads = 8;
++module_param(encoded_ds_nthreads, uint, 0444);
++MODULE_PARM_DESC(encoded_ds_nthreads,
++	"Number of encoded-extent data service threads");
++
++/*
++ * The port actually bound, which is what a layout hands to a client: 0 until
++ * the service is running, which is also how a layout says "no data service".
++ */
++static unsigned short encoded_ds_bound_port;
++
++static struct svc_serv *encoded_ds_serv;
++static struct dentry *encoded_ds_debugfs;
++
++static atomic_t ds_nr_probe = ATOMIC_INIT(0);
++static atomic_t ds_nr_read = ATOMIC_INIT(0);
++static atomic_t ds_nr_write = ATOMIC_INIT(0);
++/* What the backends reported: a write left in the page cache, and one synced. */
++static atomic_t ds_nr_write_unstable = ATOMIC_INIT(0);
++/*
++ * Time spent inside the backend, per direction, in nanoseconds: the service's
++ * cost is this plus the transport, and a throughput number cannot tell the two
++ * apart. Written under a lock - this is a test and debug counter, not part of
++ * the data path's own accounting.
++ */
++static DEFINE_SPINLOCK(ds_ns_lock);
++static u64 ds_read_ns, ds_write_ns;
++static atomic_t ds_nr_write_file_sync = ATOMIC_INIT(0);
++static atomic_t ds_nr_not_encoded = ATOMIC_INIT(0);
++static atomic_t ds_nr_codec_unknown = ATOMIC_INIT(0);
++static atomic_t ds_nr_errors = ATOMIC_INIT(0);
++/*
++ * How many calls the service had inside the backend at once, and the high-water
++ * mark of that. The thread count says how many it *can* have; this says how many
++ * the client actually kept in its hands, which is what a wide workload is about
++ * - a client that walks one unit per request leaves a service with twelve
++ * threads running one deep.
++ */
++static atomic_t ds_inflight = ATOMIC_INIT(0);
++static atomic_t ds_inflight_max = ATOMIC_INIT(0);
++
++static void ds_inflight_enter(void)
++{
++	int n = atomic_inc_return(&ds_inflight), max;
++
++	for (;;) {
++		max = atomic_read(&ds_inflight_max);
++		if (n <= max || atomic_cmpxchg(&ds_inflight_max, max, n) == max)
++			return;
++	}
++}
++
++static void ds_inflight_leave(void)
++{
++	atomic_dec(&ds_inflight);
++}
++
++/* ------------------------------------------------------------- arguments -- */
++
++/*
++ * A file is named the way NFS names one: by the file handle the MDS handed out.
++ * It is opaque bytes on the wire because that is what nfsd gives us, and the
++ * exportfs fid inside it is a word array, so the conversion happens in exactly
++ * one place below.
++ */
++struct encoded_ds_addr {
++	u8		fh[ENCODED_DS_MAX_FH];
++	u32		fh_len;
++};
++
++struct encoded_ds_probeargs {
++	struct encoded_ds_addr addr;
++	u64		offset;
++	u64		len;
++};
++
++struct encoded_ds_readargs {
++	struct encoded_ds_addr addr;
++	u64		offset;
++	u32		buf_size;
++};
++
++struct encoded_ds_writeargs {
++	struct encoded_ds_addr addr;
++	u64		offset;
++	struct encoded_extent_desc desc;
++	u32		codec;		/* wire position, before translation */
++	u32		stable;		/* NFS's levels, see the wire header */
++	void		*payload;	/* kvmalloc'd, freed by pc_release */
++	u32		payload_len;
++};
++
++struct encoded_ds_reply {
++	s32		status;
++	/* PROBE and READ only: what the range was answered with. */
++	struct encoded_extent_desc desc;
++	u32		codec;		/* wire position, translated from desc */
++	/* WRITE only: what the backend reached, and the netns write verifier. */
++	enum encoded_extent_stable committed;
++	__be32		verf[2];
++	/* READ only: the encoded payload, freed by pc_release. */
++	void		*payload;
++	size_t		payload_len;
++};
++
++union encoded_ds_xdrstore {
++	struct encoded_ds_probeargs	probe;
++	struct encoded_ds_readargs	read;
++	struct encoded_ds_writeargs	write;
++	struct encoded_ds_reply		reply;
++};
++
++/* --------------------------------------------------------------- decoding -- */
++
++static bool
++encoded_ds_decode_addr(struct xdr_stream *xdr, struct encoded_ds_addr *addr)
++{
++	void *p;
++	ssize_t len;
++
++	len = xdr_stream_decode_opaque_inline(xdr, &p, sizeof(addr->fh));
++	if (len < 0)
++		return false;
++	addr->fh_len = len;
++	if (len)
++		memcpy(addr->fh, p, len);
++
++	return true;
++}
++
++/* NULL: no arguments to decode and nothing to send back. */
++static bool
++encoded_ds_void(struct svc_rqst *rqstp, struct xdr_stream *xdr)
++{
++	return true;
++}
++
++static bool
++encoded_ds_decode_probe(struct svc_rqst *rqstp, struct xdr_stream *xdr)
++{
++	struct encoded_ds_probeargs *args = rqstp->rq_argp;
++
++	if (!encoded_ds_decode_addr(xdr, &args->addr))
++		return false;
++
++	return xdr_stream_decode_u64(xdr, &args->offset) == 0 &&
++	       xdr_stream_decode_u64(xdr, &args->len) == 0;
++}
++
++static bool
++encoded_ds_decode_read(struct svc_rqst *rqstp, struct xdr_stream *xdr)
++{
++	struct encoded_ds_readargs *args = rqstp->rq_argp;
++
++	if (!encoded_ds_decode_addr(xdr, &args->addr))
++		return false;
++
++	return xdr_stream_decode_u64(xdr, &args->offset) == 0 &&
++	       xdr_stream_decode_u32(xdr, &args->buf_size) == 0;
++}
++
++/*
++ * The wire carries a codec's position in the layout's list; the backend speaks
++ * its filesystem's own numbering. Translating between them is this file's job
++ * because it is the only place that sees both, and it is what keeps each
++ * numbering on its own side. A position that names no registered codec, or an
++ * extent whose codec the filesystem has not registered, is not served encoded.
++ */
++static bool
++encoded_ds_translate_codec(const struct encoded_extent_ops *ops, u32 codec,
++			   struct encoded_extent_desc *desc)
++{
++	const struct encoded_extent_codec *c;
++
++	/*
++	 * The position is in the layout's list, which is *this* filesystem's
++	 * list: two filesystems can be exported under one layout type, and a
++	 * lookup that ignored which one the file is on would translate a
++	 * position into another filesystem's numbering.
++	 */
++	c = encoded_extent_codec_by_position(ops, codec);
++	if (!c)
++		return false;
++	desc->compression = c->compression;
++	return true;
++}
++
++static bool
++encoded_ds_encode_codec(const struct encoded_extent_ops *ops,
++			struct encoded_extent_desc *desc, u32 *codec)
++{
++	/*
++	 * A layout's list is capped, so a filesystem with more codecs than that
++	 * would produce positions the peer cannot see. Those extents are not
++	 * served encoded rather than numbered ambiguously.
++	 */
++	return encoded_extent_codec_by_compression(ops, desc->compression,
++						   codec) &&
++	       *codec < ENCODED_DS_MAX_CODECS;
++}
++
++static bool
++encoded_ds_decode_desc(struct xdr_stream *xdr, struct encoded_extent_desc *desc,
++		       u32 *codec)
++{
++	struct encoded_ds_desc wire;
++	u32 encrypted;
++
++	if (xdr_stream_decode_u64(xdr, &wire.unit_offset) < 0)
++		return false;
++	if (xdr_stream_decode_u64(xdr, &wire.unit_len) < 0)
++		return false;
++	if (xdr_stream_decode_u64(xdr, &wire.unencoded_offset) < 0)
++		return false;
++	if (xdr_stream_decode_u32(xdr, &wire.codec) < 0)
++		return false;
++	if (xdr_stream_decode_u32(xdr, &encrypted) < 0)
++		return false;
++	wire.encrypted = encrypted != 0;
++
++	desc->unit_offset	= wire.unit_offset;
++	desc->unit_len		= wire.unit_len;
++	desc->unencoded_offset	= wire.unencoded_offset;
++	desc->encrypted		= wire.encrypted;
++	desc->compression	= 0;
++	*codec			= wire.codec;
++
++	return true;
++}
++
++static bool
++encoded_ds_decode_write(struct svc_rqst *rqstp, struct xdr_stream *xdr)
++{
++	struct encoded_ds_writeargs *args = rqstp->rq_argp;
++	struct xdr_buf payload;
++	u32 len;
++
++	if (!encoded_ds_decode_addr(xdr, &args->addr))
++		return false;
++	if (xdr_stream_decode_u64(xdr, &args->offset) < 0)
++		return false;
++	if (!encoded_ds_decode_desc(xdr, &args->desc, &args->codec))
++		return false;
++	if (xdr_stream_decode_u32(xdr, &args->stable) < 0)
++		return false;
++	/*
++	 * Refuse rather than round up: a level this service does not understand
++	 * must not be answered as though it were one it does. The caller falls
++	 * back to the MDS, which is always correct.
++	 */
++	if (args->stable > ENCODED_EXTENT_FILE_SYNC)
++		return false;
++
++	/*
++	 * The payload is up to ENCODED_DS_MAX_PAYLOAD, which the stream's
++	 * one-page inline/scratch path cannot express: take it as a sub-buffer
++	 * and copy it out, exactly as nfsd's WRITE decoder does. The backend
++	 * vtable takes a linear buffer, so the copy is unavoidable for now.
++	 */
++	if (xdr_stream_decode_u32(xdr, &len) < 0)
++		return false;
++	if (len > ENCODED_DS_MAX_PAYLOAD ||
++	    len > svc_max_payload(rqstp))
++		return false;
++	if (!xdr_stream_subsegment(xdr, &payload, len))
++		return false;
++
++	args->payload = kvmalloc(len, GFP_KERNEL);
++	if (!args->payload)
++		return false;
++	args->payload_len = len;
++
++	if (read_bytes_from_xdr_buf(&payload, 0, args->payload, len)) {
++		kvfree(args->payload);
++		args->payload = NULL;
++		args->payload_len = 0;
++		return false;
++	}
++
++	return true;
++}
++
++/* --------------------------------------------------------------- encoding -- */
++
++/*
++ * A payload larger than a page cannot be encoded through the xdr_stream's
++ * inline path - xdr_reserve_space() refuses anything over a page - so it goes
++ * into reply pages and is attached with svcxdr_encode_opaque_pages(), the same
++ * way nfsd sends an NFS READ. rq_next_page is what the release path uses to
++ * find the pages again, so it must be advanced over them.
++ */
++static bool
++encoded_ds_encode_payload(struct svc_rqst *rqstp, struct xdr_stream *xdr,
++			  const void *payload, size_t len)
++{
++	struct page **first = rqstp->rq_respages + 1;
++	unsigned int npages = DIV_ROUND_UP(len, PAGE_SIZE);
++	const u8 *p = payload;
++	size_t left = len;
++	unsigned int i;
++
++	if (first + npages > rqstp->rq_page_end)
++		return false;
++	if (xdr_stream_encode_u32(xdr, len) < 0)
++		return false;
++
++	for (i = 0; i < npages; i++) {
++		size_t n = min_t(size_t, left, PAGE_SIZE);
++
++		memcpy(page_address(first[i]), p, n);
++		p += n;
++		left -= n;
++	}
++
++	rqstp->rq_next_page = first + npages;
++	svcxdr_encode_opaque_pages(rqstp, xdr, first, 0, len);
++	return true;
++}
++
++/*
++ * The head every reply shares: the status, and the descriptor and codec the
++ * status refers to. A refused request still carries the descriptor - the
++ * counters and a fallback caller both want to know what was asked for.
++ */
++static bool
++encoded_ds_encode_reply_head(struct xdr_stream *xdr,
++			     const struct encoded_ds_reply *reply)
++{
++	if (xdr_stream_encode_u32(xdr, (u32)reply->status) < 0)
++		return false;
++	if (xdr_stream_encode_u64(xdr, reply->desc.unit_offset) < 0)
++		return false;
++	if (xdr_stream_encode_u64(xdr, reply->desc.unit_len) < 0)
++		return false;
++	if (xdr_stream_encode_u64(xdr, reply->desc.unencoded_offset) < 0)
++		return false;
++	if (xdr_stream_encode_u32(xdr, reply->codec) < 0)
++		return false;
++	if (xdr_stream_encode_u32(xdr, reply->desc.encrypted ? 1 : 0) < 0)
++		return false;
++	return true;
++}
++
++static bool
++encoded_ds_encode_reply(struct svc_rqst *rqstp, struct xdr_stream *xdr)
++{
++	const struct encoded_ds_reply *reply = rqstp->rq_resp;
++
++	if (!encoded_ds_encode_reply_head(xdr, reply))
++		return false;
++	if (reply->payload &&
++	    !encoded_ds_encode_payload(rqstp, xdr, reply->payload,
++				       reply->payload_len))
++		return false;
++
++	return true;
++}
++
++/*
++ * A write reply says what the service did with the bytes, not just that it
++ * accepted them: @committed is the level the backend reached, and the verifier
++ * is the netns's own, so a client that commits later can tell whether a server
++ * restart lost the data.
++ */
++static bool
++encoded_ds_encode_write_reply(struct svc_rqst *rqstp, struct xdr_stream *xdr)
++{
++	const struct encoded_ds_reply *reply = rqstp->rq_resp;
++
++	/*
++	 * No descriptor: a write's reply is about the bytes, and the caller
++	 * already knows which unit it sent. A read's reply needs one because
++	 * the unit the service answers with is the one covering the offset it
++	 * asked about, which may be wider than the request.
++	 */
++	if (xdr_stream_encode_u32(xdr, (u32)reply->status) < 0)
++		return false;
++	if (xdr_stream_encode_u32(xdr, (u32)reply->committed) < 0)
++		return false;
++	if (xdr_stream_encode_opaque_fixed(xdr, reply->verf,
++					   ENCODED_DS_WRITEVERF) < 0)
++		return false;
++	return true;
++}
++
++static void
++encoded_ds_release_read(struct svc_rqst *rqstp)
++{
++	struct encoded_ds_reply *reply = rqstp->rq_resp;
++
++	kvfree(reply->payload);
++	reply->payload = NULL;
++}
++
++static void
++encoded_ds_release_write(struct svc_rqst *rqstp)
++{
++	struct encoded_ds_writeargs *args = rqstp->rq_argp;
++
++	kvfree(args->payload);
++	args->payload = NULL;
++}
++
++/* ------------------------------------------------------- resolving a file -- */
++
++struct encoded_ds_file {
++	struct file			*file;
++	const struct encoded_extent_ops	*ops;
++};
++
++static void encoded_ds_close(struct encoded_ds_file *f)
++{
++	fput(f->file);
++}
++
++/*
++ * nfsd_open() reports nfsd's own __be32 status; this wire carries a plain
++ * errno. nfsd has no generic nfs-status-to-errno helper (nfserrno() goes the
++ * other way), so map the ones a refusal can actually be, as lockd does with its
++ * switch. The client falls back to the MDS on any non-zero status, so an
++ * unmapped one costs only the precision of the debug counter.
++ */
++static int encoded_ds_nfserr(__be32 status)
++{
++	switch (status) {
++	case nfs_ok:		return 0;
++	case nfserr_stale:
++	case nfserr_badhandle:	return -ESTALE;
++	case nfserr_acces:	return -EACCES;
++	case nfserr_wrongsec:	return -EACCES;
++	case nfserr_perm:	return -EPERM;
++	case nfserr_rofs:	return -EROFS;
++	case nfserr_noent:	return -ENOENT;
++	case nfserr_isdir:
++	case nfserr_notdir:	return -EISDIR;
++	case nfserr_inval:	return -EINVAL;
++	case nfserr_nospc:	return -ENOSPC;
++	case nfserr_jukebox:	return -EAGAIN;
++	case nfserr_io:
++	case nfserr_serverfault:return -EIO;
++	default:		return -EPERM;
++	}
++}
++
++/*
++ * Resolve a client-supplied nfsd file handle to an open file, with nfsd's own
++ * authorization. This is deliberately lockd's nlm_fopen() shape: build an
++ * svc_fh from the wire handle and hand it to nfsd_open(), which runs
++ * fh_verify() - the export is found by fsid for *this* client (rq_client, set
++ * by encoded_ds_authenticate), the handle is checked to be inside the export
++ * (nfsd_acceptable), the task is dropped to the client's credentials with
++ * root/all-squash, and the inode mode and the export's read-only flag are
++ * checked - and then opens the file.
++ *
++ * That is the same access decision an MDS READ or WRITE gets, which is the
++ * parity this service promises. The export path the layout carries is no longer
++ * part of the trust path at all: the export comes from the handle's fsid and the
++ * presenting client, so a caller cannot name an export it is not allowed.
++ */
++static int
++encoded_ds_open(struct svc_rqst *rqstp, const struct encoded_ds_addr *addr,
++		int flags, struct encoded_ds_file *out)
++{
++	struct svc_fh fh;
++	struct file *file;
++	__be32 nfserr;
++	int access;
++
++	/*
++	 * nfsd's handle: one word of version/auth/fsid_type/fileid_type, the
++	 * fsid, then the fid. Refuse anything that is not one, rather than hand
++	 * a malformed handle to the verifier.
++	 */
++	if (addr->fh_len < 2 * XDR_UNIT || addr->fh_len > NFS4_FHSIZE ||
++	    addr->fh_len % XDR_UNIT)
++		return -EINVAL;
++	if (addr->fh[0] != 1 || addr->fh[1] != 0)
++		return -EINVAL;
++
++	fh_init(&fh, NFS4_FHSIZE);
++	fh.fh_handle.fh_size = addr->fh_len;
++	memcpy(fh.fh_handle.fh_raw, addr->fh, addr->fh_len);
++
++	/*
++	 * The layout was granted through this client's OPEN, so the holder
++	 * already has the file; NFSD_MAY_NOT_BREAK_LEASE is what nfsd's COMMIT
++	 * uses for the same reason (fs/nfsd/nfs4proc.c). Without it, opening a
++	 * file the client holds a delegation on tries to recall that delegation
++	 * from the very client that is asking us to write, and nfsd_open
++	 * returns nfserr_jukebox.
++	 */
++	access = (flags & O_ACCMODE) == O_RDONLY ? NFSD_MAY_READ : NFSD_MAY_WRITE;
++	access |= NFSD_MAY_NOT_BREAK_LEASE;
++	nfserr = nfsd_open(rqstp, &fh, S_IFREG, access, &file);
++	fh_put(&fh);
++	if (nfserr) {
++		pr_warn_ratelimited("encoded_ds: open refused: nfserr=%08x fh_len=%u access=%d\n",
++				    be32_to_cpu(nfserr), addr->fh_len, access);
++		return encoded_ds_nfserr(nfserr);
++	}
++
++	out->ops = file_inode(file)->i_sb->s_export_op->encoded_extent_ops;
++	if (WARN_ON_ONCE(!out->ops)) {
++		fput(file);
++		return -ENODATA;
++	}
++
++	out->file = file;
++	return 0;
++}
++
++/* ------------------------------------------------------------- procedures -- */
++
++static void
++encoded_ds_failed(struct encoded_ds_reply *reply, int ret)
++{
++	if (ret == -ENODATA)
++		atomic_inc(&ds_nr_not_encoded);
++	else
++		atomic_inc(&ds_nr_errors);
++	reply->status = ret;
++}
++
++static __be32
++encoded_ds_proc_null(struct svc_rqst *rqstp)
++{
++	return rpc_success;
++}
++
++static __be32
++encoded_ds_proc_probe(struct svc_rqst *rqstp)
++{
++	struct encoded_ds_probeargs *args = rqstp->rq_argp;
++	struct encoded_ds_reply *reply = rqstp->rq_resp;
++	struct encoded_ds_file f;
++	int ret;
++
++	atomic_inc(&ds_nr_probe);
++
++	ret = encoded_ds_open(rqstp, &args->addr, O_RDONLY, &f);
++	if (ret)
++		goto out_err;
++
++	ret = f.ops->probe(f.file, args->offset, args->len, &reply->desc);
++	encoded_ds_close(&f);
++	if (ret)
++		goto out_err;
++	if (!encoded_ds_encode_codec(f.ops, &reply->desc, &reply->codec)) {
++		atomic_inc(&ds_nr_codec_unknown);
++		ret = -ENODATA;
++		goto out_err;
++	}
++
++	return rpc_success;
++
++out_err:
++	encoded_ds_failed(reply, ret);
++	return rpc_success;
++}
++
++static __be32
++encoded_ds_proc_read(struct svc_rqst *rqstp)
++{
++	struct encoded_ds_readargs *args = rqstp->rq_argp;
++	struct encoded_ds_reply *reply = rqstp->rq_resp;
++	struct encoded_ds_file f;
++	u64 start;
++	size_t len;
++	void *buf;
++	int ret;
++
++	atomic_inc(&ds_nr_read);
++
++	ret = encoded_ds_open(rqstp, &args->addr, O_RDONLY, &f);
++	if (ret)
++		goto out_err;
++
++	/*
++	 * The caller says how much room it has for the encoded payload; the
++	 * backend is asked for the unit covering the offset and answers with
++	 * what it actually needed.
++	 */
++	len = min_t(u32, args->buf_size, f.ops->unit_max(file_inode(f.file)));
++	if (!len) {
++		encoded_ds_close(&f);
++		ret = -EINVAL;
++		goto out_err;
++	}
++
++	buf = kvzalloc(len, GFP_KERNEL);
++	if (!buf) {
++		encoded_ds_close(&f);
++		ret = -ENOMEM;
++		goto out_err;
++	}
++
++	start = ktime_get_ns();
++	ds_inflight_enter();
++	ret = f.ops->read(f.file, args->offset, args->buf_size, buf, &len,
++			  &reply->desc);
++	spin_lock(&ds_ns_lock);
++	ds_read_ns += ktime_get_ns() - start;
++	spin_unlock(&ds_ns_lock);
++	ds_inflight_leave();
++	encoded_ds_close(&f);
++	if (ret) {
++		kvfree(buf);
++		goto out_err;
++	}
++
++	/*
++	 * The backend named the codec in its own numbering; the peer is told
++	 * which one it is by position in the layout's list. A codec the
++	 * filesystem stores but has not registered is one this service cannot
++	 * hand out, so the range is not served encoded.
++	 */
++	if (!encoded_ds_encode_codec(f.ops, &reply->desc, &reply->codec)) {
++		atomic_inc(&ds_nr_codec_unknown);
++		kvfree(buf);
++		ret = -ENODATA;
++		goto out_err;
++	}
++
++	reply->payload = buf;
++	reply->payload_len = len;
++
++	return rpc_success;
++
++out_err:
++	encoded_ds_failed(reply, ret);
++	return rpc_success;
++}
++
++static __be32
++encoded_ds_proc_write(struct svc_rqst *rqstp)
++{
++	struct encoded_ds_writeargs *args = rqstp->rq_argp;
++	struct encoded_ds_reply *reply = rqstp->rq_resp;
++	struct encoded_ds_file f;
++	u64 start;
++	int ret;
++
++	atomic_inc(&ds_nr_write);
++
++	if (!args->payload_len) {
++		ret = -EINVAL;
++		goto out_err;
++	}
++
++	ret = encoded_ds_open(rqstp, &args->addr, O_RDWR, &f);
++	if (ret)
++		goto out_err;
++
++	/*
++	 * The peer named the codec by position in the layout's list and this
++	 * filesystem's own numbering is what its backend is written against.
++	 */
++	if (!encoded_ds_translate_codec(f.ops, args->codec, &args->desc)) {
++		atomic_inc(&ds_nr_codec_unknown);
++		encoded_ds_close(&f);
++		ret = -ENODATA;
++		goto out_err;
++	}
++
++	start = ktime_get_ns();
++	ds_inflight_enter();
++	ret = f.ops->write(f.file, args->offset, args->payload,
++			   args->payload_len, &args->desc,
++			   (enum encoded_extent_stable)args->stable,
++			   &reply->committed);
++	spin_lock(&ds_ns_lock);
++	ds_write_ns += ktime_get_ns() - start;
++	spin_unlock(&ds_ns_lock);
++	ds_inflight_leave();
++	encoded_ds_close(&f);
++	if (ret)
++		goto out_err;
++
++	/*
++	 * The verifier has to come from the same place nfsd's own WRITE and
++	 * COMMIT replies get theirs: it is the value a later commit is checked
++	 * against, so handing out a different one would make every unstable
++	 * write look lost.
++	 */
++	if (reply->committed == ENCODED_EXTENT_UNSTABLE)
++		atomic_inc(&ds_nr_write_unstable);
++	else if (reply->committed == ENCODED_EXTENT_FILE_SYNC)
++		atomic_inc(&ds_nr_write_file_sync);
++
++	nfsd_copy_write_verifier(reply->verf,
++				 net_generic(SVC_NET(rqstp), nfsd_net_id));
++
++	return rpc_success;
++
++out_err:
++	encoded_ds_failed(reply, ret);
++	return rpc_success;
++}
++
++/*
++ * The standard decode, call, encode shape; lockd's dispatcher is the same
++ * twenty lines (sunrpc has no shared helper, only per-program copies).
++ */
++static int
++encoded_ds_dispatch(struct svc_rqst *rqstp)
++{
++	const struct svc_procedure *procp = rqstp->rq_procinfo;
++	__be32 *statp = rqstp->rq_accept_statp;
++
++	/*
++	 * Start the request on the thread's own credentials. nfsd_open() installs
++	 * the client's as an override and nothing else clears it, so without this
++	 * a request path that does not open a file - the NULL procedure, the XDR
++	 * decode, the counters - would run under whatever identity the previous
++	 * request left behind. This is the same reset nfsd_setuser() does at its
++	 * own entry.
++	 */
++	put_cred(revert_creds(get_cred(current_real_cred())));
++
++	if (!procp->pc_decode(rqstp, &rqstp->rq_arg_stream))
++		goto out_decode_err;
++
++	*statp = procp->pc_func(rqstp);
++	if (*statp == rpc_drop_reply)
++		return 0;
++	if (*statp != rpc_success)
++		return 1;
++
++	if (!procp->pc_encode(rqstp, &rqstp->rq_res_stream))
++		goto out_encode_err;
++
++	return 1;
++
++out_decode_err:
++	*statp = rpc_garbage_args;
++	return 1;
++
++out_encode_err:
++	*statp = rpc_system_err;
++	return 1;
++}
++
++static const struct svc_procedure encoded_ds_procedures[] = {
++	[ENCODED_DS_NULL] = {
++		.pc_func	= encoded_ds_proc_null,
++		.pc_decode	= encoded_ds_void,
++		.pc_encode	= encoded_ds_void,
++		.pc_xdrressize	= 1,
++		.pc_name	= "NULL",
++	},
++	[ENCODED_DS_PROBE] = {
++		.pc_func	= encoded_ds_proc_probe,
++		.pc_decode	= encoded_ds_decode_probe,
++		.pc_encode	= encoded_ds_encode_reply,
++		.pc_argzero	= sizeof(struct encoded_ds_probeargs),
++		.pc_ressize	= sizeof(struct encoded_ds_reply),
++		.pc_xdrressize	= 1 + 8,
++		.pc_name	= "PROBE",
++	},
++	[ENCODED_DS_READ] = {
++		.pc_func	= encoded_ds_proc_read,
++		.pc_decode	= encoded_ds_decode_read,
++		.pc_encode	= encoded_ds_encode_reply,
++		.pc_release	= encoded_ds_release_read,
++		.pc_argzero	= sizeof(struct encoded_ds_readargs),
++		.pc_ressize	= sizeof(struct encoded_ds_reply),
++		.pc_xdrressize	= ENCODED_DS_READ_WORDS,
++		.pc_name	= "READ",
++	},
++	[ENCODED_DS_WRITE] = {
++		.pc_func	= encoded_ds_proc_write,
++		.pc_decode	= encoded_ds_decode_write,
++		.pc_encode	= encoded_ds_encode_write_reply,
++		.pc_release	= encoded_ds_release_write,
++		.pc_argzero	= sizeof(struct encoded_ds_writeargs),
++		.pc_ressize	= sizeof(struct encoded_ds_reply),
++		/* status, committed, verifier. */
++		.pc_xdrressize	= 2 + ENCODED_DS_WRITEVERF / XDR_UNIT,
++		.pc_name	= "WRITE",
++	},
++};
++
++/*
++ * vs_count is bumped per procedure by the generic init (this_cpu_inc), so it
++ * has to exist even though nothing here reads it.
++ */
++static DEFINE_PER_CPU_ALIGNED(unsigned long,
++			      encoded_ds_counts[ENCODED_DS_NR_PROCS]);
++
++static const struct svc_version encoded_ds_version = {
++	.vs_vers	= ENCODED_DS_VERSION,
++	.vs_nproc	= ENCODED_DS_NR_PROCS,
++	.vs_proc	= encoded_ds_procedures,
++	.vs_count	= encoded_ds_counts,
++	.vs_xdrsize	= sizeof(union encoded_ds_xdrstore),
++	/*
++	 * A fixed port the layout carries in its body, so there is nothing to
++	 * register with rpcbind and nothing to advertise.
++	 */
++	.vs_hidden	= true,
++	.vs_dispatch	= encoded_ds_dispatch,
++};
++
++static const struct svc_version *encoded_ds_versions[] = {
++	[ENCODED_DS_VERSION] = &encoded_ds_version,
++};
++
++/*
++ * Authenticate as nfsd does, via lockd's template: AUTH_NULL and AUTH_UNIX
++ * only, the NULL procedure always accepted (the liveness probe needs no client
++ * identity), and every other procedure resolved against nfsd's client list by
++ * svc_set_client() - which sets rq_client and denies a caller nfsd does not
++ * know. That is the same list the exports use, because the program shares
++ * nfsd's authentication class ("nfsd" below), exactly as lockd does. It is what
++ * nfsd_open() then needs to find the right export.
++ */
++static enum svc_auth_status
++encoded_ds_authenticate(struct svc_rqst *rqstp)
++{
++	switch (rqstp->rq_authop->flavour) {
++	case RPC_AUTH_NULL:
++	case RPC_AUTH_UNIX:
++		rqstp->rq_auth_stat = rpc_auth_ok;
++		if (rqstp->rq_proc == 0)
++			return SVC_OK;
++		return svc_set_client(rqstp);
++	default:
++		rqstp->rq_auth_stat = rpc_autherr_badcred;
++		return SVC_DENIED;
++	}
++}
++
++static struct svc_program encoded_ds_program = {
++	.pg_prog		= ENCODED_DS_PROGRAM,
++	.pg_nvers		= ARRAY_SIZE(encoded_ds_versions),
++	.pg_vers		= encoded_ds_versions,
++	.pg_name		= "encoded_ds",
++	/* Share authentication with nfsd, as lockd does. */
++	.pg_class		= "nfsd",
++	.pg_authenticate	= encoded_ds_authenticate,
++	.pg_init_request	= svc_generic_init_request,
++	.pg_rpcbind_set		= svc_generic_rpcbind_set,
++};
++
++/* ----------------------------------------------------------------- thread -- */
++
++static int
++encoded_ds_thread(void *data)
++{
++	struct svc_rqst *rqstp = data;
++
++	/*
++	 * A kthread inherits init's fs_struct, whose root is not necessarily
++	 * where the export paths resolve from; nfsd unshares for the same
++	 * reason. svc_set_num_threads() waits for this status, so it is not
++	 * optional.
++	 */
++	svc_thread_init_status(rqstp, unshare_fs_struct());
++
++	set_freezable();
++	while (!svc_thread_should_stop(rqstp))
++		svc_recv(rqstp);
++
++	svc_exit_thread(rqstp);
++	return 0;
++}
++
++/* ------------------------------------------------------------- lifecycle -- */
++
++unsigned short encoded_ds_get_port(void)
++{
++	return encoded_ds_bound_port;
++}
++
++static void encoded_ds_debugfs_init(void)
++{
++	encoded_ds_debugfs = debugfs_create_dir("encoded_ds", NULL);
++	if (IS_ERR_OR_NULL(encoded_ds_debugfs))
++		return;
++
++	debugfs_create_atomic_t("probe", 0444, encoded_ds_debugfs, &ds_nr_probe);
++	debugfs_create_atomic_t("read", 0444, encoded_ds_debugfs, &ds_nr_read);
++	debugfs_create_atomic_t("write", 0444, encoded_ds_debugfs, &ds_nr_write);
++	debugfs_create_atomic_t("write_unstable", 0444, encoded_ds_debugfs,
++				&ds_nr_write_unstable);
++	debugfs_create_u64("read_ns", 0444, encoded_ds_debugfs, &ds_read_ns);
++	debugfs_create_u64("write_ns", 0444, encoded_ds_debugfs, &ds_write_ns);
++	debugfs_create_atomic_t("inflight", 0444, encoded_ds_debugfs,
++				&ds_inflight);
++	debugfs_create_atomic_t("inflight_max", 0444, encoded_ds_debugfs,
++				&ds_inflight_max);
++	debugfs_create_atomic_t("write_file_sync", 0444, encoded_ds_debugfs,
++				&ds_nr_write_file_sync);
++	debugfs_create_atomic_t("not_encoded", 0444, encoded_ds_debugfs,
++				&ds_nr_not_encoded);
++	debugfs_create_atomic_t("codec_unknown", 0444, encoded_ds_debugfs,
++				&ds_nr_codec_unknown);
++	debugfs_create_atomic_t("errors", 0444, encoded_ds_debugfs,
++				&ds_nr_errors);
++}
++
++/*
++ * Called from nfsd's pNFS init/exit, which is serialized with module load, so
++ * one service at a time; the mutex is for the module path where nfsd's own
++ * locking is not held.
++ */
++static DEFINE_MUTEX(encoded_ds_mutex);
++
++int encoded_ds_start(void)
++{
++	struct svc_serv *serv;
++	int ret;
++
++	mutex_lock(&encoded_ds_mutex);
++	if (encoded_ds_serv) {
++		mutex_unlock(&encoded_ds_mutex);
++		return 0;
++	}
++
++	serv = svc_create(&encoded_ds_program, ENCODED_DS_BUFSIZE,
++			  encoded_ds_thread);
++	if (!serv) {
++		mutex_unlock(&encoded_ds_mutex);
++		return -ENOMEM;
++	}
++
++	/* Listener first: svc_set_num_threads() can then fail cleanly. */
++	ret = svc_xprt_create(serv, "tcp", &init_net, AF_INET, encoded_ds_port,
++			      SVC_SOCK_ANONYMOUS, current_cred());
++	if (ret < 0)
++		goto out_destroy;
++
++	encoded_ds_bound_port = ret;
++
++#if IS_ENABLED(CONFIG_IPV6)
++	/*
++	 * The address the client gets in the layout is the one it reached the
++	 * MDS at, which may be IPv6 even when the MDS also has an IPv4
++	 * address; listen on both. Best effort: an IPv4-only host still works.
++	 */
++	ret = svc_xprt_create(serv, "tcp", &init_net, AF_INET6,
++			      encoded_ds_bound_port, SVC_SOCK_ANONYMOUS,
++			      current_cred());
++	if (ret < 0)
++		pr_info("encoded_ds: no IPv6 listener (%d)\n", ret);
++#endif
++
++	ret = svc_set_num_threads(serv, 0, encoded_ds_nthreads);
++	if (ret < 0) {
++		svc_xprt_destroy_all(serv, &init_net, true);
++		goto out_destroy;
++	}
++
++	encoded_ds_serv = serv;
++	mutex_unlock(&encoded_ds_mutex);
++
++	encoded_ds_debugfs_init();
++	pr_info("encoded_ds: listening on port %u with %u threads\n",
++		encoded_ds_bound_port, encoded_ds_nthreads);
++	return 0;
++
++out_destroy:
++	svc_destroy(&serv);
++	mutex_unlock(&encoded_ds_mutex);
++	return ret;
++}
++
++void encoded_ds_stop(void)
++{
++	mutex_lock(&encoded_ds_mutex);
++	if (encoded_ds_serv) {
++		svc_set_num_threads(encoded_ds_serv, 0, 0);
++		svc_xprt_destroy_all(encoded_ds_serv, &init_net, true);
++		svc_destroy(&encoded_ds_serv);
++		encoded_ds_bound_port = 0;
++	}
++	mutex_unlock(&encoded_ds_mutex);
++
++	debugfs_remove_recursive(encoded_ds_debugfs);
++	encoded_ds_debugfs = NULL;
++}
+diff --git a/fs/nfsd/nfs4layouts.c b/fs/nfsd/nfs4layouts.c
+index 2121ef26e..ae9dd60d1 100644
+--- a/fs/nfsd/nfs4layouts.c
++++ b/fs/nfsd/nfs4layouts.c
+@@ -8,6 +8,7 @@
+ #include <linux/jhash.h>
+ #include <linux/sched.h>
+ #include <linux/sunrpc/addr.h>
++#include <linux/encoded_extent_ds.h>
+ 
+ #include "pnfs.h"
+ #include "netns.h"
+@@ -37,6 +38,9 @@ const struct nfsd4_layout_ops *nfsd4_layout_ops[LAYOUT_TYPE_MAX] =  {
+ #ifdef CONFIG_NFSD_SCSILAYOUT
+ 	[LAYOUT_SCSI]		= &scsi_layout_ops,
+ #endif
++#ifdef CONFIG_NFSD_BCACHEFS_LAYOUT
++	[LAYOUT_BCACHEFS_ENCODED]	= &bc_layout_ops,
++#endif
+ };
+ 
+ /* pNFS device ID to export fsid mapping */
+@@ -125,7 +129,8 @@ nfsd4_set_deviceid(struct nfsd4_deviceid *id, const struct svc_fh *fhp,
+ 
+ void nfsd4_setup_layout_type(struct svc_export *exp)
+ {
+-#if defined(CONFIG_NFSD_BLOCKLAYOUT) || defined(CONFIG_NFSD_SCSILAYOUT)
++#if defined(CONFIG_NFSD_BLOCKLAYOUT) || defined(CONFIG_NFSD_SCSILAYOUT) || \
++	defined(CONFIG_NFSD_BCACHEFS_LAYOUT)
+ 	struct super_block *sb = exp->ex_path.mnt->mnt_sb;
+ #endif
+ 
+@@ -149,6 +154,15 @@ void nfsd4_setup_layout_type(struct svc_export *exp)
+ 	    sb->s_bdev->bd_disk->fops->get_unique_id)
+ 		exp->ex_layout_types |= 1 << LAYOUT_SCSI;
+ #endif
++#ifdef CONFIG_NFSD_BCACHEFS_LAYOUT
++	/*
++	 * Only offer the encoded layout type for a filesystem that can
++	 * actually serve it: the data service talks to the filesystem through
++	 * this vtable, and a filesystem without one has nothing to move.
++	 */
++	if (sb->s_export_op && sb->s_export_op->encoded_extent_ops)
++		exp->ex_layout_types |= 1 << LAYOUT_BCACHEFS_ENCODED;
++#endif
+ }
+ 
+ void nfsd4_close_layout(struct nfs4_layout_stateid *ls)
+@@ -790,6 +804,13 @@ nfsd4_init_pnfs(void)
+ 		kmem_cache_destroy(nfs4_layout_cache);
+ 		return -ENOMEM;
+ 	}
++
++	/*
++	 * The data service is started on the first layout request, not here:
++	 * its listeners need IPv6, and inet6_init() may not have run yet when
++	 * nfsd's initcall does. nfsd starts its own listeners the same way -
++	 * later, on demand.
++	 */
+ 	return 0;
+ }
+ 
+@@ -798,6 +819,10 @@ nfsd4_exit_pnfs(void)
+ {
+ 	int i;
+ 
++#ifdef CONFIG_NFSD_ENCODED_DS
++	encoded_ds_stop();
++#endif
++
+ 	kmem_cache_destroy(nfs4_layout_cache);
+ 	kmem_cache_destroy(nfs4_layout_stateid_cache);
+ 
+diff --git a/fs/nfsd/pnfs.h b/fs/nfsd/pnfs.h
+index db9af7804..c5a3db7c0 100644
+--- a/fs/nfsd/pnfs.h
++++ b/fs/nfsd/pnfs.h
+@@ -52,6 +52,9 @@ extern const struct nfsd4_layout_ops scsi_layout_ops;
+ #ifdef CONFIG_NFSD_FLEXFILELAYOUT
+ extern const struct nfsd4_layout_ops ff_layout_ops;
+ #endif
++#ifdef CONFIG_NFSD_BCACHEFS_LAYOUT
++extern const struct nfsd4_layout_ops bc_layout_ops;
++#endif
+ 
+ __be32 nfsd4_preprocess_layout_stateid(struct svc_rqst *rqstp,
+ 		struct nfsd4_compound_state *cstate, stateid_t *stateid,
+diff --git a/include/linux/encoded_extent.h b/include/linux/encoded_extent.h
+new file mode 100644
+index 000000000..c0ea44258
+--- /dev/null
++++ b/include/linux/encoded_extent.h
+@@ -0,0 +1,290 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_ENCODED_EXTENT_H
++#define _LINUX_ENCODED_EXTENT_H
++
++#include <linux/types.h>
++#include <linux/fs.h>
++
++struct inode;
++struct module;
++
++/*
++ * Encoded extent I/O: move a filesystem's compressed, checksummed extents
++ * without decoding them.
++ *
++ * The unit is one whole encoded extent as the filesystem stores it. A caller
++ * sees a descriptor, not the on-disk format:
++ *
++ *   - @unit_max and @unit_align are the largest encoded payload a backend will
++ *     produce and the alignment an encoded offset and length must respect. A
++ *     caller that cannot align a request falls back to ordinary I/O. A
++ *     @unit_max of 0 means this filesystem cannot be served encoded at all: a
++ *     layout must not be offered for it, and a caller that asks anyway is
++ *     refused. That is how a backend reports a limit of its own serving path
++ *     rather than dying inside it;
++ *   - @compression is the backend's own codec numbering, so a client can
++ *     decode with the matching codec - the counter half of the offload;
++ *   - @unit_offset and @unit_len are the plaintext range the encoded unit
++ *     covers. The requested range may start inside it, which is how page- or
++ *     block-padded encodings are described, and @unencoded_offset says where
++ *     the requested range starts within the unit's plaintext;
++ *   - @encrypted: encoded I/O deliberately does not touch encryption. An
++ *     encrypted extent is refused (-ENODATA) and the caller falls back, so no
++ *     key handling is duplicated here.
++ *
++ * Checksums are the backend's business: it verifies on read and computes on
++ * write, so an encoded payload is never trusted blindly and no checksum code
++ * is duplicated by the caller. A backend refuses a payload it cannot describe
++ * rather than storing something no reader could decode - the same rule the
++ * on-disk format would enforce for a local writer.
++ *
++ * Encoded I/O is a serving facility: it exists so a filesystem can be exported
++ * to a client that does the codec work itself, which is why the ops hang off
++ * export_operations. A filesystem that cannot be exported does not need them,
++ * and a backend only needs to implement what it can do honestly - anything it
++ * refuses falls back to ordinary I/O, which is always correct.
++ */
++struct encoded_extent_desc {
++	u64	unit_offset;		/* logical offset of the unit's start */
++	u64	unit_len;		/* plaintext the unit covers */
++	u64	unencoded_offset;	/* start of the requested range in it */
++	u32	compression;		/* backend's codec numbering */
++	bool	encrypted;
++};
++
++/*
++ * How durable a write has to be, and how durable it turned out.
++ *
++ * These are NFS's three write-stability levels with the same values, named here
++ * because encoded I/O exists to serve NFS and the levels are the far end's
++ * contract: a backend may always do more than it was asked, and must never
++ * claim more than it has done. @ENCODED_EXTENT_UNSTABLE is a page cache write -
++ * a client that needs the data on stable storage must come back and ask for
++ * more; @ENCODED_EXTENT_DATA_SYNC is the data on stable storage with metadata
++ * possibly still in flight; @ENCODED_EXTENT_FILE_SYNC is both.
++ */
++enum encoded_extent_stable {
++	ENCODED_EXTENT_UNSTABLE		= 0,
++	ENCODED_EXTENT_DATA_SYNC	= 1,
++	ENCODED_EXTENT_FILE_SYNC	= 2,
++};
++
++/*
++ * The durability half of an encoded write, which is the same on every backend:
++ * the payload reached the page cache, so the level the caller asked for is
++ * honoured by syncing the unit's own plaintext range - the data alone for a data
++ * sync, the data and the metadata for a file sync - and what actually happened
++ * is handed back. A level below a data sync needs no work and is reported as
++ * what it is.
++ *
++ * The range is the *unit's*, not the requested range: a request may start inside
++ * a unit, and syncing past the unit's end would make this call responsible for
++ * data it did not write.
++ */
++static inline int encoded_extent_sync(struct file *file, u64 offset, u64 len,
++				      enum encoded_extent_stable how,
++				      enum encoded_extent_stable *committed)
++{
++	loff_t start = offset;
++	loff_t end = offset + len - 1;
++	int ret;
++
++	if (how < ENCODED_EXTENT_DATA_SYNC) {
++		*committed = ENCODED_EXTENT_UNSTABLE;
++		return 0;
++	}
++
++	ret = vfs_fsync_range(file, start, end,
++			      how == ENCODED_EXTENT_DATA_SYNC);
++	if (ret)
++		return ret;
++
++	*committed = how;
++	return 0;
++}
++
++/*
++ * A codec a filesystem stores encoded extents with, and what the peer that does
++ * the codec work needs to run it.
++ *
++ * The two halves of a codec have different owners, which is why this exists
++ * rather than a bare number on the wire. The exporting filesystem owns the
++ * numbering: @compression is the number its own encoded_extent_desc carries, and
++ * only it knows which of its codecs a given extent used. The peer owns the
++ * implementation, because the peer is the one decoding and encoding - which also
++ * means it must have the codec, and that a codec it does not have is a range it
++ * cannot serve. @name is the identity that crosses between them.
++ *
++ * So a filesystem registers the codecs it may store extents with, a peer
++ * resolves a name to an implementation, and a name that does not resolve is a
++ * range that falls back to ordinary I/O - which is always correct. Nothing on
++ * either side has to know the other's numbering, and the backend's numbering is
++ * never on the wire.
++ *
++ * Registration is per layout type: the same codec name can mean different
++ * framing to two filesystems, and the layout type identifies the format.
++ *
++ * A provider is usually a module, and the only thing that names it is the
++ * codec's own name, so the module that implements one advertises
++ * MODULE_ALIAS_ENCODED_EXTENT_CODEC(@name) and a peer that cannot resolve a
++ * name asks for that module before giving up. A provider built into the kernel
++ * needs nothing.
++ */
++
++/* Bytes, no terminator: how long a codec name may be to be asked for by name. */
++#define ENCODED_EXTENT_CODEC_NAME_MAX	32
++
++/* The module alias a codec's provider advertises, and what is asked for. */
++#define ENCODED_EXTENT_CODEC_MODULE_PREFIX	"encoded-extent-codec-"
++
++#define MODULE_ALIAS_ENCODED_EXTENT_CODEC(name) \
++	MODULE_ALIAS(ENCODED_EXTENT_CODEC_MODULE_PREFIX name)
++struct encoded_extent_codec {
++	struct module	*owner;
++	u32		compression;
++	const char	*name;
++	/*
++	 * Decode @src into @dst, at most @dst_cap bytes; *@dst_len is the
++	 * plaintext length on success. A codec that will not store encoded
++	 * extents fills in only the naming half and leaves these NULL; a peer
++	 * that needs one and finds it missing does not serve the range
++	 * encoded.
++	 */
++	int		(*decode)(const void *src, size_t src_len,
++				  void *dst, size_t dst_cap, size_t *dst_len);
++	int		(*encode)(const void *src, size_t src_len,
++				  void *dst, size_t dst_cap, size_t *dst_len);
++};
++
++/*
++ * The filesystem that stores them registers its codecs; a peer looks them up by
++ * layout type, by name (what the wire carries) or by the filesystem's own
++ * numbering, and @index, filled in by the latter, is the codec's position in the
++ * registered table - the number that goes on the wire in the descriptor's place.
++ * @names() and those positions agree by construction, which is what keeps a
++ * unit's codec number and the layout's list of names consistent.
++ *
++ * A lookup holds a reference to the codec's module, released with
++ * @encoded_extent_codec_put, so a codec cannot be unloaded under a layout that
++ * is still using it.
++ */
++int encoded_extent_codec_register(u32 layout_type,
++		const struct encoded_extent_codec * const *codecs,
++		unsigned int nr_codecs);
++void encoded_extent_codec_unregister(u32 layout_type,
++		const struct encoded_extent_codec * const *codecs);
++/*
++ * Resolve a name to a codec: if it does not resolve, ask for the module that
++ * advertises it (MODULE_ALIAS_ENCODED_EXTENT_CODEC()) and look again. A name
++ * whose provider cannot be loaded, or whose characters cannot be part of an
++ * alias, is left unresolved - which is a hole the caller falls back over, never
++ * an error. Repeated asks for one name are rate limited, because the name came
++ * from a peer.
++ */
++const struct encoded_extent_codec *encoded_extent_codec_find_or_load(
++		u32 layout_type, const char *name);
++/* How many times a provider has been asked for, for tests and debugging. */
++unsigned long encoded_extent_codec_load_attempts(void);
++void encoded_extent_codec_put(const struct encoded_extent_codec *codec);
++
++struct encoded_extent_ops {
++	/*
++	 * The codecs this filesystem stores encoded extents with, in the order a
++	 * layout names them. A descriptor's codec is a position in *this* list,
++	 * not in every codec registered for the layout type: two filesystems can
++	 * be exported under one layout type at once, and a position resolved
++	 * against a merged list would name one filesystem's codec to the peer
++	 * and another's to the server. The same array is registered by name (see
++	 * encoded_extent_codec_register()) so that a peer which does not have
++	 * the codec can find an implementation for it.
++	 */
++	const struct encoded_extent_codec * const *codecs;
++	unsigned int	nr_codecs;
++
++	/*
++	 * The largest encoded payload a backend will produce, and the alignment
++	 * an encoded offset and length must respect. Per-mount values (btrfs's
++	 * sector size, bcachefs's block size and encoded extent ceiling), so
++	 * they are calls rather than constants.
++	 */
++	u32 (*unit_max)(struct inode *inode);
++	u32 (*unit_align)(struct inode *inode);
++
++	/*
++	 * Read the encoded unit covering [offset, offset + len) into @dst,
++	 * whose capacity is *@dst_len on entry; on success *@dst_len is the
++	 * payload length. Returns -ENODATA if the range has no encoded unit
++	 * (hole, inline, nocow, uncompressed, encrypted) and the caller must
++	 * fall back to ordinary reads.
++	 */
++	int (*read)(struct file *file, u64 offset, size_t len,
++		    void *dst, size_t *dst_len,
++		    struct encoded_extent_desc *desc);
++
++	/*
++	 * Insert @len bytes of encoded payload as the unit covering
++	 * [offset, offset + @desc->unit_len), with the inode's and the
++	 * filesystem's normal allocation policy. Returns -ENODATA if the
++	 * backend will not store encoded data here (an encrypted or nocow
++	 * inode, a codec mismatch, a payload that is not a whole unit) and the
++	 * caller must fall back to ordinary writes; -EINVAL only for a
++	 * malformed request.
++	 *
++	 * @how is what the caller needs to survive, and *@committed is what the
++	 * backend actually reached: @how when it honoured the request, a lower
++	 * level when it could not. A backend whose writes land in the page cache
++	 * reports @ENCODED_EXTENT_UNSTABLE unless it synced, which is the whole
++	 * point of the pair: a caller must be able to tell a write that survives
++	 * a power cut from one that does not. A backend that is always durable
++	 * (write-through to stable storage) may report more than it was asked
++	 * for.
++	 */
++	int (*write)(struct file *file, u64 offset,
++		     const void *src, size_t len,
++		     const struct encoded_extent_desc *desc,
++		     enum encoded_extent_stable how,
++		     enum encoded_extent_stable *committed);
++
++	/*
++	 * Describe the encoded unit covering [offset, offset + len) without
++	 * transferring it, so a caller can align requests and choose between
++	 * the encoded path and the fallback. -ENODATA as above.
++	 */
++	int (*probe)(struct file *file, u64 offset, size_t len,
++		     struct encoded_extent_desc *desc);
++};
++
++/*
++ * The codec at a position in a filesystem's own list, or NULL if it has none
++ * there - which is what a descriptor naming a position past the end means, and
++ * a range that is not served encoded.
++ */
++static inline const struct encoded_extent_codec *
++encoded_extent_codec_by_position(const struct encoded_extent_ops *ops,
++				 unsigned int position)
++{
++	return position < ops->nr_codecs ? ops->codecs[position] : NULL;
++}
++
++/*
++ * The position of the codec with a filesystem's own numbering, or NULL if it
++ * has no such codec registered - a codec the filesystem stores extents with
++ * but does not offer to peers, which those extents' ranges fall back over.
++ */
++static inline const struct encoded_extent_codec *
++encoded_extent_codec_by_compression(const struct encoded_extent_ops *ops,
++				    u32 compression, unsigned int *position)
++{
++	unsigned int i;
++
++	for (i = 0; i < ops->nr_codecs; i++)
++		if (ops->codecs[i]->compression == compression) {
++			if (position)
++				*position = i;
++			return ops->codecs[i];
++		}
++
++	return NULL;
++}
++
++#endif /* _LINUX_ENCODED_EXTENT_H */
+diff --git a/include/linux/encoded_extent_ds.h b/include/linux/encoded_extent_ds.h
+new file mode 100644
+index 000000000..ad1ddf43e
+--- /dev/null
++++ b/include/linux/encoded_extent_ds.h
+@@ -0,0 +1,122 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_ENCODED_EXTENT_DS_H
++#define _LINUX_ENCODED_EXTENT_DS_H
++
++#include <linux/types.h>
++
++/*
++ * The encoded-extent data service: how a client gets a filesystem's stored
++ * extents without the server decoding them.
++ *
++ * It is an RPC program of its own rather than new NFS operations, for two
++ * reasons. It rides on sunrpc, so it inherits the transport work a network
++ * filesystem otherwise reimplements - reconnect, request slots, keepalives,
++ * timeouts, multiple requests in flight - and it can be developed without
++ * touching the NFS protocol. And the payload is not NFS-shaped: one whole
++ * encoded extent plus the small descriptor needed to decode it, which reads
++ * awkwardly as a READ with a length.
++ *
++ * Files are addressed the way NFS addresses them: the file handle the MDS
++ * handed out in the layout, resolved by nfsd's own fh_verify(), so this works
++ * for any filesystem that can be exported and needs no filesystem-specific
++ * identity on the wire. The address is what an MDS that is also the data
++ * service knows - the address the client reached it at - which is exactly
++ * flexfiles' trick. A file handle is only meaningful relative to an export, and
++ * fh_verify() finds that export by fsid for the client that presented the
++ * handle, which is why the wire carries no export name: the export comes from
++ * the handle and the presenting client, so a caller cannot name one it is not
++ * allowed.
++ *
++ * Status: 0 for success, or -errno as an s32. -ENODATA means "not served
++ * encoded" - a hole, an uncompressed, inline, nocow or encrypted extent, an
++ * extent whose codec the exporting filesystem has not registered, a payload the
++ * backend refuses - and the caller uses ordinary NFS I/O, which is
++ * always correct.
++ *
++ * PROGRAM NUMBER: unregistered and experimental. A submission would take a
++ * number from IANA's RPC program registry, or a vendor range.
++ *
++ * Procedure arguments, in order (all opaques are XDR length-prefixed):
++ *
++ *   NULL   ()
++ *   PROBE  (addr, offset u64, len u64)              -> probe reply
++ *   READ   (addr, offset u64, buf_size u32)         -> read reply, payload
++ *   WRITE  (addr, offset u64, desc, stable u32, data opaque) -> write reply
++ *
++ *   addr   = fh opaque
++ *   desc   = unit_offset u64, unit_len u64, unencoded_offset u64,
++ *            codec u32, encrypted u32
++ *   probe reply = status s32, desc
++ *   read reply  = status s32, desc, payload (absent unless status is 0)
++ *   write reply = status s32, committed u32, writeverf[8]
++ *
++ * @stable is how durable the writer needs this unit to be, as NFS's three
++ * levels (0 unstable, 1 data sync, 2 file sync), and @committed is what the
++ * service actually reached - never more than it can back, and never more than
++ * @stable. A service whose backend stores the unit in the page cache says
++ * unstable, and the writer has to come back and commit; claiming otherwise
++ * would lose an acknowledged write on a power cut.
++ *
++ * @writeverf is the 8-byte write verifier of the serving nfsd net namespace -
++ * the same value, from the same source, that this server's own NFS WRITE and
++ * COMMIT replies carry. A client that writes unstably and commits later
++ * compares it against the one the commit returns, which is how it learns that
++ * a server restart lost the data; so the two paths must agree, not merely be
++ * restart-unique.
++ *
++ * @codec is a position in the codec list the layout carried, not the
++ * filesystem's own numbering for the codec: the layout names the codecs the
++ * export may use, in the order these positions index, and a peer resolves the
++ * position to a name to an implementation. The filesystem's numbering never
++ * crosses the wire, so neither side needs the other's.
++ */
++
++#define ENCODED_DS_PROGRAM	0x2000BC01
++#define ENCODED_DS_VERSION	2
++
++enum encoded_ds_proc {
++	ENCODED_DS_NULL		= 0,
++	ENCODED_DS_PROBE	= 1,
++	ENCODED_DS_READ		= 2,
++	ENCODED_DS_WRITE	= 3,
++	ENCODED_DS_NR_PROCS
++};
++
++#define ENCODED_DS_MAX_FH	128	/* bytes; an NFSv4 handle is at most 128 */
++/*
++ * The most one encoded extent can be on the wire: 2 MiB, bcachefs's own
++ * maximum unit. It is not a promise that a unit that large can be *served* -
++ * the read path builds one bio per unit and the bio vector pool stops at
++ * BIO_MAX_VECS pages (1 MiB), so a backend must refuse a payload it cannot
++ * read rather than dying in bvec_alloc(). The layout's unit_max is what says
++ * what this service will actually answer for.
++ */
++#define ENCODED_DS_MAX_PAYLOAD	(2U << 20)
++#define ENCODED_DS_MAX_CODECS	8	/* codecs one layout may name */
++#define ENCODED_DS_MAX_CODEC_NAME 16	/* bytes, no terminator on the wire */
++#define ENCODED_DS_WRITEVERF	8	/* bytes; NFS's write verifier size */
++
++/*
++ * What a reader needs to decode the payload. @codec indexes the layout's codec
++ * list. The checksum is deliberately absent: the backend verifies it on read and
++ * computes it on write, so a peer never reproduces the filesystem's checksum
++ * code.
++ */
++struct encoded_ds_desc {
++	__u64	unit_offset;
++	__u64	unit_len;
++	__u64	unencoded_offset;
++	__u32	codec;
++	__u32	encrypted;
++};
++
++/*
++ * Server side (fs/nfsd/encoded_ds.c). The service is started and stopped with
++ * nfsd; @encoded_ds_get_port returns 0 while it is not running, which is what a
++ * layout uses to say "no data service" to a client.
++ */
++int encoded_ds_start(void);
++void encoded_ds_stop(void);
++unsigned short encoded_ds_get_port(void);
++
++#endif /* _LINUX_ENCODED_EXTENT_DS_H */
+diff --git a/include/linux/exportfs.h b/include/linux/exportfs.h
+index f0cf2714e..83bb935a6 100644
+--- a/include/linux/exportfs.h
++++ b/include/linux/exportfs.h
+@@ -257,7 +257,17 @@ struct handle_to_path_ctx {
+  *    get_name is not (which is possibly inconsistent)
+  */
+ 
++struct encoded_extent_ops;
++
+ struct export_operations {
++	/*
++	 * Compressed, checksummed extents as stored, for a client that does
++	 * the codec work itself; see linux/encoded_extent.h. Optional: NULL
++	 * means ordinary I/O only, which is what every backend can fall back
++	 * to anyway.
++	 */
++	const struct encoded_extent_ops *encoded_extent_ops;
++
+ 	int (*encode_fh)(struct inode *inode, __u32 *fh, int *max_len,
+ 			struct inode *parent);
+ 	struct dentry * (*fh_to_dentry)(struct super_block *sb, struct fid *fid,
+diff --git a/include/linux/nfs4.h b/include/linux/nfs4.h
+index e947af6a3..b5556ac1c 100644
+--- a/include/linux/nfs4.h
++++ b/include/linux/nfs4.h
+@@ -727,6 +727,7 @@ enum pnfs_layouttype {
+ 	LAYOUT_BLOCK_VOLUME = 3,
+ 	LAYOUT_FLEX_FILES = 4,
+ 	LAYOUT_SCSI = 5,
++	LAYOUT_BCACHEFS_ENCODED = 6,
+ 	LAYOUT_TYPE_MAX
+ };
+ 
