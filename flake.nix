@@ -40,6 +40,9 @@
       # The server module owns the export; the client module owns the mounts.
       # These take the upstream source and the patch, and apply it themselves,
       # so they need no store path from this flake.
+      nixosModules.server = import ./nix/modules/server.nix { inherit bcachefsTools; };
+      nixosModules.client = import ./nix/modules/client.nix { inherit bcachefsTools; };
+
       packages = forAllSystems (pkgs:
         let
           src = patched pkgs;
