@@ -80,6 +80,9 @@
           gce = { profile = "gce-network-storage"; };
         in
         {
+          btrfs = import ./nix/tests/btrfs.nix btrfsArgs;
+          btrfs-gce-network-storage =
+            import ./nix/tests/btrfs.nix (btrfsArgs // gce);
           emulation = import ./nix/tests/emulation-check.nix { inherit pkgs; lib = pkgs.lib; };
           # The backend rather than the layout: three devices, fg + bg +
           # promote with durability=0, and the assertion that a read leaves the
