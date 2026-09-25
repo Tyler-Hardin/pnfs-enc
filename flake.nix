@@ -83,6 +83,11 @@
           btrfs = import ./nix/tests/btrfs.nix btrfsArgs;
           btrfs-gce-network-storage =
             import ./nix/tests/btrfs.nix (btrfsArgs // gce);
+          bcachefs = import ./nix/tests/bcachefs.nix bcachefsArgs;
+          bcachefs-gce-network-storage =
+            import ./nix/tests/bcachefs.nix (bcachefsArgs // gce);
+          # Not a suite: it checks the emulation the suites lean on. It builds
+          # no kernel, so it is the cheap one.
           emulation = import ./nix/tests/emulation-check.nix { inherit pkgs; lib = pkgs.lib; };
           # The backend rather than the layout: three devices, fg + bg +
           # promote with durability=0, and the assertion that a read leaves the
