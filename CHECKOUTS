@@ -2,4 +2,4 @@
 # .githooks/pre-commit on every commit (see README.md).  A revision
 # marked +dirty had uncommitted changes when this commit was made.
 linux           71dd283bd7e89b60b37e1ba047da14107e101262  pnfs     nfs,nfsd: the reply path, request shape, and the fixes the suites turned up
-bcachefs-tools  5785889c44e03fb72977fe2031cd63580afe3d36  master   bcachefs: a promote onto a durability 0 device is not "no rw devs"
+bcachefs-tools  c6aaaeca874e6d658e79f26a0880112aa797327c  master   Remove CLAUDE.md
