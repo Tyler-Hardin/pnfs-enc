@@ -93,6 +93,7 @@
           # promote with durability=0, and the assertion that a read leaves the
           # data on the promote device. It is here because a promote that is
           # refused is silent - see the file's header.
+          promote = import ./nix/tests/promote.nix { inherit pkgs src; lib = pkgs.lib; };
           bcachefs-module-c = import ./nix/checks/bcachefs-module-c.nix { inherit pkgs src; };
           bcachefs-module-rust = import ./nix/checks/bcachefs-module-rust.nix { inherit pkgs src; };
         });
