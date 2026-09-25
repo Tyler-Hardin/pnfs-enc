@@ -99,6 +99,12 @@
           # and without it does not.
           promote-on-write =
             import ./nix/tests/promote-on-write.nix { inherit pkgs src; lib = pkgs.lib; };
+          # Not a gate: the numbers for promote_on_write on a bed where fg is
+          # shaped like a network-backed SSD and promote is local, so the
+          # read-path half of the benefit can be seen.  See the file's header
+          # for what the bed can and cannot model.
+          promote-bench =
+            import ./nix/tests/promote-bench.nix { inherit pkgs src; lib = pkgs.lib; };
           bcachefs-module-c = import ./nix/checks/bcachefs-module-c.nix { inherit pkgs src; };
           bcachefs-module-rust = import ./nix/checks/bcachefs-module-rust.nix { inherit pkgs src; };
         });
