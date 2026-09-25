@@ -94,6 +94,11 @@
           # data on the promote device. It is here because a promote that is
           # refused is silent - see the file's header.
           promote = import ./nix/tests/promote.nix { inherit pkgs src; lib = pkgs.lib; };
+          # The other half of the backend's promote story: with promote_on_write
+          # a write leaves a cached copy on the promote target before any read,
+          # and without it does not.
+          promote-on-write =
+            import ./nix/tests/promote-on-write.nix { inherit pkgs src; lib = pkgs.lib; };
           bcachefs-module-c = import ./nix/checks/bcachefs-module-c.nix { inherit pkgs src; };
           bcachefs-module-rust = import ./nix/checks/bcachefs-module-rust.nix { inherit pkgs src; };
         });

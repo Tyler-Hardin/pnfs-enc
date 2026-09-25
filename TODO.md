@@ -10,7 +10,9 @@ authorization through nfsd's own `fh_verify`/`nfsd_open`, with the refusals
 tested on the wire; NFS's stability levels and the serving write verifier on the
 wire, with commits through the MDS; codec providers findable by module alias and
 rate limited; the codec table owned by the filesystem rather than by the layout
-type; durability across a server crash; two clients staying coherent.
+type; durability across a server crash; two clients staying coherent; and the
+backend's two promote paths - a read filling the cache, and `promote_on_write`
+filling it from the write.
 
 ## What is next
 
@@ -50,7 +52,7 @@ backend.
 | | btrfs | bcachefs |
 |---|---|---|
 | works end to end | yes | yes |
-| test depth | reads, writes, fallback, codec A/B, durability, crash, coherence (two clients), failure modes (unreachable service, ENOSPC, the payload ceiling), throughput, concurrency | the same, plus the backend promote check |
+| test depth | reads, writes, fallback, codec A/B, durability, crash, coherence (two clients), failure modes (unreachable service, ENOSPC, the payload ceiling), throughput, concurrency | the same, plus the backend promote checks (read-time, and write-time with `promote_on_write`) |
 | coherence | two clients, incl. a held delegation and an NFSv3 reader | same |
 | durability | stable/unstable both ways; commits through the MDS and the backend's own fsync | same |
 | authorization | nfsd's own `fh_verify`/`nfsd_open` per request; refusals tested | same |

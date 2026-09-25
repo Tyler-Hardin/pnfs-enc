@@ -74,6 +74,13 @@ the data service's port (which is *not* nfsd's port, and which nothing else
 opens), sets the service's thread count and port as kernel parameters, and loads
 the bcachefs module. It does not mount the filesystem; that is yours.
 
+If the export's durable store is across a network and a local `promote_target`
+is configured, mount with `-o promote_on_write` to write new data to both: the
+first read after a write is then served from the local copy instead of the
+durable one. It is a mount option rather than a superblock option, so it changes
+nothing on disk and is the bcachefs side of the placement decision - see
+[`doc/design.md`](doc/design.md).
+
 Client:
 
 ```nix

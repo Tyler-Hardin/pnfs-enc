@@ -184,6 +184,52 @@ index b64bc8432..704b0828a 100644
  	errcode.o				\
  	fs/acl.o				\
  	fs/check.o				\
+diff --git a/fs/alloc/foreground.c b/fs/alloc/foreground.c
+index e1a047993..e5a22bece 100644
+--- a/fs/alloc/foreground.c
++++ b/fs/alloc/foreground.c
+@@ -1799,9 +1799,13 @@ retry:
+ 		/*
+ 		 * Rebuilt from scratch: devs_may_alloc has been through
+ 		 * per-device clears and possibly a widened target - the cache
+-		 * copy comes from the target the caller specified:
++		 * copy comes from the target the caller specified.  With
++		 * promote_on_write the caller names a different target
++		 * (@cache_target, the promote target) whose durability 0
++		 * devices hold the copy instead of the write target's own:
+ 		 */
+-		req->devs_may_alloc = target_rw_devs(c, BCH_DATA_cached, orig_target);
++		unsigned cache_target = req->cache_target ?: orig_target;
++		req->devs_may_alloc = target_rw_devs(c, BCH_DATA_cached, cache_target);
+ 
+ 		darray_for_each(*req->devs_have, d)
+ 			__clear_bit(*d, req->devs_may_alloc.d);
+diff --git a/fs/alloc/foreground.h b/fs/alloc/foreground.h
+index 1a6f1607f..a1dce1021 100644
+--- a/fs/alloc/foreground.h
++++ b/fs/alloc/foreground.h
+@@ -46,6 +46,13 @@ struct alloc_request {
+ 	u8			ec_replicas;
+ 	u8			ec_max_data_blocks;	/* 0 = no cap */
+ 	unsigned		target;
++	/*
++	 * Where the write-time cached copy comes from, when the caller wants
++	 * one on a device outside @target - promote_on_write.  0 means "the
++	 * durability 0 devices in @target", the write-through cache case:
++	 * see bch2_alloc_sectors_req().
++	 */
++	unsigned		cache_target;
+ 	bool			ec:1;
+ 	bool			new_stripe_alloc:1;
+ 	bool			will_retry_all_devices:1;
+@@ -420,6 +427,7 @@ static inline struct alloc_request *alloc_request_get(struct btree_trans *trans,
+ 	req->ec_replicas		= ec_replicas;
+ 	req->ec				= erasure_code;
+ 	req->target			= target;
++	req->cache_target		= 0;
+ 	req->watermark			= watermark;
+ 	req->flags			= flags;
+ 	req->devs_have			= devs_have;
 diff --git a/fs/btree/commit.c b/fs/btree/commit.c
 index 6c8b121d3..913daa694 100644
 --- a/fs/btree/commit.c
@@ -364,7 +410,7 @@ index 6f079d191..a756100a7 100644
  	for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
  		if (bch2_dev_list_has_dev(*devs_have, i))
 diff --git a/fs/data/write.c b/fs/data/write.c
-index 2b221c573..23af75d75 100644
+index 2b221c573..6e52bb737 100644
 --- a/fs/data/write.c
 +++ b/fs/data/write.c
 @@ -1814,6 +1814,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
@@ -388,6 +434,26 @@ index 2b221c573..23af75d75 100644
  	/*
  	 * If the data is compressed and we couldn't write the entire extent as
  	 * is, we have to decompress it:
+@@ -2546,8 +2560,18 @@ again:
+ 						  op->watermark,
+ 						  op->flags,
+ 						  !io_in_flight ? &op->cl : NULL);
+-			if (!IS_ERR(req))
++			if (!IS_ERR(req)) {
+ 				req->ec_max_data_blocks = c->opts.ec_max_data_blocks;
++				/*
++				 * promote_on_write: a write-time cached copy
++				 * goes to the promote target rather than to the
++				 * durability 0 devices in the write target.
++				 * bch2_alloc_sectors_req() writes it after the
++				 * durable replicas and never blocks on it.
++				 */
++				if (c->opts.promote_on_write)
++					req->cache_target = op->opts.promote_target;
++			}
+ 			int ret2 = PTR_ERR_OR_ZERO(req) ?:
+ 			bch2_alloc_sectors_req(trans, req, op->write_point, &wp);
+ 
 diff --git a/fs/data/write_types.h b/fs/data/write_types.h
 index b0dc9839e..9e16cda0b 100644
 --- a/fs/data/write_types.h
@@ -1424,6 +1490,24 @@ index 6a4db5b3f..42ccdad8d 100644
  	return 0;
  err:
  	bcachefs_exit();
+diff --git a/fs/opts.h b/fs/opts.h
+index 3b2947d8a..0094a21ce 100644
+--- a/fs/opts.h
++++ b/fs/opts.h
+@@ -224,6 +224,13 @@ enum fsck_err_opts {
+ 	  OPT_FN(bch2_opt_target),					\
+ 	  BCH_SB_PROMOTE_TARGET,	0,				\
+ 	  "(target)",	"Device or label to promote data to on read")	\
++	x(promote_on_write,		u8,				\
++	  OPT_FS|OPT_MOUNT,						\
++	  OPT_BOOL(),							\
++	  BCH2_NO_SB_OPT,		false,				\
++	  NULL,		"Write new data to the promote_target as well as the "\
++			"foreground_target; the promote copy is cached, so it "\
++			"is not a durable replica")\
+ 	x(erasure_code,			u16,				\
+ 	  OPT_FS|OPT_INODE|OPT_FORMAT|OPT_MOUNT_OLD|OPT_RUNTIME,	\
+ 	  OPT_BOOL(),							\
 diff --git a/fs/vfs/fs.c b/fs/vfs/fs.c
 index 285820d21..5f42adbaa 100644
 --- a/fs/vfs/fs.c

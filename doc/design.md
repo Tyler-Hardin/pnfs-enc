@@ -186,6 +186,36 @@ What is left: the write window (the encode of unit N+1 waits for the reply to
 unit N), the per-unit backend cost, and the codec workspace each unit allocates
 on both sides.
 
+## Backend data placement
+
+Where the bytes live is the backend's decision, and for an export whose
+foreground target is across a network it is worth configuring. bcachefs's
+`foreground_target` / `background_target` / `promote_target` and per-device
+`durability` already express writeback and writearound caching, and a
+`durability=0` device in the *foreground* target gives write-through: every write
+also leaves a cached copy there (`bch2_alloc_sectors_req()`, "true writethrough
+caching" in the bcachefs docs).
+
+The shape the deployment here has - the durable store as the only
+`foreground_target`, a separate `promote_target` on a durability 0 device - is
+the writearound one: stock bcachefs fills that cache from a *read*, so the first
+read after a write pays for the foreground trip. The backend patch adds
+`promote_on_write`, a mount option (not a superblock option: no format change, and
+it is chosen at mount) that makes a user-data write also allocate a cached copy
+on the promote target, in the same write operation. The copy is durability 0, so
+success still rests on the foreground write: a promote that cannot be allocated
+is skipped rather than failing the write, and an IO error on it drops the pointer
+and logs a degraded write.
+
+Reads need no change. `bch2_bkey_pick_read_device()` already chooses a replica by
+device latency, biased by the square of it, so the local cache wins over the
+network-backed foreground on its own - with a small share of reads still sent to
+the slow device to keep its latency estimate current. The feature is only about
+the window before a promote-on-read can happen.
+
+It is off by default, and staying off leaves `promote.nix`'s writearound
+behaviour unchanged.
+
 ## Decisions already made - don't relitigate without new information
 
 - pNFS layout type rather than a new filesystem or FUSE. Fallback is free and
