@@ -1,0 +1,12 @@
+# The two checkouts are repositories of their own - the kernel work is commits
+# on branch `pnfs`, the backend is commits on top of upstream bcachefs-tools.
+# Nothing under them is this repository's to track, and nothing under them can
+# be: git refuses to add a file that lives inside another repository's
+# worktree.  Everything this repository owns is at this level.
+/linux/
+/bcachefs-tools/
+
+# Working worktrees of a rewrite, and test-run outputs: nix `result` symlinks
+# and the logs of a run.
+/.worktrees/
+/dev/result-*

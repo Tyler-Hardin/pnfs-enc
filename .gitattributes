@@ -1,0 +1,5 @@
+# The benchmark corpus is real data - see nix/tests/corpus.nix - and every file
+# is 737 MiB. Plain git blobs of that size are refused by most forges (GitHub
+# caps a blob at 100 MB), so they go through LFS: the repository holds a pointer
+# and the forges hold the bytes.
+nix/tests/data/*.bin filter=lfs diff=lfs merge=lfs -text
