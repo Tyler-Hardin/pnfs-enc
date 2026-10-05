@@ -53,12 +53,16 @@ resolves the file by fsid through `fh_verify()`.
 ### The kernel side
 
 `->read_pagelist` / `->write_pagelist` do the work. Reads fetch whole encoded
-units, decode them, and copy the intersection into the request's pages; writes
-compress whole units client-side and store them. Both are asynchronous: a
-request covering several units chains them, each completion issuing the next,
-because a synchronous call inside `read_pagelist` serialises every unit behind a
-round trip. One unit is in flight per request; the pgio carries several
-requests.
+units and decode them straight into the request's pages when the request covers
+the unit; a request that starts or ends inside one decodes into a scratch buffer
+and copies the intersection out. Writes compress a whole unit straight out of
+the request's pages, into a buffer the transport sends as it stands. Both are
+asynchronous: a request covering several units chains them, each completion
+issuing the next, because a synchronous call inside `read_pagelist` serialises
+every unit behind a round trip. One unit is in flight per request; the pgio
+carries several requests. The first unit of a write is encoded on a work item
+rather than in `->write_pagelist`, so the client's writeback worker is not the
+compressor - see the codec boundary below.
 
 The request size is `bc_pg_bsize()`:
 
@@ -74,7 +78,13 @@ per request from `pg_count`.
 ### The codec boundary
 
 The exporting filesystem owns the naming; the peer owns the implementation.
-`struct encoded_extent_codec` is `{owner, compression, name, decode, encode}`.
+`struct encoded_extent_codec` is `{owner, compression, name, decode, encode}`,
+and both directions work in `struct encoded_extent_pages`: a page range with an
+offset and a length, so a codec moves the caller's pages straight through its
+stream with no flattening buffer. On a write that is the request's dirty pages
+in and the send buffer out; on a read the receive buffer in and the request's
+pages out. The zstd stream driving is shared in `fs/encoded_extent.c`, since the
+two backends differ only in framing and parameters.
 
 A filesystem publishes the codecs it stores extents with on its
 `encoded_extent_ops` table, and every *server-side* resolution - the names a
@@ -181,10 +191,22 @@ three, with the service's RPC count and the time it spends in the backend
 - The data service saturates at its thread count; writes to one shared file are
   the hot point. `pg_units` above about 4 loses on the beds measured, so its
   default stays 1.
+- On the client, one `rpc_clnt` is one connection and one slot table, and the
+  pool hangs off the layout header - which is per inode, so a file already gets
+  its own transport. `bc_ds_connections` (module parameter on `nfs`, default 1)
+  widens a single file's pool, which is what a read-ahead with several requests
+  in flight can use; it is left at 1 because a per-file pool of four is four
+  connections for every file. Moving the pool to the mount - a `set_layoutdriver`
+  hook and somewhere on `nfs_server` to hang it - is what would make several
+  transports useful fleet-wide, and is the client-side scaling work left.
 
-What is left: the write window (the encode of unit N+1 waits for the reply to
-unit N), the per-unit backend cost, and the codec workspace each unit allocates
-on both sides.
+The data path moves pages, not copies: a write's unit is encoded straight out of
+the request's pages into the buffer the transport sends, and a whole-unit read
+decodes straight into the pages it is filling. The first unit of a write is
+encoded on a work item, so the client's own writeback worker does not carry the
+compression. What is left: the write window (the encode of unit N+1 waits for the
+reply to unit N), the per-unit backend cost, and the codec workspace each unit
+allocates on both sides.
 
 ## Backend data placement
 

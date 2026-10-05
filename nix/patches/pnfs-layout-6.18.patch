@@ -91,10 +91,10 @@ index 062ebd9c2..dcf768d72 100644
  struct compressed_bio {
 diff --git a/fs/btrfs/encoded_extent.c b/fs/btrfs/encoded_extent.c
 new file mode 100644
-index 000000000..8ff34aea6
+index 000000000..7d9c9e7c4
 --- /dev/null
 +++ b/fs/btrfs/encoded_extent.c
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,372 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded extent I/O for btrfs, as an encoded_extent_ops backend.
@@ -395,100 +395,20 @@ index 000000000..8ff34aea6
 + */
 +#define BTRFS_ENCODED_ZSTD_LEVEL	1
 +
-+static int btrfs_encoded_zstd_decode(const void *src, size_t src_len,
-+				     void *dst, size_t dst_cap, size_t *dst_len)
++static int btrfs_encoded_zstd_decode(const struct encoded_extent_pages *src,
++				     const struct encoded_extent_pages *dst,
++				     size_t *dst_len)
 +{
-+	zstd_dstream *stream;
-+	zstd_in_buffer in = { .src = src, .size = src_len, .pos = 0 };
-+	zstd_out_buffer out = { .dst = dst, .size = dst_cap, .pos = 0 };
-+	size_t workspace_size, ret, prev;
-+	void *workspace;
-+
-+	workspace_size = zstd_dstream_workspace_bound(ZSTD_BTRFS_MAX_INPUT);
-+	workspace = kvmalloc(workspace_size, GFP_NOFS);
-+	if (!workspace)
-+		return -ENOMEM;
-+
-+	stream = zstd_init_dstream(ZSTD_BTRFS_MAX_INPUT, workspace,
-+				   workspace_size);
-+	if (!stream) {
-+		kvfree(workspace);
-+		return -EIO;
-+	}
-+
-+	/*
-+	 * A btrfs encoded extent is one or more zstd frames, so this runs until
-+	 * the input or the output is exhausted. How much plaintext came out is
-+	 * the caller's to check against the unit length it was promised - that
-+	 * check is what binds a payload to the pages it may fill.
-+	 */
-+	do {
-+		prev = in.pos + out.pos;
-+		ret = zstd_decompress_stream(stream, &out, &in);
-+		if (zstd_is_error(ret)) {
-+			kvfree(workspace);
-+			return -EIO;
-+		}
-+	} while (in.pos < in.size && out.pos < out.size &&
-+		 in.pos + out.pos != prev);
-+
-+	*dst_len = out.pos;
-+	kvfree(workspace);
-+	return 0;
++	return encoded_extent_zstd_decode(src, dst, ZSTD_BTRFS_MAX_INPUT,
++					  dst_len);
 +}
 +
-+static int btrfs_encoded_zstd_encode(const void *src, size_t src_len,
-+				     void *dst, size_t dst_cap, size_t *dst_len)
++static int btrfs_encoded_zstd_encode(const struct encoded_extent_pages *src,
++				     const struct encoded_extent_pages *dst,
++				     size_t *dst_len)
 +{
-+	zstd_parameters params = zstd_get_params(BTRFS_ENCODED_ZSTD_LEVEL,
-+						 src_len);
-+	zstd_in_buffer in = { .src = src, .size = src_len, .pos = 0 };
-+	zstd_out_buffer out = { .dst = dst, .size = dst_cap, .pos = 0 };
-+	zstd_cstream *cstream;
-+	void *workspace;
-+	size_t workspace_size, ret;
-+
-+	if (params.cParams.windowLog > ZSTD_BTRFS_MAX_WINDOWLOG)
-+		params.cParams.windowLog = ZSTD_BTRFS_MAX_WINDOWLOG;
-+
-+	workspace_size = zstd_cstream_workspace_bound(&params.cParams);
-+	workspace = kvmalloc(workspace_size, GFP_NOFS);
-+	if (!workspace)
-+		return -ENOMEM;
-+
-+	cstream = zstd_init_cstream(&params, src_len, workspace, workspace_size);
-+	if (!cstream) {
-+		kvfree(workspace);
-+		return -EIO;
-+	}
-+
-+	do {
-+		ret = zstd_compress_stream(cstream, &out, &in);
-+		if (zstd_is_error(ret)) {
-+			kvfree(workspace);
-+			return -EIO;
-+		}
-+		if (out.pos == out.size && in.pos < in.size) {
-+			kvfree(workspace);
-+			return -E2BIG;
-+		}
-+	} while (in.pos < in.size);
-+
-+	do {
-+		ret = zstd_end_stream(cstream, &out);
-+		if (zstd_is_error(ret)) {
-+			kvfree(workspace);
-+			return -EIO;
-+		}
-+		if (ret && out.pos == out.size) {
-+			kvfree(workspace);
-+			return -E2BIG;
-+		}
-+	} while (ret);
-+
-+	*dst_len = out.pos;
-+	kvfree(workspace);
-+	return 0;
++	return encoded_extent_zstd_encode(src, dst, BTRFS_ENCODED_ZSTD_LEVEL,
++					  ZSTD_BTRFS_MAX_WINDOWLOG, dst_len);
 +}
 +
 +static const struct encoded_extent_codec btrfs_encoded_zstd_codec = {
@@ -698,10 +618,10 @@ index c9cddcfa3..27cbed31a 100644
  #define ZSTD_BTRFS_MAX_LEVEL 15
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..0cbca4eb8
+index 000000000..769615edc
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,515 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded extent codecs: the table that connects the filesystem which stores an
@@ -729,12 +649,16 @@ index 000000000..0cbca4eb8
 + */
 +#include <linux/encoded_extent.h>
 +#include <linux/ctype.h>
++#include <linux/highmem.h>
 +#include <linux/kmod.h>
 +#include <linux/list.h>
++#include <linux/mm.h>
 +#include <linux/module.h>
 +#include <linux/mutex.h>
 +#include <linux/slab.h>
 +#include <linux/string.h>
++#include <linux/vmalloc.h>
++#include <linux/zstd.h>
 +
 +struct encoded_extent_codec_set {
 +	struct list_head	list;
@@ -968,6 +892,251 @@ index 000000000..0cbca4eb8
 +		module_put(codec->owner);
 +}
 +EXPORT_SYMBOL_GPL(encoded_extent_codec_put);
++
++/* ------------------------------------------------------------- zstd codecs -- */
++
++/*
++ * The two zstd codecs - bcachefs's and btrfs's - differ only in framing and
++ * parameters, so the page-by-page stream driving lives here rather than twice.
++ *
++ * The stream is fed straight from the caller's pages: on a write the source is
++ * the page cache and the destination is the send buffer, and on a read the
++ * source is the receive buffer and the destination is the page cache. The pages
++ * are therefore the only buffer on the path - no flattening copy, in either
++ * direction - and the codec's own context is the only allocation.
++ *
++ * kmap_local mappings are strictly nested: the source is mapped first, the
++ * destination second, and both are dropped before either is remapped. That is
++ * what kmap_local requires where the pages really are highmem, and it is why
++ * the refills below drop the destination before touching the source.
++ */
++struct encoded_extent_pmap {
++	struct encoded_extent_iter	it;
++	void				*base;
++	unsigned int			off;
++	size_t				size;
++};
++
++static void pmap_fill(struct encoded_extent_pmap *m)
++{
++	struct page *page;
++
++	m->base = NULL;
++	if (encoded_extent_iter_done(&m->it))
++		return;
++	m->size = encoded_extent_iter_chunk(&m->it, &page);
++	m->off = m->it.off;
++	m->base = kmap_local_page(page);
++}
++
++static void pmap_drop(struct encoded_extent_pmap *m)
++{
++	if (m->base) {
++		kunmap_local(m->base);
++		m->base = NULL;
++	}
++}
++
++/* Drop the current chunk, step the iterator, and map the next if there is one. */
++static void pmap_step(struct encoded_extent_pmap *m)
++{
++	pmap_drop(m);
++	encoded_extent_iter_advance(&m->it, m->size);
++	pmap_fill(m);
++}
++
++static size_t pmap_unused(const struct encoded_extent_pmap *m, size_t pos)
++{
++	return m->base ? m->it.left - pos : 0;
++}
++
++int encoded_extent_zstd_encode(const struct encoded_extent_pages *src,
++			       const struct encoded_extent_pages *dst,
++			       int level, unsigned int max_window_log,
++			       size_t *dst_len)
++{
++	struct encoded_extent_pmap in = { }, out = { };
++	zstd_parameters params = zstd_get_params(level, src->len);
++	zstd_cstream *cstream;
++	zstd_in_buffer zin = { };
++	zstd_out_buffer zout = { };
++	void *workspace;
++	size_t workspace_size, ret;
++	int err = -EIO;
++
++	if (!src->len || !dst->len)
++		return -EINVAL;
++
++	if (max_window_log && params.cParams.windowLog > max_window_log)
++		params.cParams.windowLog = max_window_log;
++
++	workspace_size = zstd_cstream_workspace_bound(&params.cParams);
++	workspace = kvmalloc(workspace_size, GFP_NOFS);
++	if (!workspace)
++		return -ENOMEM;
++
++	cstream = zstd_init_cstream(&params, src->len, workspace, workspace_size);
++	if (!cstream) {
++		kvfree(workspace);
++		return -EIO;
++	}
++
++	encoded_extent_iter_init(&in.it, src);
++	encoded_extent_iter_init(&out.it, dst);
++	pmap_fill(&in);
++	pmap_fill(&out);
++	if (!in.base || !out.base)
++		goto out_drop;
++
++	zin = (zstd_in_buffer) { .src = in.base + in.off, .size = in.size, .pos = 0 };
++	zout = (zstd_out_buffer) { .dst = out.base + out.off, .size = out.size, .pos = 0 };
++
++	while (in.base) {
++		ret = zstd_compress_stream(cstream, &zout, &zin);
++		if (zstd_is_error(ret))
++			goto out_drop;
++
++		if (zin.pos == zin.size) {
++			/* The source is spent: drop both, step the source, remap both. */
++			pmap_drop(&out);
++			pmap_step(&in);
++			pmap_fill(&out);
++			if (!out.base) {
++				err = -E2BIG;
++				goto out_drop;
++			}
++			if (in.base)
++				zin = (zstd_in_buffer) { .src = in.base + in.off,
++							 .size = in.size, .pos = 0 };
++			zout.dst = out.base + out.off;
++			continue;
++		}
++
++		if (zout.pos == zout.size) {
++			pmap_step(&out);
++			if (!out.base) {
++				err = -E2BIG;
++				goto out_drop;
++			}
++			zout = (zstd_out_buffer) { .dst = out.base + out.off,
++						   .size = out.size, .pos = 0 };
++		}
++	}
++
++	/* The input is in: flush the epilogue, stepping the output as it fills. */
++	for (;;) {
++		ret = zstd_end_stream(cstream, &zout);
++		if (zstd_is_error(ret))
++			goto out_drop;
++		if (!ret)
++			break;
++		if (zout.pos == zout.size) {
++			pmap_step(&out);
++			if (!out.base) {
++				err = -E2BIG;
++				goto out_drop;
++			}
++			zout = (zstd_out_buffer) { .dst = out.base + out.off,
++						   .size = out.size, .pos = 0 };
++		}
++	}
++
++	*dst_len = dst->len - pmap_unused(&out, zout.pos);
++	err = 0;
++out_drop:
++	pmap_drop(&out);
++	pmap_drop(&in);
++	kvfree(workspace);
++	return err;
++}
++EXPORT_SYMBOL_GPL(encoded_extent_zstd_encode);
++
++int encoded_extent_zstd_decode(const struct encoded_extent_pages *src,
++			       const struct encoded_extent_pages *dst,
++			       size_t max_window_size, size_t *dst_len)
++{
++	struct encoded_extent_pmap in = { }, out = { };
++	zstd_dstream *stream;
++	zstd_in_buffer zin = { };
++	zstd_out_buffer zout = { };
++	void *workspace;
++	size_t workspace_size, ret, prev;
++	int err = -EIO;
++
++	if (!src->len || !dst->len || !max_window_size)
++		return -EINVAL;
++
++	workspace_size = zstd_dstream_workspace_bound(max_window_size);
++	workspace = kvmalloc(workspace_size, GFP_NOFS);
++	if (!workspace)
++		return -ENOMEM;
++
++	stream = zstd_init_dstream(max_window_size, workspace, workspace_size);
++	if (!stream) {
++		kvfree(workspace);
++		return -EIO;
++	}
++
++	encoded_extent_iter_init(&in.it, src);
++	encoded_extent_iter_init(&out.it, dst);
++	pmap_fill(&in);
++	pmap_fill(&out);
++	if (!in.base || !out.base)
++		goto out_drop;
++
++	zin = (zstd_in_buffer) { .src = in.base + in.off, .size = in.size, .pos = 0 };
++	zout = (zstd_out_buffer) { .dst = out.base + out.off, .size = out.size, .pos = 0 };
++
++	/*
++	 * A btrfs extent is one or more concatenated frames, so this runs until
++	 * the input is consumed, the destination is full, or the stream stops
++	 * making progress - the corrupted or truncated case. A full destination
++	 * is a normal stop and not an error: the caller asked for a unit's worth
++	 * of plaintext and checks the length it got against the unit it was
++	 * promised, which is what catches a frame that really did not fit.
++	 */
++	for (;;) {
++		if (zin.pos == zin.size) {
++			pmap_drop(&out);
++			pmap_step(&in);
++			if (!in.base) {
++				pmap_fill(&out);
++				break;
++			}
++			zin = (zstd_in_buffer) { .src = in.base + in.off,
++						 .size = in.size, .pos = 0 };
++			pmap_fill(&out);
++			if (!out.base)
++				break;
++			zout.dst = out.base + out.off;
++		}
++
++		if (zout.pos == zout.size) {
++			pmap_step(&out);
++			if (!out.base)
++				break;
++			zout = (zstd_out_buffer) { .dst = out.base + out.off,
++						   .size = out.size, .pos = 0 };
++		}
++
++		prev = zin.pos + zout.pos;
++		ret = zstd_decompress_stream(stream, &zout, &zin);
++		if (zstd_is_error(ret))
++			goto out_drop;
++		if (zin.pos < zin.size && zout.pos < zout.size &&
++		    zin.pos + zout.pos == prev)
++			break;
++	}
++
++	*dst_len = dst->len - pmap_unused(&out, zout.pos);
++	err = 0;
++out_drop:
++	pmap_drop(&out);
++	pmap_drop(&in);
++	kvfree(workspace);
++	return err;
++}
++EXPORT_SYMBOL_GPL(encoded_extent_zstd_decode);
 diff --git a/fs/nfs/Kconfig b/fs/nfs/Kconfig
 index 07932ce92..31bd0b59a 100644
 --- a/fs/nfs/Kconfig
@@ -1005,18 +1174,18 @@ index 9fb2f2cac..f58d3f05b 100644
 +nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
 diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
 new file mode 100644
-index 000000000..05d0d3c2e
+index 000000000..eefd89037
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.c
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,743 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The client side of the encoded-extent data service.
 + *
 + * The layout body says where the data service is and how to name the file to
 + * it; this is the transport that asks it questions. It is deliberately the
-+ * smallest RPC client that works: one rpc_clnt per mount, created lazily from
-+ * the first layout's address, speaking the wire in
++ * smallest RPC client that works: a small pool of rpc_clnts per mount, created
++ * lazily from the first layout's address, speaking the wire in
 + * linux/encoded_extent_ds.h, with no callback channel and no rpcbind (the
 + * port came in the layout).
 + *
@@ -1056,8 +1225,8 @@ index 000000000..05d0d3c2e
 +	u32			codec;
 +	/* How durable this unit has to be; NFS's levels, see the wire header. */
 +	u32			stable;
-+	struct page		**pages;
-+	u32			payload_len;
++	/* The payload, in pages the caller owns until ->release. */
++	struct bc_ds_payload	payload;
 +};
 +
 +struct bc_ds_write_reply {
@@ -1144,9 +1313,10 @@ index 000000000..05d0d3c2e
 +	 * request head, so it goes in pages: the same shape as an NFSv3 WRITE
 +	 * argument (length, then the pages).
 +	 */
-+	if (xdr_stream_encode_u32(xdr, args->payload_len) != XDR_UNIT)
++	if (xdr_stream_encode_u32(xdr, args->payload.len) != XDR_UNIT)
 +		return;
-+	xdr_write_pages(xdr, args->pages, 0, args->payload_len);
++	xdr_write_pages(xdr, args->payload.pages, args->payload.offset,
++			args->payload.len);
 +}
 +
 +static int
@@ -1343,23 +1513,59 @@ index 000000000..05d0d3c2e
 + * This is reached from an RPC completion, so the client goes to a work item
 + * rather than being shut down here - see bc_ds_clnt_shutdown_async().
 + */
++/*
++ * How many transports a mount keeps to the data service, per file. One rpc_clnt
++ * is one connection and one slot table, and both are per-transport, so a file
++ * whose read-ahead has several requests in flight can use several at once
++ * rather than queueing every unit on one send path.
++ *
++ * The default is one, because the client hangs off the *layout header*, which
++ * is per inode: a pool of four would be four connections for every file that
++ * has a layout, which is the wrong trade until the pool moves to the mount.
++ * One is what this code did before the knob existed.
++ */
++static unsigned int bc_ds_connections = 1;
++module_param(bc_ds_connections, uint, 0644);
++MODULE_PARM_DESC(bc_ds_connections,
++	"Data-service transports per file, each with its own connection and slot table");
++
++static unsigned int bc_ds_nr_clnts(void)
++{
++	return clamp_t(unsigned int, bc_ds_connections, 1, BC_DS_CLNTS);
++}
++
++/*
++ * Throw every transport away, so that the next request builds new ones. Called
++ * when a call times out: see the comment on the definition for why the client
++ * is what has to go, and why this is safe to call from an RPC completion.
++ */
 +void bc_ds_clnt_drop(struct bc_layout_hdr *blh)
 +{
-+	struct rpc_clnt *clnt;
++	struct rpc_clnt *clnt[BC_DS_CLNTS];
++	unsigned int i;
 +
 +	mutex_lock(&blh->clnt_mutex);
-+	clnt = blh->clnt;
-+	blh->clnt = NULL;
++	memcpy(clnt, blh->clnt, sizeof(clnt));
++	memset(blh->clnt, 0, sizeof(blh->clnt));
 +	mutex_unlock(&blh->clnt_mutex);
 +
-+	if (clnt)
-+		bc_ds_clnt_shutdown_async(clnt);
++	for (i = 0; i < BC_DS_CLNTS; i++)
++		if (clnt[i])
++			bc_ds_clnt_shutdown_async(clnt[i]);
++}
++
++void bc_ds_clnt_shutdown_all(struct bc_layout_hdr *blh)
++{
++	unsigned int i;
++
++	for (i = 0; i < BC_DS_CLNTS; i++)
++		if (blh->clnt[i])
++			bc_ds_clnt_shutdown_async(blh->clnt[i]);
 +}
 +
 +static struct rpc_clnt *
-+bc_ds_clnt_get(struct bc_layout_hdr *blh, const struct bc_layout *bl)
++bc_ds_clnt_create(struct nfs_client *clp, const struct bc_layout *bl)
 +{
-+	struct nfs_client *clp = NFS_SERVER(blh->plh.plh_inode)->nfs_client;
 +	struct rpc_create_args args = { };
 +	struct sockaddr_storage ss;
 +	struct rpc_timeout timeout = {
@@ -1367,32 +1573,12 @@ index 000000000..05d0d3c2e
 +		.to_maxval	= 15 * HZ,
 +		.to_retries	= 1,
 +	};
-+	struct rpc_clnt *clnt;
 +	int salen;
-+
-+	mutex_lock(&blh->clnt_mutex);
-+	clnt = blh->clnt;
-+	if (clnt)
-+		goto out;
-+
-+	/*
-+	 * A client is not built for a service that is inside the down window:
-+	 * the request that got here was already in flight when the timeout
-+	 * happened, and the answer for it is the MDS. The window is what makes
-+	 * the recovery bounded - one client, and one connection, per timeout;
-+	 * the caller sees this as the error it would have seen 15s later.
-+	 */
-+	if (bc_ds_is_down(blh)) {
-+		clnt = ERR_PTR(-ETIMEDOUT);
-+		goto out;
-+	}
 +
 +	salen = rpc_pton(&init_net, bl->addr, bl->addr_len,
 +			 (struct sockaddr *)&ss, sizeof(ss));
-+	if (!salen) {
-+		clnt = ERR_PTR(-EINVAL);
-+		goto out;
-+	}
++	if (!salen)
++		return ERR_PTR(-EINVAL);
 +	switch (ss.ss_family) {
 +	case AF_INET:
 +		((struct sockaddr_in *)&ss)->sin_port = htons(bl->port);
@@ -1403,8 +1589,7 @@ index 000000000..05d0d3c2e
 +		break;
 +#endif
 +	default:
-+		clnt = ERR_PTR(-EAFNOSUPPORT);
-+		goto out;
++		return ERR_PTR(-EAFNOSUPPORT);
 +	}
 +
 +	args.net	= clp->cl_net;
@@ -1428,10 +1613,45 @@ index 000000000..05d0d3c2e
 +	args.cred	= clp->cl_rpcclient->cl_cred;
 +	args.flags	= RPC_CLNT_CREATE_NOPING;
 +
-+	clnt = rpc_create(&args);
-+	if (IS_ERR(clnt))
++	return rpc_create(&args);
++}
++
++static struct rpc_clnt *
++bc_ds_clnt_get(struct bc_layout_hdr *blh, const struct bc_layout *bl)
++{
++	struct nfs_client *clp = NFS_SERVER(blh->plh.plh_inode)->nfs_client;
++	struct rpc_clnt *clnt;
++	unsigned int i;
++
++	mutex_lock(&blh->clnt_mutex);
++
++	/*
++	 * A client is not built for a service that is inside the down window:
++	 * the request that got here was already in flight when the timeout
++	 * happened, and the answer for it is the MDS. The window is what makes
++	 * the recovery bounded - one set of connections per timeout; the caller
++	 * sees this as the error it would have seen 15s later.
++	 */
++	if (bc_ds_is_down(blh)) {
++		clnt = ERR_PTR(-ETIMEDOUT);
 +		goto out;
-+	blh->clnt = clnt;
++	}
++
++	/*
++	 * Round-robin, so consecutive units of one request, and requests from
++	 * different files, spread across the transports instead of queueing on
++	 * one. The index is chosen before the lazy build, so a transport that
++	 * cannot be built does not pin every later call to it.
++	 */
++	i = blh->clnt_next++ % bc_ds_nr_clnts();
++
++	clnt = blh->clnt[i];
++	if (!clnt) {
++		clnt = bc_ds_clnt_create(clp, bl);
++		if (IS_ERR(clnt))
++			goto out;
++		blh->clnt[i] = clnt;
++	}
 +out:
 +	/*
 +	 * The reference returned here is the call's, not the header's, and it is
@@ -1464,16 +1684,18 @@ index 000000000..05d0d3c2e
 +};
 +
 +/*
-+ * The pages of a buffer a reply is received into. rpc_prepare_reply_pages()
-+ * takes pages, not an address, which is why the buffer has to start on a page
-+ * boundary: payload byte 0 lands at offset 0 of the first page.
++ * The pages of a page-aligned kernel buffer, which is the shape both directions
++ * want: rpc_prepare_reply_pages() takes pages rather than an address on a read
++ * and xdr_write_pages() takes pages rather than an address on a write, so both
++ * buffers are handed over as they stand. Byte 0 of the buffer lands at offset 0
++ * of the first page, which is why the buffer has to be page-aligned.
 + *
 + * kvmalloc() may have returned either allocator's memory and their page lookups
 + * differ. A page that cannot be found means the buffer is not what the caller
-+ * thinks it is, so the call is refused rather than received into.
++ * thinks it is, so the call is refused rather than received into or sent from.
 + */
-+static struct page **bc_ds_reply_pages(void *buf, size_t size,
-+				       unsigned int *nr_pages)
++struct page **bc_ds_buffer_pages(void *buf, size_t size,
++				 unsigned int *nr_pages)
 +{
 +	unsigned int i, n = DIV_ROUND_UP(size, PAGE_SIZE);
 +	struct page **pages;
@@ -1562,7 +1784,7 @@ index 000000000..05d0d3c2e
 +	 * buffer, which is what bounds a unit by the wire rather than by that
 +	 * buffer's size. Nothing is copied, in either direction.
 +	 */
-+	call->pages = bc_ds_reply_pages(payload, capacity, &call->npages);
++	call->pages = bc_ds_buffer_pages(payload, capacity, &call->npages);
 +	if (!call->pages) {
 +		rpc_release_client(clnt);
 +		kfree(call);
@@ -1603,8 +1825,6 @@ index 000000000..05d0d3c2e
 +	struct rpc_message	msg;
 +	struct bc_ds_write_args	args;
 +	struct bc_ds_write_reply reply;
-+	struct page		**pages;
-+	unsigned int		npages;
 +	/* The call's reference on the client; released in ->rpc_release. */
 +	struct rpc_clnt		*clnt;
 +	void			(*done)(void *ctx, int status, u32 committed,
@@ -1631,11 +1851,9 @@ index 000000000..05d0d3c2e
 +bc_ds_write_call_release(void *calldata)
 +{
 +	struct bc_ds_write_call *call = calldata;
-+	unsigned int i;
 +
-+	for (i = 0; i < call->npages; i++)
-+		__free_page(call->pages[i]);
-+	kfree(call->pages);
++	if (call->args.payload.release)
++		call->args.payload.release(call->args.payload.ctx);
 +	rpc_release_client(call->clnt);
 +	kfree(call);
 +}
@@ -1647,7 +1865,7 @@ index 000000000..05d0d3c2e
 +
 +int
 +bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
-+		  u64 offset, const void *payload, size_t payload_len,
++		  u64 offset, const struct bc_ds_payload *payload,
 +		  const struct encoded_extent_desc *desc, u32 codec,
 +		  u32 stable,
 +		  void (*done)(void *ctx, int status, u32 committed,
@@ -1656,54 +1874,35 @@ index 000000000..05d0d3c2e
 +{
 +	struct bc_ds_write_call *call;
 +	struct rpc_clnt *clnt;
-+	unsigned int i, allocated = 0;
-+	size_t sent = 0;
 +	int ret;
++
++	if (!payload->len || !payload->pages)
++		return -EINVAL;
 +
 +	call = kzalloc(sizeof(*call), GFP_NOFS);
 +	if (!call)
 +		return -ENOMEM;
 +
-+	/*
-+	 * The request head cannot carry a unit, so the payload goes in pages,
-+	 * and they have to outlive the call: they are freed in ->rpc_release.
-+	 */
-+	call->npages = DIV_ROUND_UP(payload_len, PAGE_SIZE);
-+	call->pages = kcalloc(call->npages, sizeof(*call->pages), GFP_NOFS);
-+	if (!call->pages) {
-+		kfree(call);
-+		return -ENOMEM;
-+	}
-+
-+	for (i = 0; i < call->npages; i++) {
-+		size_t n = min_t(size_t, payload_len - sent, PAGE_SIZE);
-+		void *kaddr;
-+
-+		call->pages[i] = alloc_page(GFP_NOFS);
-+		if (!call->pages[i]) {
-+			ret = -ENOMEM;
-+			goto out_free;
-+		}
-+		allocated++;
-+		kaddr = kmap_local_page(call->pages[i]);
-+		memcpy(kaddr, payload + sent, n);
-+		kunmap_local(kaddr);
-+		sent += n;
-+	}
-+
 +	clnt = bc_ds_clnt_get(blh, bl);
 +	if (IS_ERR(clnt)) {
 +		ret = PTR_ERR(clnt);
-+		goto out_free;
++		kfree(call);
++		return ret;
 +	}
 +
++	/*
++	 * The request head cannot carry a unit, so the payload goes in pages -
++	 * the caller's, as they stand. An encoded unit is already in the buffer
++	 * the transport will send, so copying it here would be a second pass
++	 * over every byte; the pages have to outlive the call, and ->release
++	 * hands them back once the transport is done with them.
++	 */
 +	call->args.bl		= bl;
 +	call->args.offset	= offset;
 +	call->args.desc		= *desc;
 +	call->args.codec	= codec;
 +	call->args.stable	= stable;
-+	call->args.payload_len	= payload_len;
-+	call->args.pages	= call->pages;
++	call->args.payload	= *payload;
 +	call->clnt		= clnt;
 +	call->done		= done;
 +	call->ctx		= ctx;
@@ -1715,27 +1914,19 @@ index 000000000..05d0d3c2e
 +	ret = rpc_call_async(clnt, &call->msg, RPC_TASK_SOFT,
 +			     &bc_ds_write_call_ops, call);
 +	if (ret) {
-+		for (i = 0; i < call->npages; i++)
-+			__free_page(call->pages[i]);
-+		kfree(call->pages);
++		if (payload->release)
++			payload->release(payload->ctx);
 +		rpc_release_client(clnt);
 +		kfree(call);
 +	}
 +	return ret;
-+
-+out_free:
-+	for (i = 0; i < allocated; i++)
-+		__free_page(call->pages[i]);
-+	kfree(call->pages);
-+	kfree(call);
-+	return ret;
 +}
 diff --git a/fs/nfs/bcachefs_ds.h b/fs/nfs/bcachefs_ds.h
 new file mode 100644
-index 000000000..76cd1808f
+index 000000000..3d91491a5
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.h
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,213 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Shared state for the pNFS encoded-extent client: the layout driver
@@ -1743,8 +1934,8 @@ index 000000000..76cd1808f
 + *
 + * The layout body carries where the data service is and how to name the file to
 + * it; everything the driver learns from the server lands here. The data service
-+ * client hangs an rpc_clnt off the layout header, so one mount talks to one
-+ * data service over one transport.
++ * client hangs its rpc_clnts off the layout header, so one mount talks to one
++ * data service over as many transports as it is configured to keep.
 + */
 +#ifndef _NFS_BCACHEFS_DS_H
 +#define _NFS_BCACHEFS_DS_H
@@ -1764,10 +1955,20 @@ index 000000000..76cd1808f
 +
 +struct rpc_clnt;
 +
++/*
++ * The data service clients a mount may hold open. One rpc_clnt is one
++ * connection and one slot table, and one transport serialises on both, so a
++ * mount that wants more than that in flight uses several and round-robins its
++ * units across them. How many are actually used is bc_ds_connections, in
++ * bcachefs_ds.c.
++ */
++#define BC_DS_CLNTS	8
++
 +struct bc_layout_hdr {
 +	struct pnfs_layout_hdr	plh;
 +	struct mutex		clnt_mutex;
-+	struct rpc_clnt		*clnt;
++	struct rpc_clnt		*clnt[BC_DS_CLNTS];
++	unsigned int		clnt_next;
 +	/*
 +	 * When a call to the data service times out, the mount stays off it
 +	 * until this time passes. A timeout costs the client 15-30s and a request
@@ -1845,11 +2046,11 @@ index 000000000..76cd1808f
 +bool bc_ds_is_down(struct bc_layout_hdr *blh);
 +
 +/*
-+ * Release the header's reference on its data-service client, from a work item:
-+ * rpc_shutdown_client() sleeps, and it has to see the caller's own RPC task
-+ * finish, so it can never be called from inside one. Used both when the header
-+ * goes away (bc_free_layout_hdr()) and when a client is condemned
-+ * (bc_ds_clnt_drop()).
++ * Release the header's reference on one of its data-service clients, from a
++ * work item: rpc_shutdown_client() sleeps, and it has to see the caller's own
++ * RPC task finish, so it can never be called from inside one. Used both when
++ * the header goes away (bc_ds_clnt_shutdown_all()) and when the clients are
++ * condemned (bc_ds_clnt_drop()).
 + */
 +void bc_ds_clnt_shutdown_async(struct rpc_clnt *clnt);
 +
@@ -1860,6 +2061,14 @@ index 000000000..76cd1808f
 + * RPC completion.
 + */
 +void bc_ds_clnt_drop(struct bc_layout_hdr *blh);
++
++/*
++ * Hand every client the header holds to the shutdown work item, without taking
++ * the lock: this is the header going away, reached under ->i_lock, where
++ * bc_ds_clnt_drop()'s mutex could not be taken. No new call can start on the
++ * header, so there is nothing to synchronise with.
++ */
++void bc_ds_clnt_shutdown_all(struct bc_layout_hdr *blh);
 +
 +/*
 + * Fetch the encoded unit covering @offset into @payload (capacity @capacity),
@@ -1889,14 +2098,41 @@ index 000000000..76cd1808f
 +		     bc_ds_done_fn done, void *ctx);
 +
 +/*
++ * A payload that lives in pages the caller owns, and how the caller gets them
++ * back. The write path hands the codec's output straight to the transport, so
++ * the pages are never copied: they have to stay valid until @release runs,
++ * which is from the RPC's release - after the transport is done with the send
++ * buffer. @offset is the byte offset into @pages[0] where the payload starts.
++ */
++struct bc_ds_payload {
++	struct page	**pages;
++	unsigned int	nr_pages;
++	unsigned int	offset;
++	size_t		len;
++	void		(*release)(void *ctx);
++	void		*ctx;
++};
++
++/*
++ * The pages of a page-aligned kernel buffer, which is what lets a codec work in
++ * pages with no flattening copy: the receive buffer on a read and the send
++ * buffer on a write are both such buffers.
++ */
++struct page **bc_ds_buffer_pages(void *buf, size_t size,
++				 unsigned int *nr_pages);
++
++/*
 + * Store one encoded unit, asynchronously; @codec is the position of the codec it
 + * was encoded with, @stable is how durable the caller needs it to be (see
 + * enum encoded_extent_stable), and @done gets the service's status together
 + * with the level it actually reached and its write verifier - the value a later
 + * commit of this unit will be checked against, which the caller must keep.
++ *
++ * @payload's pages are the request: they are sent as they stand, and @release
++ * hands them back once the transport is done with them.
 + */
 +int bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
-+		      u64 offset, const void *payload, size_t payload_len,
++		      u64 offset, const struct bc_ds_payload *payload,
 +		      const struct encoded_extent_desc *desc, u32 codec,
 +		      u32 stable,
 +		      void (*done)(void *ctx, int status, u32 committed,
@@ -1906,10 +2142,10 @@ index 000000000..76cd1808f
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..ed61f77f2
+index 000000000..e29a780a8
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1177 @@
+@@ -0,0 +1,1306 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2216,13 +2452,12 @@ index 000000000..ed61f77f2
 +	struct bc_layout_hdr *blh = container_of(lo, struct bc_layout_hdr, plh);
 +
 +	/*
-+	 * The client goes to a work item: this is reached under ->i_lock, and
-+	 * rpc_shutdown_client() sleeps. If the allocation fails the client is
++	 * The clients go to a work item: this is reached under ->i_lock, and
++	 * rpc_shutdown_client() sleeps. If the allocation fails a client is
 +	 * leaked rather than freed from atomic context, which is the right way
 +	 * round.
 +	 */
-+	if (blh->clnt)
-+		bc_ds_clnt_shutdown_async(blh->clnt);
++	bc_ds_clnt_shutdown_all(blh);
 +	kfree_rcu(blh, plh.plh_rcu);
 +}
 +
@@ -2513,25 +2748,6 @@ index 000000000..ed61f77f2
 +	}
 +}
 +
-+static void
-+bc_copy_from_pages(struct nfs_pgio_header *hdr, size_t skip, void *dst,
-+		   size_t len)
-+{
-+	unsigned int pgindex = (hdr->args.pgbase + skip) >> PAGE_SHIFT;
-+	unsigned int pgoff = (hdr->args.pgbase + skip) & (PAGE_SIZE - 1);
-+
-+	while (len) {
-+		struct page *page = hdr->args.pages[pgindex];
-+		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
-+
-+		memcpy_from_page(dst, page, pgoff, n);
-+		dst += n;
-+		len -= n;
-+		pgoff = 0;
-+		pgindex++;
-+	}
-+}
-+
 +/* ------------------------------------------------------------ the read -- */
 +
 +/*
@@ -2562,6 +2778,11 @@ index 000000000..ed61f77f2
 +	struct bc_layout_hdr	*blh;
 +	void			*payload;	/* one encoded unit */
 +	void			*plain;		/* decoded, unit_max */
++	/* The pages of both buffers, which is how the codec moves them. */
++	struct page		**payload_pages;
++	unsigned int		payload_nr_pages;
++	struct page		**plain_pages;
++	unsigned int		plain_nr_pages;
 +	u64			offset;		/* next byte to fetch */
 +	u64			end;
 +};
@@ -2572,6 +2793,8 @@ index 000000000..ed61f77f2
 +	struct nfs_pgio_header *hdr = io->hdr;
 +	struct bc_layout_hdr *blh = io->blh;
 +
++	kvfree(io->plain_pages);
++	kvfree(io->payload_pages);
 +	kvfree(io->plain);
 +	kvfree(io->payload);
 +	kfree(io);
@@ -2608,6 +2831,7 @@ index 000000000..ed61f77f2
 +{
 +	const struct encoded_extent_codec *c;
 +	struct bc_read_io *io = ctx;
++	struct encoded_extent_pages src, dst;
 +	u64 unit_end, len;
 +	size_t declen;
 +	int ret;
@@ -2640,14 +2864,45 @@ index 000000000..ed61f77f2
 +	atomic_set(&bc_stat_ds_last_unit_len, desc->unit_len);
 +	atomic_set(&bc_stat_ds_last_payload_len, payload_len);
 +
-+	ret = c->decode(payload, payload_len, io->plain, desc->unit_len,
-+			&declen);
-+	if (ret || declen != desc->unit_len)
-+		goto out_failed;
-+
 +	len = min(io->end, unit_end) - io->offset;
-+	bc_copy_to_pages(io->hdr, io->offset - io->hdr->args.offset,
-+			 io->plain + (io->offset - desc->unit_offset), len);
++
++	src = (struct encoded_extent_pages) {
++		.pages		= io->payload_pages,
++		.nr_pages	= io->payload_nr_pages,
++		.offset		= 0,
++		.len		= payload_len,
++	};
++
++	/*
++	 * A request that covers the whole unit decodes straight into the pages
++	 * it is filling; only a request that starts or ends inside a unit needs
++	 * the scratch buffer and the copy out of it.
++	 */
++	if (io->offset == desc->unit_offset && len == desc->unit_len) {
++		dst = (struct encoded_extent_pages) {
++			.pages		= io->hdr->args.pages,
++			.nr_pages	= io->hdr->page_array.npages,
++			.offset		= io->hdr->args.pgbase +
++					  (io->offset - io->hdr->args.offset),
++			.len		= desc->unit_len,
++		};
++		ret = c->decode(&src, &dst, &declen);
++		if (ret || declen != desc->unit_len)
++			goto out_failed;
++	} else {
++		dst = (struct encoded_extent_pages) {
++			.pages		= io->plain_pages,
++			.nr_pages	= io->plain_nr_pages,
++			.offset		= 0,
++			.len		= desc->unit_len,
++		};
++		ret = c->decode(&src, &dst, &declen);
++		if (ret || declen != desc->unit_len)
++			goto out_failed;
++		bc_copy_to_pages(io->hdr, io->offset - io->hdr->args.offset,
++				 io->plain + (io->offset - desc->unit_offset),
++				 len);
++	}
 +	spin_lock(&bc_read_bytes_lock);
 +	bc_ds_read_bytes += len;
 +	bc_ds_read_wasted += desc->unit_len - len;
@@ -2731,14 +2986,28 @@ index 000000000..ed61f77f2
 +		goto out_free;
 +
 +	/*
-+	 * The payload is received straight into this buffer's pages, so it has
-+	 * to start on a page boundary: byte 0 of the payload is offset 0 of the
-+	 * first page, and an unaligned buffer would be received into the page
++	 * The payload is received straight into this buffer's pages, and the
++	 * codec addresses both buffers by page, so both have to start on a page
++	 * boundary: byte 0 of a buffer is offset 0 of its first page, and an
++	 * unaligned buffer would be received into, or decoded into, the page
 +	 * before it. Every allocator returns page-aligned memory for a size this
 +	 * large, so this is a guard rather than a hope, and a buffer that failed
 +	 * it would be a bug worth knowing about - see bc_ds_read_async().
 +	 */
-+	if (WARN_ON_ONCE(!PAGE_ALIGNED(io->payload)))
++	if (WARN_ON_ONCE(!PAGE_ALIGNED(io->payload) || !PAGE_ALIGNED(io->plain)))
++		goto out_free;
++
++	/*
++	 * The codec works in pages in both directions, so both buffers are
++	 * mapped once here: the payload's pages are the decode's source, and the
++	 * plaintext buffer's are the scratch a partial unit decodes into.
++	 */
++	io->payload_pages = bc_ds_buffer_pages(io->payload,
++					       bc_ds_payload_max(bl),
++					       &io->payload_nr_pages);
++	io->plain_pages = bc_ds_buffer_pages(io->plain, bufsize,
++					     &io->plain_nr_pages);
++	if (!io->payload_pages || !io->plain_pages)
 +		goto out_free;
 +
 +	ret = bc_ds_read_async(blh, bl, io->offset, io->payload,
@@ -2749,6 +3018,8 @@ index 000000000..ed61f77f2
 +	return PNFS_ATTEMPTED;
 +
 +out_free:
++	kvfree(io->plain_pages);
++	kvfree(io->payload_pages);
 +	kvfree(io->payload);
 +	kvfree(io->plain);
 +	kfree(io);
@@ -2757,12 +3028,59 @@ index 000000000..ed61f77f2
 +
 +/* ----------------------------------------------------------- the write -- */
 +
++/*
++ * One unit's encoded payload. It is allocated per unit rather than reused,
++ * because the transport holds it until its RPC is released, which can be after
++ * the next unit has already been sent. It is one allocation of the unit ceiling
++ * rather than a page per page, and nothing is ever copied into it: the codec
++ * encodes into these pages and the transport sends these pages.
++ */
++struct bc_write_unit {
++	void			*buf;
++	size_t			size;
++	struct page		**pages;
++	unsigned int		nr_pages;
++};
++
++static void bc_write_unit_free(void *ctx)
++{
++	struct bc_write_unit *u = ctx;
++
++	kvfree(u->pages);
++	free_pages_exact(u->buf, u->size);
++	kfree(u);
++}
++
++static struct bc_write_unit *bc_write_unit_alloc(size_t size)
++{
++	struct bc_write_unit *u;
++
++	u = kzalloc(sizeof(*u), GFP_NOFS);
++	if (!u)
++		return NULL;
++
++	u->size = size;
++	u->buf = alloc_pages_exact(size, GFP_NOFS);
++	if (!u->buf)
++		goto err;
++
++	u->pages = bc_ds_buffer_pages(u->buf, size, &u->nr_pages);
++	if (!u->pages)
++		goto err_free;
++
++	return u;
++err_free:
++	free_pages_exact(u->buf, u->size);
++err:
++	kfree(u);
++	return NULL;
++}
++
 +struct bc_write_io {
 +	struct nfs_pgio_header	*hdr;
 +	struct bc_layout	*bl;
 +	struct bc_layout_hdr	*blh;
-+	void			*plain;
-+	void			*comp;
++	struct work_struct	work;
 +	u64			offset;
 +	size_t			left;
 +	size_t			unit;		/* the unit in flight */
@@ -2786,8 +3104,6 @@ index 000000000..ed61f77f2
 +	u8 verf[ENCODED_DS_WRITEVERF];
 +
 +	memcpy(verf, io->verf, ENCODED_DS_WRITEVERF);
-+	kvfree(io->plain);
-+	kvfree(io->comp);
 +	kfree(io);
 +
 +	if (status) {
@@ -2858,7 +3174,10 @@ index 000000000..ed61f77f2
 +bc_write_step(struct bc_write_io *io)
 +{
 +	const struct encoded_extent_codec *c = io->bl->codec[io->bl->write_codec];
++	struct encoded_extent_pages src, dst;
 +	struct encoded_extent_desc desc;
++	struct bc_ds_payload payload;
++	struct bc_write_unit *u;
 +	size_t done, complen;
 +	int ret;
 +
@@ -2870,28 +3189,75 @@ index 000000000..ed61f77f2
 +	io->unit = min_t(size_t, io->left, io->bl->unit_max);
 +	done = io->hdr->args.count - io->left;
 +
++	u = bc_write_unit_alloc(io->bl->unit_max);
++	if (!u) {
++		bc_write_finish(io, -ENOMEM);
++		return;
++	}
++
 +	memset(&desc, 0, sizeof(desc));
 +	desc.unit_offset = io->offset;
 +	desc.unit_len = io->unit;
 +
-+	bc_copy_from_pages(io->hdr, done, io->plain, io->unit);
-+	complen = io->bl->unit_max;
-+	ret = c->encode(io->plain, io->unit, io->comp, io->bl->unit_max,
-+			&complen);
++	/*
++	 * The dirty pages are the codec's input and this unit's buffer is its
++	 * output, so the bytes move straight out of the page cache into the
++	 * encoder and straight out of it into the transport - no flattening
++	 * buffer and no second pass over the unit anywhere.
++	 */
++	src = (struct encoded_extent_pages) {
++		.pages		= io->hdr->args.pages,
++		.nr_pages	= io->hdr->page_array.npages,
++		.offset		= io->hdr->args.pgbase + done,
++		.len		= io->unit,
++	};
++	dst = (struct encoded_extent_pages) {
++		.pages		= u->pages,
++		.nr_pages	= u->nr_pages,
++		.offset		= 0,
++		.len		= io->bl->unit_max,
++	};
++
++	ret = c->encode(&src, &dst, &complen);
 +	if (ret) {
++		bc_write_unit_free(u);
 +		bc_write_finish(io, ret);
 +		return;
 +	}
 +	if (!complen) {
++		bc_write_unit_free(u);
 +		bc_write_finish(io, -EIO);
 +		return;
 +	}
 +
-+	ret = bc_ds_write_async(io->blh, io->bl, io->offset, io->comp, complen,
++	payload = (struct bc_ds_payload) {
++		.pages		= u->pages,
++		.nr_pages	= u->nr_pages,
++		.offset		= 0,
++		.len		= complen,
++		.release	= bc_write_unit_free,
++		.ctx		= u,
++	};
++
++	/* On failure the call has already run ->release, as its contract says. */
++	ret = bc_ds_write_async(io->blh, io->bl, io->offset, &payload,
 +				&desc, io->bl->write_codec,
 +				(u32)io->hdr->args.stable, bc_write_done, io);
 +	if (ret)
 +		bc_write_finish(io, ret);
++}
++
++/*
++ * The first unit used to be encoded inline, which put it on the generic
++ * writeback worker that called ->write_pagelist - the one thread a local
++ * writer's compression all funnelled through. A work item is enough to take it
++ * off that thread, and the completion path already runs in one.
++ */
++static void bc_write_work(struct work_struct *work)
++{
++	struct bc_write_io *io = container_of(work, struct bc_write_io, work);
++
++	bc_write_step(io);
 +}
 +
 +/*
@@ -2946,16 +3312,15 @@ index 000000000..ed61f77f2
 +	 * at that level and each reply can only lower it.
 +	 */
 +	io->committed = (u32)hdr->args.stable;
-+	io->plain = kvmalloc(bl->unit_max, GFP_NOFS);
-+	io->comp = kvmalloc(bl->unit_max, GFP_NOFS);
-+	if (!io->plain || !io->comp) {
-+		kvfree(io->plain);
-+		kvfree(io->comp);
-+		kfree(io);
-+		return PNFS_NOT_ATTEMPTED;
-+	}
 +
-+	bc_write_step(io);
++	/*
++	 * Hand the whole run to a work item: the caller is the writeback
++	 * worker, and the encode below is the client's CPU, which belongs off
++	 * it. The work item and every completion after it run in process
++	 * context, which is what the codec and the RPC client need.
++	 */
++	INIT_WORK(&io->work, bc_write_work);
++	schedule_work(&io->work);
 +	return PNFS_ATTEMPTED;
 +}
 +
@@ -4564,10 +4929,10 @@ index db9af7804..c5a3db7c0 100644
  		struct nfsd4_compound_state *cstate, stateid_t *stateid,
 diff --git a/include/linux/encoded_extent.h b/include/linux/encoded_extent.h
 new file mode 100644
-index 000000000..c0ea44258
+index 000000000..be6dc62f7
 --- /dev/null
 +++ b/include/linux/encoded_extent.h
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,385 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_H
 +#define _LINUX_ENCODED_EXTENT_H
@@ -4577,6 +4942,7 @@ index 000000000..c0ea44258
 +
 +struct inode;
 +struct module;
++struct page;
 +
 +/*
 + * Encoded extent I/O: move a filesystem's compressed, checksummed extents
@@ -4709,21 +5075,98 @@ index 000000000..c0ea44258
 +
 +#define MODULE_ALIAS_ENCODED_EXTENT_CODEC(name) \
 +	MODULE_ALIAS(ENCODED_EXTENT_CODEC_MODULE_PREFIX name)
++/*
++ * A run of bytes inside a page array, which is what a caller transfers rather
++ * than a linear buffer: a request's pages are the page cache's and a reply's
++ * are the receive buffer's, and neither is one virtually contiguous
++ * allocation. @offset is the byte offset into @pages[0] at which the range
++ * starts; the pages need not be contiguous.
++ *
++ * On entry to a codec, @len is the bytes described for a source, and the
++ * capacity for a destination; the codec reports what it produced in @dst_len,
++ * which for a decode is the plaintext length the caller checks against the
++ * unit it was promised.
++ */
++struct encoded_extent_pages {
++	struct page	**pages;
++	unsigned int	nr_pages;
++	unsigned int	offset;
++	size_t		len;
++};
++
++/*
++ * Walk a page range one chunk at a time, so a codec drives its stream over
++ * pages with no intermediate buffer. The mapping is kmap_local(), so a chunk
++ * must be unmapped before the next is taken.
++ */
++struct encoded_extent_iter {
++	struct page	**pages;
++	unsigned int	nr_pages;
++	unsigned int	idx;
++	unsigned int	off;
++	size_t		left;
++};
++
++static inline void
++encoded_extent_iter_init(struct encoded_extent_iter *it,
++			 const struct encoded_extent_pages *p)
++{
++	it->pages	= p->pages;
++	it->nr_pages	= p->nr_pages;
++	it->idx		= p->offset >> PAGE_SHIFT;
++	it->off		= p->offset & (PAGE_SIZE - 1);
++	it->left	= p->len;
++}
++
++static inline bool
++encoded_extent_iter_done(const struct encoded_extent_iter *it)
++{
++	return !it->left;
++}
++
++/*
++ * The next chunk: its length, and the page it lives in. The caller maps @page
++ * with kmap_local_page() and adds @it->off to the address, then advances with
++ * encoded_extent_iter_advance() once it is unmapped.
++ */
++static inline size_t
++encoded_extent_iter_chunk(const struct encoded_extent_iter *it,
++			  struct page **page)
++{
++	*page = it->pages[it->idx];
++	return min_t(size_t, it->left, PAGE_SIZE - it->off);
++}
++
++static inline void
++encoded_extent_iter_advance(struct encoded_extent_iter *it, size_t len)
++{
++	it->left -= len;
++	it->off += len;
++	if (it->off >= PAGE_SIZE) {
++		it->off = 0;
++		it->idx++;
++	}
++}
++
 +struct encoded_extent_codec {
 +	struct module	*owner;
 +	u32		compression;
 +	const char	*name;
 +	/*
-+	 * Decode @src into @dst, at most @dst_cap bytes; *@dst_len is the
-+	 * plaintext length on success. A codec that will not store encoded
-+	 * extents fills in only the naming half and leaves these NULL; a peer
-+	 * that needs one and finds it missing does not serve the range
-+	 * encoded.
++	 * Decode @src into @dst, at most @dst->len bytes; *@dst_len is the
++	 * plaintext length on success. Both sides are page ranges, so the
++	 * codec moves pages straight between the caller's buffers and its
++	 * stream - no intermediate buffer, and no copy the caller did not ask
++	 * for. A codec that will not store encoded extents fills in only the
++	 * naming half and leaves these NULL; a peer that needs one and finds
++	 * it missing does not serve the range encoded.
 +	 */
-+	int		(*decode)(const void *src, size_t src_len,
-+				  void *dst, size_t dst_cap, size_t *dst_len);
-+	int		(*encode)(const void *src, size_t src_len,
-+				  void *dst, size_t dst_cap, size_t *dst_len);
++	int		(*decode)(const struct encoded_extent_pages *src,
++				  const struct encoded_extent_pages *dst,
++				  size_t *dst_len);
++	int		(*encode)(const struct encoded_extent_pages *src,
++				  const struct encoded_extent_pages *dst,
++				  size_t *dst_len);
 +};
 +
 +/*
@@ -4743,6 +5186,23 @@ index 000000000..c0ea44258
 +		unsigned int nr_codecs);
 +void encoded_extent_codec_unregister(u32 layout_type,
 +		const struct encoded_extent_codec * const *codecs);
++
++/*
++ * The two zstd codecs - bcachefs's and btrfs's - differ only in framing and
++ * parameters, so the page-by-page stream driving is shared here rather than
++ * written twice. @max_window_log and @max_window_size bound the window to what
++ * the backend's own decoder will accept; 0 means no bound.
++ * encoded_extent_zstd_encode() writes one frame; encoded_extent_zstd_decode()
++ * reads one or more concatenated frames, which is what btrfs stores.
++ */
++int encoded_extent_zstd_encode(const struct encoded_extent_pages *src,
++			       const struct encoded_extent_pages *dst,
++			       int level, unsigned int max_window_log,
++			       size_t *dst_len);
++int encoded_extent_zstd_decode(const struct encoded_extent_pages *src,
++			       const struct encoded_extent_pages *dst,
++			       size_t max_window_size, size_t *dst_len);
++
 +/*
 + * Resolve a name to a codec: if it does not resolve, ask for the module that
 + * advertises it (MODULE_ALIAS_ENCODED_EXTENT_CODEC()) and look again. A name

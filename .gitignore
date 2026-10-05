@@ -10,3 +10,11 @@
 # and the logs of a run.
 /.worktrees/
 /dev/result-*
+
+# A check's `result` symlink at the root, and the logs of a suite run. A run's
+# output is evidence to read, not a file to track - bench-compare.md is the
+# summary that is.
+/result
+/bench-*.log
+/bench-*-summary.txt
+/btrfs-control.log

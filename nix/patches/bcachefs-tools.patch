@@ -484,10 +484,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..6e88a7ad0
+index 000000000..ae71a0bce
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,922 @@
+@@ -0,0 +1,971 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -1274,86 +1274,135 @@ index 000000000..6e88a7ad0
 +/* bcachefs rescales its own level (data/compress.c); this is a mid-range one. */
 +#define BCH2_ENCODED_ZSTD_LEVEL		3
 +
-+static int bch2_encoded_zstd_decode(const void *src, size_t src_len,
-+				    void *dst, size_t dst_cap, size_t *dst_len)
++/*
++ * The window a unit of the largest size the wire carries needs: the peer
++ * encodes units of at most the layout's unit_max, which is bounded by the
++ * data service's 2 MiB payload ceiling, and zstd sizes its window from the
++ * input, so 2 MiB is the window both sides have to be able to hold.
++ */
++#define BCH2_ENCODED_ZSTD_WINDOW_LOG	21
++
++/*
++ * Read the exact compressed length out of the frame's little-endian u32. It is
++ * four bytes at the start of the payload, which the on-disk format places at
++ * the start of the unit; reading it through the page iterator rather than a
++ * dereference keeps a payload that starts near the end of a page honest.
++ */
++static int bch2_encoded_prefix_get(const struct encoded_extent_pages *src,
++				   size_t *framed_len)
 +{
-+	size_t workspace_size = zstd_dctx_workspace_bound();
-+	ZSTD_DCtx *ctx;
-+	void *workspace;
-+	size_t real_src_len, ret;
++	struct encoded_extent_iter it;
++	__le32 prefix;
++	u8 *p = (u8 *)&prefix;
++	unsigned int got = 0;
 +
-+	if (src_len < sizeof(u32))
++	if (src->len < sizeof(prefix))
 +		return -EIO;
 +
-+	real_src_len = le32_to_cpup(src);
-+	if (real_src_len > src_len - sizeof(u32))
-+		return -EIO;
++	encoded_extent_iter_init(&it, src);
++	while (got < sizeof(prefix)) {
++		struct page *page;
++		void *addr;
++		size_t n = encoded_extent_iter_chunk(&it, &page);
 +
-+	workspace = kvmalloc(workspace_size, GFP_NOFS);
-+	if (!workspace)
-+		return -ENOMEM;
-+
-+	ctx = zstd_init_dctx(workspace, workspace_size);
-+	if (!ctx) {
-+		kvfree(workspace);
-+		return -EIO;
++		n = min_t(size_t, n, sizeof(prefix) - got);
++		addr = kmap_local_page(page);
++		memcpy(p + got, addr + it.off, n);
++		kunmap_local(addr);
++		encoded_extent_iter_advance(&it, n);
++		got += n;
 +	}
 +
-+	ret = zstd_decompress_dctx(ctx, dst, dst_cap,
-+				   src + sizeof(u32), real_src_len);
-+	kvfree(workspace);
-+
-+	if (zstd_is_error(ret))
-+		return -EIO;
-+	if (!ret)
++	*framed_len = le32_to_cpu(prefix);
++	if (*framed_len > src->len - sizeof(prefix))
 +		return -EIO;
 +
-+	/*
-+	 * How much plaintext came out is the caller's to check against the unit
-+	 * length it was promised - that check is what binds a payload to the
-+	 * pages it may fill.
-+	 */
-+	*dst_len = ret;
 +	return 0;
 +}
 +
-+static int bch2_encoded_zstd_encode(const void *src, size_t src_len,
-+				    void *dst, size_t dst_cap, size_t *dst_len)
++static void bch2_encoded_prefix_put(const struct encoded_extent_pages *dst,
++				    u32 framed_len)
 +{
-+	zstd_parameters params = zstd_get_params(BCH2_ENCODED_ZSTD_LEVEL, src_len);
-+	ZSTD_CCtx *ctx;
-+	void *workspace;
-+	size_t workspace_size, ret;
++	struct encoded_extent_iter it;
++	__le32 prefix = cpu_to_le32(framed_len);
++	const u8 *p = (const u8 *)&prefix;
++	unsigned int done = 0;
++
++	encoded_extent_iter_init(&it, dst);
++	while (done < sizeof(prefix)) {
++		struct page *page;
++		void *addr;
++		size_t n = encoded_extent_iter_chunk(&it, &page);
++
++		n = min_t(size_t, n, sizeof(prefix) - done);
++		addr = kmap_local_page(page);
++		memcpy(addr + it.off, p + done, n);
++		kunmap_local(addr);
++		encoded_extent_iter_advance(&it, n);
++		done += n;
++	}
++}
++
++static int bch2_encoded_zstd_decode(const struct encoded_extent_pages *src,
++				    const struct encoded_extent_pages *dst,
++				    size_t *dst_len)
++{
++	struct encoded_extent_pages frame;
++	size_t framed_len;
++	int ret;
++
++	ret = bch2_encoded_prefix_get(src, &framed_len);
++	if (ret)
++		return ret;
++	if (!framed_len)
++		return -EIO;
 +
 +	/*
-+	 * Room for the length prefix, and for zstd's tendency to write a little
-+	 * past the end of its output buffer - the same slop the filesystem's own
-+	 * compressor leaves (data/compress.c).
++	 * The prefix is the frame's exact length; the stored payload behind it
++	 * is padded, so the frame is a sub-range of the pages and the padding
++	 * is never looked at.
 +	 */
-+	if (dst_cap <= sizeof(u32) + 7)
++	frame = (struct encoded_extent_pages) {
++		.pages		= src->pages,
++		.nr_pages	= src->nr_pages,
++		.offset		= src->offset + sizeof(u32),
++		.len		= framed_len,
++	};
++
++	return encoded_extent_zstd_decode(&frame, dst,
++					  1U << BCH2_ENCODED_ZSTD_WINDOW_LOG,
++					  dst_len);
++}
++
++static int bch2_encoded_zstd_encode(const struct encoded_extent_pages *src,
++				    const struct encoded_extent_pages *dst,
++				    size_t *dst_len)
++{
++	struct encoded_extent_pages frame;
++	size_t framed_len;
++	int ret;
++
++	/* Room for the length prefix, at least. */
++	if (dst->len <= sizeof(u32))
 +		return -E2BIG;
 +
-+	workspace_size = zstd_cctx_workspace_bound(&params.cParams);
-+	workspace = kvmalloc(workspace_size, GFP_NOFS);
-+	if (!workspace)
-+		return -ENOMEM;
++	frame = (struct encoded_extent_pages) {
++		.pages		= dst->pages,
++		.nr_pages	= dst->nr_pages,
++		.offset		= dst->offset + sizeof(u32),
++		.len		= dst->len - sizeof(u32),
++	};
 +
-+	ctx = zstd_init_cctx(workspace, workspace_size);
-+	if (!ctx) {
-+		kvfree(workspace);
-+		return -EIO;
-+	}
-+
-+	ret = zstd_compress_cctx(ctx, dst + sizeof(u32),
-+				 dst_cap - sizeof(u32) - 7,
-+				 src, src_len, &params);
-+	kvfree(workspace);
-+
-+	if (zstd_is_error(ret) || !ret)
++	ret = encoded_extent_zstd_encode(src, &frame, BCH2_ENCODED_ZSTD_LEVEL,
++					 BCH2_ENCODED_ZSTD_WINDOW_LOG,
++					 &framed_len);
++	if (ret)
++		return ret;
++	if (!framed_len)
 +		return -EIO;
 +
-+	*(__le32 *) dst = cpu_to_le32(ret);
-+	*dst_len = ret + sizeof(u32);
++	bch2_encoded_prefix_put(dst, framed_len);
++	*dst_len = framed_len + sizeof(u32);
 +	return 0;
 +}
 +
