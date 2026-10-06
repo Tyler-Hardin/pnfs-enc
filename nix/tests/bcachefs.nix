@@ -1191,6 +1191,58 @@ pkgs.testers.nixosTest {
     assert sha256_on(client2, "/mnt/coherence.bin") == sdigest, \
         "client2 served stale data after a write that followed a layout recall"
 
+    # (6) The direction every case above stops short of: a write that only
+    # dirties the *server's* page cache, with no fsync, and then a read through
+    # the data service. A local buffered write is exactly what an NFSv3 or
+    # MDS-fallback WRITE is to the data service - an update to the page cache
+    # and not to the extent btree - and the data service reads the btree, so
+    # without flushing the range first it hands the client the extent as it was
+    # before the write, with status 0 rather than the -ENODATA that would send
+    # the client to the MDS. The range is written through the layout first, so
+    # there is an encoded extent for the later write to be stale against; that
+    # is the case a hole would hide.
+    dirty = server.succeed(
+        "cat /proc/sys/vm/dirty_ratio /proc/sys/vm/dirty_background_ratio "
+        "/proc/sys/vm/dirty_writeback_centisecs").split()
+    server.succeed("echo 100 > /proc/sys/vm/dirty_ratio; "
+                   "echo 100 > /proc/sys/vm/dirty_background_ratio; "
+                   "echo 0 > /proc/sys/vm/dirty_writeback_centisecs")
+    try:
+        client.succeed(pattern(1048576, "I", "/mnt/localwrite.bin"))
+        client.succeed("sync -d /mnt/localwrite.bin")
+        assert sha256_on(server, "/srv/export/localwrite.bin") == \
+            client.succeed("head -c 1048576 /dev/zero | tr '\\000' 'I' | "
+                           "sha256sum").split()[0], \
+            "the localwrite file is wrong before the test even starts"
+
+        # In place and buffered, so the server's cache has "J" and the btree
+        # still has "I"; nothing has been synced, and the writeback timers are
+        # off, so the page is still dirty when the client reads.
+        server.succeed(overwrite(1048576, "J", "/srv/export/localwrite.bin"))
+        want = client.succeed("head -c 1048576 /dev/zero | tr '\\000' 'J' | "
+                              "sha256sum").split()[0]
+
+        client.succeed("echo 3 > /proc/sys/vm/drop_caches")
+        drok = counter("ds_read_ok")
+        got = sha256_on(client, "/mnt/localwrite.bin")
+        served = counter("ds_read_ok")
+        client.log("coherence (dirty server cache): server-cache=%s read=%s "
+                   "(want %s), ds_read_ok %d -> %d" %
+                   (sha256_on(server, "/srv/export/localwrite.bin")[:16],
+                    got[:16], want[:16], drok, served))
+        assert served > drok, \
+            "the read never reached the data service, so it says nothing " \
+            "about the data service's view of a dirty page cache"
+        assert got == want, \
+            "the data service served the pre-write extent for a range a " \
+            "buffered server write had already overwritten: it reads the " \
+            "btree without flushing the page cache first"
+    finally:
+        server.succeed("echo %s > /proc/sys/vm/dirty_ratio; "
+                       "echo %s > /proc/sys/vm/dirty_background_ratio; "
+                       "echo %s > /proc/sys/vm/dirty_writeback_centisecs; "
+                       "sync" % (dirty[0], dirty[1], dirty[2]))
+
     # --- two backends at once ---------------------------------------------
     # btrfs is a codec provider loaded on this same client, with the bcachefs
     # export still mounted: which codec a file is offered is a property of the
