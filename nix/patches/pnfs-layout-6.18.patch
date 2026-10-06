@@ -1174,10 +1174,10 @@ index 9fb2f2cac..f58d3f05b 100644
 +nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
 diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
 new file mode 100644
-index 000000000..7d7883cc8
+index 000000000..4d3a2d897
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.c
-@@ -0,0 +1,743 @@
+@@ -0,0 +1,747 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The client side of the encoded-extent data service.
@@ -1760,6 +1760,7 @@ index 000000000..7d7883cc8
 +
 +int
 +bc_ds_read_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		 const struct cred *cred,
 +		 u64 offset, void *payload, size_t capacity,
 +		 bc_ds_done_fn done, void *ctx)
 +{
@@ -1803,6 +1804,7 @@ index 000000000..7d7883cc8
 +	call->msg.rpc_proc	= &clnt->cl_procinfo[ENCODED_DS_READ];
 +	call->msg.rpc_argp	= &call->args;
 +	call->msg.rpc_resp	= &call->reply;
++	call->msg.rpc_cred	= cred;
 +
 +	/*
 +	 * A call that could not be started has to be reported, because nothing
@@ -1864,6 +1866,7 @@ index 000000000..7d7883cc8
 +
 +int
 +bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		  const struct cred *cred,
 +		  u64 offset, const struct bc_ds_payload *payload,
 +		  const struct encoded_extent_desc *desc, u32 codec,
 +		  u32 stable,
@@ -1913,6 +1916,7 @@ index 000000000..7d7883cc8
 +	call->msg.rpc_proc	= &clnt->cl_procinfo[ENCODED_DS_WRITE];
 +	call->msg.rpc_argp	= &call->args;
 +	call->msg.rpc_resp	= &call->reply;
++	call->msg.rpc_cred	= cred;
 +
 +	/* As on the read side: a call that never started has no completion, and
 +	 * rpc_call_async() has already run ->rpc_release (which frees the
@@ -1923,10 +1927,10 @@ index 000000000..7d7883cc8
 +}
 diff --git a/fs/nfs/bcachefs_ds.h b/fs/nfs/bcachefs_ds.h
 new file mode 100644
-index 000000000..3d91491a5
+index 000000000..80755c79a
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.h
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,226 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Shared state for the pNFS encoded-extent client: the layout driver
@@ -2092,8 +2096,16 @@ index 000000000..3d91491a5
 + * Asynchronous because the data path has to be: a synchronous call inside
 + * read_pagelist serialises every unit behind a round trip, and nothing else in
 + * the pgio can proceed.
++ *
++ * @cred is the credential the service authenticates the request as, and it has
++ * to be the I/O's own (hdr->cred), not the client's default: the service runs
++ * nfsd's access checks, so a mount credential - typically root, which
++ * root_squash then maps to nobody - can read a world-readable file but is
++ * refused write on it, and every encoded write would silently fall back to the
++ * MDS.
 + */
 +int bc_ds_read_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		     const struct cred *cred,
 +		     u64 offset, void *payload, size_t capacity,
 +		     bc_ds_done_fn done, void *ctx);
 +
@@ -2130,8 +2142,13 @@ index 000000000..3d91491a5
 + *
 + * @payload's pages are the request: they are sent as they stand, and @release
 + * hands them back once the transport is done with them.
++ *
++ * @cred is the I/O's credential, for the same reason as bc_ds_read_async(): the
++ * service runs nfsd's access checks, and the mount credential is not the one
++ * the MDS would use.
 + */
 +int bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
++		      const struct cred *cred,
 +		      u64 offset, const struct bc_ds_payload *payload,
 +		      const struct encoded_extent_desc *desc, u32 codec,
 +		      u32 stable,
@@ -2142,10 +2159,10 @@ index 000000000..3d91491a5
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..e29a780a8
+index 000000000..609ac9367
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1306 @@
+@@ -0,0 +1,1307 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2910,7 +2927,8 @@ index 000000000..e29a780a8
 +
 +	io->offset += len;
 +	if (io->offset < io->end) {
-+		ret = bc_ds_read_async(io->blh, io->bl, io->offset, io->payload,
++		ret = bc_ds_read_async(io->blh, io->bl, io->hdr->cred,
++				       io->offset, io->payload,
 +				       bc_ds_payload_max(io->bl),
 +				       bc_read_done, io);
 +		if (!ret)
@@ -3010,7 +3028,7 @@ index 000000000..e29a780a8
 +	if (!io->payload_pages || !io->plain_pages)
 +		goto out_free;
 +
-+	ret = bc_ds_read_async(blh, bl, io->offset, io->payload,
++	ret = bc_ds_read_async(blh, bl, hdr->cred, io->offset, io->payload,
 +			       bc_ds_payload_max(bl), bc_read_done, io);
 +	if (ret)
 +		goto out_free;
@@ -3240,8 +3258,8 @@ index 000000000..e29a780a8
 +	};
 +
 +	/* On failure the call has already run ->release, as its contract says. */
-+	ret = bc_ds_write_async(io->blh, io->bl, io->offset, &payload,
-+				&desc, io->bl->write_codec,
++	ret = bc_ds_write_async(io->blh, io->bl, io->hdr->cred, io->offset,
++				&payload, &desc, io->bl->write_codec,
 +				(u32)io->hdr->args.stable, bc_write_done, io);
 +	if (ret)
 +		bc_write_finish(io, ret);
