@@ -1891,24 +1891,19 @@ pkgs.testers.nixosTest {
     # whole reason this arm can assert on ds_write_err where the coherence arm
     # above cannot: a refusal here is always a bug.
     with subtest("write/close/read-back while the write points turn over"):
-        side = r'''
-set -u
-sz=3145728
-i=0; iters=0; short=0; wrong=0
-while [ $i -lt 40 ]; do
-  f=/mnt/side.$$.$i
-  head -c $sz /dev/zero | tr '\000' 'A' > "$f.tmp"
-  mv "$f.tmp" "$f"
-  n=$(wc -c < "$f")
-  a=$(tr -cd 'A' < "$f" | wc -c)
-  [ "$n" = "$sz" ] || short=$((short + 1))
-  [ "$a" = "$sz" ] || wrong=$((wrong + 1))
-  rm -f "$f"
-  i=$((i + 1)); iters=$((iters + 1))
-done
-echo "side: iters=$iters short=$short wrong=$wrong"
-'''
-        client.succeed("cat > /tmp/side.sh <<'SIDE_EOF'\n%s\nSIDE_EOF" % side)
+        side = " ".join([
+            'set -u; yes abcdefghijklmnopqrstuvwxyz | head -c 3145728 > /tmp/side.ref;',
+            'i=0; short=0; wrong=0;',
+            'while [ $i -lt 40 ]; do',
+            'f=/mnt/side.$$.$i;',
+            'cp /tmp/side.ref $f.tmp; mv $f.tmp $f;',
+            'n=$(wc -c < $f);',
+            'cmp -s /tmp/side.ref $f || wrong=$((wrong+1));',
+            '[ "$n" = 3145728 ] || short=$((short+1));',
+            'rm -f $f; i=$((i+1));',
+            'done;',
+            'echo side_short=$short side_wrong=$wrong',
+        ])
         ds_w0, ds_r0 = counter("ds_write_err"), counter("ds_read_err")
         # Sustained writes in the background: the write points fill and retire
         # repeatedly while the side files are written, which is the state a
@@ -1916,7 +1911,7 @@ echo "side: iters=$iters short=$short wrong=$wrong"
         client.succeed("setsid sh -c 'for n in 1 2 3 4; do "
                        "dd if=/dev/zero of=/mnt/press.$n bs=1M count=192 "
                        "conv=fsync >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
-        rc, out = client.execute("timeout 600 sh /tmp/side.sh")
+        rc, out = client.execute("timeout 600 sh -c '%s'" % side)
         client.log("side files under write pressure: rc=%d, %s" %
                    (rc, out.strip()[-200:]))
         assert rc == 0, "the side-file loop did not run: rc=%d" % rc
