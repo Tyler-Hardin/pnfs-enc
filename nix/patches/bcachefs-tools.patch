@@ -410,7 +410,7 @@ index 6f079d191..a756100a7 100644
  	for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
  		if (bch2_dev_list_has_dev(*devs_have, i))
 diff --git a/fs/data/write.c b/fs/data/write.c
-index 2b221c573..6e52bb737 100644
+index 2b221c573..4f3c67b4a 100644
 --- a/fs/data/write.c
 +++ b/fs/data/write.c
 @@ -1814,6 +1814,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
@@ -454,6 +454,24 @@ index 2b221c573..6e52bb737 100644
  			int ret2 = PTR_ERR_OR_ZERO(req) ?:
  			bch2_alloc_sectors_req(trans, req, op->write_point, &wp);
  
+@@ -2590,6 +2614,17 @@ again:
+ 		if (unlikely(bch2_err_matches(ret, BCH_ERR_data_write_need_fresh_buckets)) &&
+ 		    !retried_for_encoded) {
+ 			retried_for_encoded = true;
++			/*
++			 * The buckets this attempt pinned are unused - nothing was
++			 * submitted, so nothing points into them - but they are
++			 * still held on op->open_buckets, and the allocator cannot
++			 * open a fresh bucket while the open bucket pool is full.
++			 * Release them first, or the retry is handed the same
++			 * shortage it just failed on and the write goes out as
++			 * -ENODATA, which the peer reads as "not stored here" and
++			 * falls back to the MDS for data that was never written.
++			 */
++			bch2_open_buckets_put(c, &op->open_buckets);
+ 			bch2_alloc_sectors_retire_short(c, wp, op->crc.compressed_size);
+ 			goto again;
+ 		}
 diff --git a/fs/data/write_types.h b/fs/data/write_types.h
 index b0dc9839e..9e16cda0b 100644
 --- a/fs/data/write_types.h
