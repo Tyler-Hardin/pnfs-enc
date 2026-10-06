@@ -2,4 +2,4 @@
 # .githooks/pre-commit on every commit (see README.md).  A revision
 # marked +dirty had uncommitted changes when this commit was made.
 linux           25fcc3a77df1c728f23ff9d788e040c1621bf5dc  pnfs     nfs: page-based codecs and a zero-copy encoded-extent data path
-bcachefs-tools  5eaf4318ae5c8013353312fecf7ec5d0f386a738  master   bcachefs: encoded extents over page ranges
+bcachefs-tools  a492cb0248208c287694c975018dbbc5b7d89c64  master   bcachefs: retry encoded reads and probes on transaction restart

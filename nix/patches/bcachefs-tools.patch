@@ -484,10 +484,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..ae71a0bce
+index 000000000..2c501926f
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,971 @@
+@@ -0,0 +1,986 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -631,8 +631,14 @@ index 000000000..ae71a0bce
 +	u32 snapshot;
 +	int ret;
 +
-+	bch2_trans_begin(trans);
-+
++	/*
++	 * bch2_trans_begin() belongs to the caller's restart loop, not here:
++	 * both callers run this inside bch2_trans_do(), whose lockrestart_do()
++	 * calls begin() and then compares the restart count it returned against
++	 * trans->restart_count when the do-block succeeds. A second begin() on
++	 * the success path would advance that count behind its back and trip
++	 * the success-after-restart check.
++	 */
 +	CLASS(btree_iter, iter)(trans, BTREE_ID_extents,
 +				POS(inum.inum, offset >> 9), BTREE_ITER_slots);
 +
@@ -736,10 +742,12 @@ index 000000000..ae71a0bce
 +		return ret;
 +
 +	/*
-+	 * The extent is known and whole: read it as it sits on disk. A restart
-+	 * or ENOMEM can still come back synchronously; anything later fails the
-+	 * bio, and an encoded read never retries internally, so it surfaces
-+	 * here and the caller falls back.
++	 * The extent is known and whole: read it as it sits on disk. Anything
++	 * that can come back synchronously is a transaction restart or ENOMEM.
++	 * The caller runs this in a bch2_trans_do() restart loop, so a restart
++	 * re-enters here with a fresh transaction (and the lookup above is
++	 * redone), while ENOMEM fails the attempt and the caller falls back.
++	 * Anything after this point fails the bio.
 +	 */
 +	return bch2_read_extent(trans, rbio, POS(inum.inum, offset >> 9),
 +				BTREE_ID_extents, k, offset_into_extent,
@@ -797,7 +805,14 @@ index 000000000..ae71a0bce
 +	bch2_bio_alloc_pages_pool(c, &rbio->bio, 512, bytes,
 +				  GFP_NOIO|__GFP_SKIP_ZERO);
 +
-+	ret = bch2_trans_run(c, __bch2_encoded_read(trans, inum, offset, out, rbio));
++	/*
++	 * A restart here is normal under btree lock contention, and it must be
++	 * consumed by a restart loop: bch2_trans_put() panics on a restarted
++	 * transaction, so a plain bch2_trans_run() would turn lock contention
++	 * into a kernel panic. bch2_trans_do() re-begins the transaction and
++	 * retries until __bch2_encoded_read() stops returning a restart.
++	 */
++	ret = bch2_trans_do(c, __bch2_encoded_read(trans, inum, offset, out, rbio));
 +	if (ret)
 +		goto err;
 +
@@ -1121,8 +1136,8 @@ index 000000000..ae71a0bce
 +	struct bch_encoded_unit unit;
 +	int ret;
 +
-+	ret = bch2_trans_run(c, __bch2_encoded_probe(trans, inode_inum(inode),
-+						     offset, &unit));
++	ret = bch2_trans_do(c, __bch2_encoded_probe(trans, inode_inum(inode),
++						    offset, &unit));
 +	if (ret)
 +		return bch2_encoded_err(ret);
 +

@@ -262,3 +262,27 @@ position in this list, and `nix/tests/` refers to them by number.
     the function. Fixed in `fs/encoded_extent.c`; the gated wedge arm is the
     regression case (its diagnostics print the histogram and the memory trend per
     read).
+
+31. **The encoded read and probe paths put a restarted transaction, and the
+    panic reads like a btree-lock bug.** `bch2_trans_run()` is not a retry loop.
+    It is `CLASS(btree_trans)(c); (_do);` - get, run the do-block exactly once,
+    put - and `bch2_trans_put()` panics when `trans->restarted` is still set. So
+    a do-block that can return `BCH_ERR_transaction_restart` has to run under
+    `bch2_trans_do()` (whose `lockrestart_do()` re-begins and retries it), never
+    `bch2_trans_run()`. `bch2_encoded_read_unit()` and
+    `bch2_encoded_extent_probe()` wrapped a lookup that restarts on btree lock
+    contention in `bch2_trans_run()`, so a restart from `__bch2_encoded_find()`
+    reached the put and panicked:
+    `in transaction restart: transaction_restart_lock_node_reused, last
+    restarted by __bch2_btree_node_get`. The comment that justified it ("a
+    restart or ENOMEM can still come back synchronously ... it surfaces here and
+    the caller falls back") cannot hold: the put runs inside `bch2_trans_run()`
+    before the returned error is ever examined, so a restart can never surface
+    through that macro. The fix is `bch2_trans_do()`, with `bch2_trans_begin()`
+    moved out of `__bch2_encoded_find()` - a second begin on the success path
+    advances `trans->restart_count` behind `lockrestart_do()`'s back and trips
+    its success-after-restart check. This is why only concurrent reads found it:
+    lock-node-reused is a *relock* restart, and a lone client never drops and
+    retakes a lock under contention. The restart-injection kconfig
+    (`BCACHEFS_INJECT_TRANSACTION_RESTARTS`) reproduces it deterministically,
+    which is the regression arm to add.
