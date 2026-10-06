@@ -1174,7 +1174,7 @@ index 9fb2f2cac..f58d3f05b 100644
 +nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
 diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
 new file mode 100644
-index 000000000..eefd89037
+index 000000000..7d7883cc8
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.c
 @@ -0,0 +1,743 @@
@@ -1805,20 +1805,19 @@ index 000000000..eefd89037
 +	call->msg.rpc_resp	= &call->reply;
 +
 +	/*
-+	 * A call that could not be started - no memory for the task, or a client
-+	 * rpc_run_task() refuses outright - has to be reported, because nothing
++	 * A call that could not be started has to be reported, because nothing
 +	 * else will ever run: the completion is what carries the status, and a
-+	 * call that has no task has no completion. Returning here is what turns
-+	 * that into the fallback the caller already knows how to do.
++	 * call that has no task has no completion.
++	 *
++	 * There is nothing to unwind here. rpc_call_async() releases the
++	 * calldata itself when it cannot start a task: rpc_new_task() calls
++	 * rpc_release_calldata() before returning ERR_PTR(-ENOMEM)
++	 * (net/sunrpc/sched.c), which runs ->rpc_release - freeing @call->pages,
++	 * dropping the client reference and freeing @call. Unwinding again here
++	 * would double free all three.
 +	 */
-+	ret = rpc_call_async(clnt, &call->msg, RPC_TASK_SOFT,
-+			     &bc_ds_read_call_ops, call);
-+	if (ret) {
-+		kvfree(call->pages);
-+		rpc_release_client(clnt);
-+		kfree(call);
-+	}
-+	return ret;
++	return rpc_call_async(clnt, &call->msg, RPC_TASK_SOFT,
++			      &bc_ds_read_call_ops, call);
 +}
 +
 +struct bc_ds_write_call {
@@ -1876,8 +1875,13 @@ index 000000000..eefd89037
 +	struct rpc_clnt *clnt;
 +	int ret;
 +
-+	if (!payload->len || !payload->pages)
++	if (!payload->len || !payload->pages) {
++		/* The caller owns the payload, and on any return it expects the
++		 * release callback to have run (bc_write_step() relies on it). */
++		if (payload->release)
++			payload->release(payload->ctx);
 +		return -EINVAL;
++	}
 +
 +	call = kzalloc(sizeof(*call), GFP_NOFS);
 +	if (!call)
@@ -1910,16 +1914,12 @@ index 000000000..eefd89037
 +	call->msg.rpc_argp	= &call->args;
 +	call->msg.rpc_resp	= &call->reply;
 +
-+	/* As on the read side: a call that never started has no completion. */
-+	ret = rpc_call_async(clnt, &call->msg, RPC_TASK_SOFT,
-+			     &bc_ds_write_call_ops, call);
-+	if (ret) {
-+		if (payload->release)
-+			payload->release(payload->ctx);
-+		rpc_release_client(clnt);
-+		kfree(call);
-+	}
-+	return ret;
++	/* As on the read side: a call that never started has no completion, and
++	 * rpc_call_async() has already run ->rpc_release (which frees the
++	 * payload through its release callback) when it fails to start one.
++	 * Unwinding again here double frees the unit and the call. */
++	return rpc_call_async(clnt, &call->msg, RPC_TASK_SOFT,
++			      &bc_ds_write_call_ops, call);
 +}
 diff --git a/fs/nfs/bcachefs_ds.h b/fs/nfs/bcachefs_ds.h
 new file mode 100644

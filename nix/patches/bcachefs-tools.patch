@@ -484,10 +484,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..2c501926f
+index 000000000..629b6bfc0
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,986 @@
+@@ -0,0 +1,1021 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -1128,6 +1128,33 @@ index 000000000..2c501926f
 +
 +/* ------------------------------------------------------- the encoded_extent_ops -- */
 +
++/*
++ * The encoded read is the filesystem's own data path - the extent btree and the
++ * device - and not the page cache's. That is only correct while nothing newer
++ * is still dirty in the page cache: an MDS write (an NFS WRITE that fell back,
++ * a local buffered writer, an NFSv3 writer) updates the cache and leaves the
++ * extent key in the btree as it was, so an encoded read that skipped the cache
++ * would hand out pre-write plaintext with status 0 - no -ENODATA, so no
++ * fallback, and the peer decodes stale bytes.
++ *
++ * bch2_direct_IO_read() has the same requirement and meets it the same way:
++ * filemap_write_and_wait_range() before the btree is consulted. The cheap
++ * "needs writeback" test keeps an ordinary clean read off the writeback path.
++ * The other direction is already handled by the encoded write, which
++ * invalidates the cache under bch2_pagecache_block().
++ */
++static int bch2_encoded_readback_flush(struct file *file, u64 offset, size_t len)
++{
++	struct address_space *mapping = file_inode(file)->i_mapping;
++	loff_t start = offset;
++	loff_t end = offset + len - 1;
++
++	if (!len || !filemap_range_needs_writeback(mapping, start, end))
++		return 0;
++
++	return filemap_write_and_wait_range(mapping, start, end);
++}
++
 +static int bch2_encoded_extent_probe(struct file *file, u64 offset, size_t len,
 +				     struct encoded_extent_desc *desc)
 +{
@@ -1135,6 +1162,10 @@ index 000000000..2c501926f
 +	struct bch_inode_info *inode = to_bch_ei(file_inode(file));
 +	struct bch_encoded_unit unit;
 +	int ret;
++
++	ret = bch2_encoded_readback_flush(file, offset, len);
++	if (ret)
++		return ret;
 +
 +	ret = bch2_trans_do(c, __bch2_encoded_probe(trans, inode_inum(inode),
 +						    offset, &unit));
@@ -1158,6 +1189,10 @@ index 000000000..2c501926f
 +	struct bch_encoded_unit unit;
 +	size_t payload_len = 0;
 +	int ret;
++
++	ret = bch2_encoded_readback_flush(file, offset, len);
++	if (ret)
++		return ret;
 +
 +	ret = bch2_encoded_read_unit(c, inode_inum(inode), offset, dst, *dst_len,
 +				     &payload_len, &unit);
