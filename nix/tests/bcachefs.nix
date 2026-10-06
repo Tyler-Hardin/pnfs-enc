@@ -1876,6 +1876,64 @@ pkgs.testers.nixosTest {
     assert sha256_on(server, "/srv/export/perf.bin") == sdigest, \
         "filling the filesystem changed a file that was already there"
     client.log("after ENOSPC: the mount writes again and the old file is intact")
+
+    # (3) the shape a deployment's bookkeeping files have - write, close,
+    # rename, open, read back, no fsync anywhere - while sustained writes keep
+    # the write points turning over. This is the shape that broke: the service
+    # answered a whole-extent write it could not place with -ENODATA, which on
+    # this wire means "this range is not stored encoded", so the range went
+    # back to the MDS and the file read back empty.
+    #
+    # Every write below is unit-aligned and a whole number of units (3 MiB at
+    # 1 MiB units), so a write the service refuses is the service failing to
+    # store something it was handed - not a payload it is entitled to decline,
+    # which is what a partial or sub-unit request is. That distinction is the
+    # whole reason this arm can assert on ds_write_err where the coherence arm
+    # above cannot: a refusal here is always a bug.
+    with subtest("write/close/read-back while the write points turn over"):
+        side = r'''
+set -u
+sz=3145728
+i=0; iters=0; short=0; wrong=0
+while [ $i -lt 40 ]; do
+  f=/mnt/side.$$.$i
+  head -c $sz /dev/zero | tr '\000' 'A' > "$f.tmp"
+  mv "$f.tmp" "$f"
+  n=$(wc -c < "$f")
+  a=$(tr -cd 'A' < "$f" | wc -c)
+  [ "$n" = "$sz" ] || short=$((short + 1))
+  [ "$a" = "$sz" ] || wrong=$((wrong + 1))
+  rm -f "$f"
+  i=$((i + 1)); iters=$((iters + 1))
+done
+echo "side: iters=$iters short=$short wrong=$wrong"
+'''
+        client.succeed("cat > /tmp/side.sh <<'SIDE_EOF'\n%s\nSIDE_EOF" % side)
+        ds_w0, ds_r0 = counter("ds_write_err"), counter("ds_read_err")
+        # Sustained writes in the background: the write points fill and retire
+        # repeatedly while the side files are written, which is the state a
+        # whole-extent refusal needs.
+        client.succeed("setsid sh -c 'for n in 1 2 3 4; do "
+                       "dd if=/dev/zero of=/mnt/press.$n bs=1M count=192 "
+                       "conv=fsync >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
+        rc, out = client.execute("timeout 600 sh /tmp/side.sh")
+        client.log("side files under write pressure: rc=%d, %s" %
+                   (rc, out.strip()[-200:]))
+        assert rc == 0, "the side-file loop did not run: rc=%d" % rc
+        assert "short=0" in out and "wrong=0" in out, \
+            ("a side file written, closed and read back was empty or wrong "
+             "(want write/close/read-back to return what was written): %s" %
+             out.strip()[-300:])
+        client.log("side files: service write errors %d -> %d, read errors "
+                   "%d -> %d" %
+                   (ds_w0, counter("ds_write_err"), ds_r0,
+                    counter("ds_read_err")))
+        assert counter("ds_write_err") == ds_w0, \
+            ("the service refused %d whole-extent writes it was handed" %
+             (counter("ds_write_err") - ds_w0))
+        assert counter("ds_read_err") == ds_r0, \
+            "the client's reads failed while the side files were written"
+        client.succeed("rm -f /mnt/press.1 /mnt/press.2 /mnt/press.3 /mnt/press.4")
   '' + lib.optionalString pgUnitsSweep pgUnitsSweepScript;
 }
 
