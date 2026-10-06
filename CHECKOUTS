@@ -2,4 +2,4 @@
 # .githooks/pre-commit on every commit (see README.md).  A revision
 # marked +dirty had uncommitted changes when this commit was made.
 linux           6285de9321a99e5f8cbb8448250b2cbce5ce003b  pnfs     nfs: authenticate encoded DS I/O as the caller, not the mount
-bcachefs-tools  fa348b3148d89a1833a02f2c24cffa15532c25c0  master   bcachefs: flush the page cache before an encoded read
+bcachefs-tools  a19b1731390dc8c80f8bf7c0ee980a32b099b1e7  master   bcachefs: pack encoded writes into a per-inode write point

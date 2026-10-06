@@ -484,10 +484,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..629b6bfc0
+index 000000000..b6ebc46d7
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1021 @@
+@@ -0,0 +1,1034 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -1064,7 +1064,20 @@ index 000000000..629b6bfc0
 +	op->target		= io_opts.foreground_target;
 +	op->nr_replicas		= io_opts.data_replicas;
 +	op->res.nr_replicas	= io_opts.data_replicas;
-+	op->write_point		= writepoint_hashed((unsigned long) current);
++	/*
++	 * Hash the write point by the inode, as the buffered write path does
++	 * (writepoint_hashed(inode->ei_last_dirtied), fs/vfs/buffered.c), rather
++	 * than by the writing task. The data service runs one write per unit from
++	 * whichever of its threads picked up the RPC, so hashing by @current
++	 * spreads one file's extents across every thread's write point - dozens
++	 * of partially filled buckets the allocator cannot retire, and a
++	 * whole-extent write that keeps needing fresh buckets. One write point
++	 * per inode packs a file's units into a bucket that fills and retires
++	 * cleanly. Two writes to one inode cannot overlap anyway:
++	 * bch2_encoded_extent_write() holds bch2_pagecache_block() across the
++	 * whole write.
++	 */
++	op->write_point		= writepoint_hashed((unsigned long) inode);
 +	op->subvol		= inum.subvol;
 +	op->pos			= POS(inum.inum, offset >> 9);
 +	/*
