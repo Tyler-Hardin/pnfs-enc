@@ -1954,6 +1954,12 @@ pkgs.testers.nixosTest {
                             "$(cat /sys/kernel/debug/pnfs_bcachefs/$f); done").strip()))
             server.log("same-host %s: client write errors %d -> %d" %
                        (opt, ds_w1, counter("ds_write_err")))
+            server.log("same-host %s mountstats: " % opt + server.succeed(
+                "awk '/127.0.0.1:/{f=1} f{print} f&&/^$/{exit}' "
+                "/proc/self/mountstats | tr -s ' ' | grep -E "
+                "'WRITE|COMMIT|LAYOUT|xprt|age' | head -20"))
+            server.log("same-host %s dmesg: " % opt + server.succeed(
+                "dmesg | tail -12"))
             server.execute("umount " + mnt)
         assert rc2 == 0, "the same-host side-file loop did not run: rc=%d" % rc2
         assert "short=0" in out2 and "wrong=0" in out2, \
