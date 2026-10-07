@@ -98,6 +98,35 @@ let
     '';
   };
 
+  # Close-to-open read-back in a single process (see closeopen.c): the shape an
+  # application uses, and the only one tight enough to catch a client that
+  # answers a read out of something the write has not reached yet. A shell loop
+  # forks between the write and the read and loses the window entirely.
+  closeopen = pkgs.stdenv.mkDerivation {
+    name = "closeopen";
+    dontUnpack = true;
+    buildPhase = ''
+      $CC -O2 -Wall -o closeopen ${../closeopen.c}
+    '';
+    installPhase = ''
+      install -Dm755 closeopen $out/bin/closeopen
+    '';
+  };
+
+  # A large file written through mmap for as long as it is asked for (see
+  # mmapwrite.c): the load the deployment's real jobs put on a mount, and what
+  # a small write/close/read-back needs around it to go wrong.
+  mmapwrite = pkgs.stdenv.mkDerivation {
+    name = "mmapwrite";
+    dontUnpack = true;
+    buildPhase = ''
+      $CC -O2 -Wall -o mmapwrite ${../mmapwrite.c}
+    '';
+    installPhase = ''
+      install -Dm755 mmapwrite $out/bin/mmapwrite
+    '';
+  };
+
   common = { pkgs, ... }: {
     imports = [ ./emulation.nix ./corpus.nix ./client.nix ];
 
@@ -115,7 +144,7 @@ let
     # it needs the module only as a codec provider, and loading it on demand
     # when a layout names "bcachefs-zstd" is itself being tested.
     boot.extraModulePackages = [ bcachefsModule ];
-    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe pkgs.nftables ]
+    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen mmapwrite pkgs.nftables ]
       ++ lib.optionals walkProbe [ pkgs.fio ];
     networking.firewall.enable = false;
 
@@ -1910,7 +1939,7 @@ pkgs.testers.nixosTest {
             'while [ $i -lt 200 ]; do',
             '[ $((i % 10)) = 0 ] && echo side_iter=$i;',
             'f=/mnt/side.$$.$i;',
-            'cp /tmp/side.ref $f.tmp; mv $f.tmp $f;',
+            'cp /tmp/side.ref $f;',
             'n=$(wc -c < $f);',
             'cmp -s /tmp/side.ref $f || wrong=$((wrong+1));',
             '[ "$n" = 3145728 ] || short=$((short+1));',
@@ -1946,6 +1975,56 @@ pkgs.testers.nixosTest {
             rc3, out3 = server.execute("timeout 30 sh -c '%s'" % probe)
             server.log("same-host probe rc=%d out=%s : %s" %
                        (rc3, out3.strip()[:40], probe))
+        # Write, close, open, read, in one process, so there is nothing between
+        # the close and the open for the window to hide behind. The shell loop
+        # below forks a writer and a reader and never sees this, which is why
+        # it passed while the application did not.
+        for tag, cmd in (
+            ("8K", "closeopen /mnt/self/q.bin 8192 400"),
+            ("152K", "closeopen /mnt/self/q.bin 155648 400"),
+            ("152K-unlink", "closeopen /mnt/self/q.bin 155648 400 unlink"),
+            ("152K-fsync", "closeopen /mnt/self/q.bin 155648 400 fsync"),
+            ("200K", "closeopen /mnt/self/q.bin 204800 400"),
+            ("260K", "closeopen /mnt/self/q.bin 266240 400"),
+            ("3M", "closeopen /mnt/self/q.bin 3145728 200"),
+        ):
+            rc4, out4 = server.execute("timeout 300 sh -c '%s'" % cmd)
+            server.log("same-host closeopen %-11s rc=%d: %s" %
+                       (tag, rc4, out4.strip()[:220]))
+        # ... and again with the bed the deployment actually has: twenty large
+        # files going through mmap at once, while the small write/close/read
+        # happens. On its own the small file is never wrong - it takes the
+        # mount being busy for its pages to be the ones that get lost.
+        server.succeed("rm -f /mnt/self/q*.bin /mnt/self/load.*")
+        server.execute(
+            "sh -c 'for n in $(seq 20); do mmapwrite /mnt/self/load.$n "
+            "104857600 150 >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
+        server.succeed("sleep 20")
+        server.log("same-host under load: loaders running=%s" %
+                   server.succeed("pgrep -c mmapwrite || true").strip())
+        for tag, cmd in (
+            ("152K", "closeopen /mnt/self/q.bin 155648 400"),
+            ("152K-unlink", "closeopen /mnt/self/q.bin 155648 400 unlink"),
+            ("8K", "closeopen /mnt/self/q.bin 8192 400"),
+            ("3M", "closeopen /mnt/self/q.bin 3145728 100"),
+        ):
+            rc7, out7 = server.execute("timeout 300 sh -c '%s'" % cmd)
+            server.log("same-host under load closeopen %-11s rc=%d: %s" %
+                       (tag, rc7, out7.strip()[:220]))
+        server.execute("pkill -f mmapwrite; sleep 2")
+        server.execute("rm -f /mnt/self/load.* /mnt/self/q*.bin")
+        # The same program against a remote client, as the control: clean there
+        # and dirty here would say the pattern is not the problem, the client
+        # and the server sharing a machine is.
+        client.succeed("mkdir -p /mnt")
+        client.succeed("mountpoint -q /mnt || mount -t nfs4 "
+                       "-o vers=4.1,timeo=20,retrans=2,write=lazy "
+                       "server:/ /mnt")
+        for how in ("", "unlink"):
+            rc5, out5 = client.execute(
+                "timeout 240 closeopen /mnt/q.bin 3145728 200 %s" % how)
+            client.log("remote closeopen %-7s rc=%d: %s" %
+                       (how or "(plain)", rc5, out5.strip()))
         short = side.replace("$i -lt 200", "$i -lt 40")
         for opt, mnt in (("write=lazy", "/mnt/self"), ("write=eager", "/mnt/self2")):
             server.succeed("mkdir -p " + mnt)
