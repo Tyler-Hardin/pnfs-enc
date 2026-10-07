@@ -2159,10 +2159,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..b8df874b8
+index 000000000..ae3a9c318
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1359 @@
+@@ -0,0 +1,1391 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2263,6 +2263,22 @@ index 000000000..b8df874b8
 + * and then correctly retried looks exactly like one that failed.
 + */
 +static atomic_t bc_stat_ds_write_not_encoded = ATOMIC_INIT(0);
++/*
++ * The last write pgio the driver was handed, as the caller described it. The
++ * remaining failure is a file that comes back truncated to a page boundary
++ * below its last write, with everything before that intact - which is either a
++ * pgio that was never issued or one that was issued and did not land, and those
++ * two are indistinguishable from the file afterwards. This is what tells them
++ * apart: if the final range never appears here, the driver was never asked to
++ * write it; if it appears, the driver was and the write was lost above it.
++ *
++ * u64 and x64 rather than the atomic_t the other counters use, because an
++ * offset is a file position and truncating one to 32 bits would be the same
++ * class of mistake this is here to find. WRITE_ONCE is enough for a diagnostic
++ * read by a human.
++ */
++static u64 bc_stat_ds_last_write_off;
++static u64 bc_stat_ds_last_write_len;
 +/* Times the mount decided the service was not answering, and requests that then
 + * went straight to the MDS without paying a timeout first. */
 +static atomic_t bc_stat_ds_down = ATOMIC_INIT(0);
@@ -3185,6 +3201,16 @@ index 000000000..b8df874b8
 +	}
 +
 +	atomic_inc(&bc_stat_ds_write_ok);
++	/*
++	 * The units have to tile the request exactly. io->left reaching zero says
++	 * the driver consumed args.count, but not that it consumed it as one run
++	 * from args.offset - an offset that advanced too far and one that stopped
++	 * short both leave bytes the caller asked for unwritten, and the caller is
++	 * told the whole request succeeded either way. bcachefs' own rule: a
++	 * WARN and a counter, not a BUG, because a peer must not be able to take
++	 * the box down.
++	 */
++	WARN_ON_ONCE(io->offset != hdr->args.offset + hdr->args.count);
 +	hdr->res.count = hdr->args.count;
 +	hdr->pnfs_error = 0;
 +	hdr->task.tk_status = 0;
@@ -3342,6 +3368,8 @@ index 000000000..b8df874b8
 +	struct bc_write_io *io;
 +
 +	atomic_inc(&bc_stat_write_pagelist);
++	WRITE_ONCE(bc_stat_ds_last_write_off, hdr->args.offset);
++	WRITE_ONCE(bc_stat_ds_last_write_len, hdr->args.count);
 +
 +	if (!hdr->lseg)
 +		return PNFS_NOT_ATTEMPTED;
@@ -3480,6 +3508,10 @@ index 000000000..b8df874b8
 +					&bc_stat_ds_write_err);
 +	debugfs_create_atomic_t("ds_write_not_encoded", 0444, bc_debugfs_dir,
 +					&bc_stat_ds_write_not_encoded);
++	debugfs_create_x64("ds_last_write_off", 0444, bc_debugfs_dir,
++			   &bc_stat_ds_last_write_off);
++	debugfs_create_x64("ds_last_write_len", 0444, bc_debugfs_dir,
++			   &bc_stat_ds_last_write_len);
 +		debugfs_create_atomic_t("ds_down", 0444, bc_debugfs_dir,
 +					&bc_stat_ds_down);
 +		debugfs_create_atomic_t("ds_down_skips", 0444, bc_debugfs_dir,
