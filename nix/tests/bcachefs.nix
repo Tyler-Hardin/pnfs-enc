@@ -1929,6 +1929,23 @@ pkgs.testers.nixosTest {
         # load is not the trigger, and the dump below is the hang itself rather
         # than a queue behind a benchmark.
         server.succeed("mkdir -p /mnt/self")
+        # Which operation hangs, before the loop blurs it: a plain write, a
+        # syncing write, a global sync, and a read back. Whichever times out
+        # names the side of the path, with no kernel rebuild to find out.
+        server.succeed("mountpoint -q /mnt/self || mount -t nfs4 "
+                       "-o vers=4.1,timeo=20,retrans=2,write=lazy "
+                       "127.0.0.1:/ /mnt/self")
+        for probe in (
+            "dd if=/dev/zero of=/mnt/self/p.bin bs=1M count=3 status=none",
+            "dd if=/dev/zero of=/mnt/self/p.bin bs=1M count=3 conv=fsync status=none",
+            "sync",
+            "wc -c < /mnt/self/p.bin",
+            "cmp -s /dev/zero /mnt/self/p.bin",
+            "rm -f /mnt/self/p.bin",
+        ):
+            rc3, out3 = server.execute("timeout 30 sh -c '%s'" % probe)
+            server.log("same-host probe rc=%d out=%s : %s" %
+                       (rc3, out3.strip()[:40], probe))
         short = side.replace("$i -lt 200", "$i -lt 40")
         for opt, mnt in (("write=lazy", "/mnt/self"), ("write=eager", "/mnt/self2")):
             server.succeed("mkdir -p " + mnt)
@@ -1968,7 +1985,7 @@ pkgs.testers.nixosTest {
         assert counter("ds_write_err") == ds_w1, \
             ("the service refused %d whole-extent writes on the server's own "
              "mount" % (counter("ds_write_err") - ds_w1))
-        server.succeed("umount /mnt/self")
+        server.execute("umount -l /mnt/self; umount -l /mnt/self2")
 
         # The same loop from the remote client, now under load.
         ds_w0, ds_r0 = counter("ds_write_err"), counter("ds_read_err")
