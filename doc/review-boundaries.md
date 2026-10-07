@@ -23,29 +23,36 @@ So the redesign this document argues for is not "add checks everywhere". It is:
 it is used for, at the point of use, and a violation is a WARN plus a counter,
 never a silent substitution.** Three concrete places follow, in priority order.
 
-## 1. A write pgio must account for every byte, or say why not
+## 1. A write pgio must account for every *extent*, not just every byte
 
-`bc_write_finish()` reports success with
+**Corrected.** This section first claimed that
 
 ```c
 	hdr->res.count = hdr->args.count;
 ```
 
-unconditionally. `args.count` is what the caller asked for; `res.count` is
-what the client will believe was written. Nothing compares them against what
-the driver actually handed to the service. `io->left` counts exactly that, and
-is the natural check:
+was the bug - that assigning the count rather than deriving it let the client
+believe an incomplete write was complete. That is wrong, and reading the code
+properly (which adding the counter below is what prompted) shows why: `io->left`
+is decremented per unit in `bc_write_done()` and is zero before the success path
+is reachable, so the driver does account for every byte, and `res.count` there
+hides nothing. The claim was written from the shape of the failure rather than
+from the code, which is the mistake this document exists to argue against.
 
-- `WARN_ON_ONCE(io->left)` in the success path — finishing with bytes unaccounted
-  for is the dropped-pgio bug, and it should be loud the first time it happens
-  rather than inferred twenty runs later from a short file.
-- A counter, `ds_write_leftover`, so it is visible in debugfs on a box where a
-  WARN in dmesg was missed.
+The real gap is narrower and was hiding behind the wrong one. `io->left`
+reaching zero proves `args.count` was *consumed*. It does not prove it was
+consumed as one run from `args.offset`: an offset that overshot, or stopped
+short, leaves bytes the caller asked for unwritten, and the caller is told the
+whole request succeeded either way. What went unchecked was the **extent**, not
+the count.
 
-This is the 1-in-40. The failure is a file truncated to the page boundary below
-its last write — everything up to the final pgio persisted, the final pgio did
-not, and `close()` reported nothing. `res.count` being assigned rather than
-derived is why the client believed the write was complete.
+That check is now in `bc_write_finish()`:
+
+- `WARN_ON_ONCE(io->offset != hdr->args.offset + hdr->args.count)`.
+
+Still worth having, but as a guard against the next tiling mistake rather than
+as the explanation of this failure - it has not fired, and the remaining 1-in-40
+is not this.
 
 ## 2. The unit the service returns must be checked against the request
 
