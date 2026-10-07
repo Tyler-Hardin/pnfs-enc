@@ -2159,10 +2159,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..daccce1b1
+index 000000000..b8df874b8
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1343 @@
+@@ -0,0 +1,1359 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2253,6 +2253,16 @@ index 000000000..daccce1b1
 +static DEFINE_SPINLOCK(bc_read_bytes_lock);
 +static atomic_t bc_stat_ds_write_ok = ATOMIC_INIT(0);
 +static atomic_t bc_stat_ds_write_err = ATOMIC_INIT(0);
++/*
++ * A write the service refused as "not stored here" - the same answer the read
++ * side gets for a range with no encoded extent, and a normal fallback to the
++ * MDS, not a failure. Kept apart from the errors because the two mean opposite
++ * things: an error is the data path broken, a refusal is it declining, and only
++ * the first is worth waking up for. The read side has always had this
++ * distinction; the write side did not, which is how a write that was refused
++ * and then correctly retried looks exactly like one that failed.
++ */
++static atomic_t bc_stat_ds_write_not_encoded = ATOMIC_INIT(0);
 +/* Times the mount decided the service was not answering, and requests that then
 + * went straight to the MDS without paying a timeout first. */
 +static atomic_t bc_stat_ds_down = ATOMIC_INIT(0);
@@ -3161,8 +3171,12 @@ index 000000000..daccce1b1
 +	kfree(io);
 +
 +	if (status) {
-+		atomic_inc(&bc_stat_ds_write_err);
-+		atomic_set(&bc_stat_ds_last_write_err, status);
++		if (status == -ENODATA)
++			atomic_inc(&bc_stat_ds_write_not_encoded);
++		else {
++			atomic_inc(&bc_stat_ds_write_err);
++			atomic_set(&bc_stat_ds_last_write_err, status);
++		}
 +		bc_ds_mark_down(blh, status);
 +		/* Same hand-back as the read side: through the MDS. */
 +		hdr->pnfs_error = status;
@@ -3464,6 +3478,8 @@ index 000000000..daccce1b1
 +					&bc_stat_ds_write_ok);
 +		debugfs_create_atomic_t("ds_write_err", 0444, bc_debugfs_dir,
 +					&bc_stat_ds_write_err);
++	debugfs_create_atomic_t("ds_write_not_encoded", 0444, bc_debugfs_dir,
++					&bc_stat_ds_write_not_encoded);
 +		debugfs_create_atomic_t("ds_down", 0444, bc_debugfs_dir,
 +					&bc_stat_ds_down);
 +		debugfs_create_atomic_t("ds_down_skips", 0444, bc_debugfs_dir,

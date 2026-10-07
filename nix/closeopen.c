@@ -145,6 +145,9 @@ static ssize_t read_all(int fd, char *buf, size_t size)
  * a stale size and an empty read are the same symptom to an application only
  * if you stop looking at where they come from.
  */
+static off_t rb_size;
+static ssize_t rb_n;
+
 static int read_back(const char *path, const char *wbuf, char *rbuf,
 		     size_t size)
 {
@@ -162,6 +165,8 @@ static int read_back(const char *path, const char *wbuf, char *rbuf,
 		exit(2);
 	}
 	n = read_all(fd, rbuf, size);
+	rb_size = st.st_size;
+	rb_n = n;
 	close(fd);
 	if (n < 0) {
 		perror("read");
@@ -191,6 +196,8 @@ int main(int argc, char **argv)
 	unsigned long iters, i;
 	unsigned long count[5] = { 0 };	/* indexed by bit position */
 	unsigned long stuck = 0;
+	off_t fail_size = -1;
+	ssize_t fail_n = -1;
 	double worst = 0;
 	int variation = 0;
 	long split = -1;
@@ -213,6 +220,14 @@ int main(int argc, char **argv)
 			variation = 2;
 		else if (!strcmp(argv[4], "plain"))
 			variation = 0;
+		else if (!strncmp(argv[4], "chunked:", 8)) {
+			variation = 4;
+			split = strtol(argv[4] + 8, NULL, 0);
+			if (split <= 0 || (size_t)split >= size) {
+				fprintf(stderr, "chunked split out of range\n");
+				return 2;
+			}
+		}
 		else if (!strncmp(argv[4], "twophase:", 9)) {
 			variation = 3;
 			split = strtol(argv[4] + 9, NULL, 0);
@@ -247,6 +262,50 @@ int main(int argc, char **argv)
 		if (variation == 1 && unlink(path) && errno != ENOENT) {
 			perror("unlink");
 			return 2;
+		}
+		if (variation == 4) {
+			/*
+			 * The application's shape: many small writes, no explicit flush
+			 * between them, so the background flusher gets to encode a
+			 * partial range while the writes are still going - which is the
+			 * only way the page-rounded unit it encodes can end up covering
+			 * bytes that are written afterwards.
+			 */
+			size_t off = 0;
+
+			if (unlink(path) && errno != ENOENT) {
+				perror("unlink");
+				return 2;
+			}
+			memset(wbuf, 'A', split);
+			memset(wbuf + split, 'B', size - split);
+			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (fd < 0) {
+				perror("open for write");
+				return 2;
+			}
+			while (off < size) {
+				size_t n = size - off > 1024 ? 1024 : size - off;
+
+				if (write_all(fd, wbuf + off, n) < 0) {
+					perror("write");
+					return 2;
+				}
+				off += n;
+				usleep(1000);
+			}
+			close(fd);
+			bad = read_back(rpath, wbuf, rbuf, size);
+			if (!bad)
+				continue;
+			for (bit = 0; bit < 5; bit++)
+				if (bad & (1 << bit))
+					count[bit]++;
+			if (fail_size < 0) {
+				fail_size = rb_size;
+				fail_n = rb_n;
+			}
+			continue;
 		}
 		if (variation == 3) {
 			/*
@@ -316,6 +375,10 @@ int main(int argc, char **argv)
 		for (bit = 0; bit < 5; bit++)
 			if (bad & (1 << bit))
 				count[bit]++;
+		if (fail_size < 0) {
+			fail_size = rb_size;
+			fail_n = rb_n;
+		}
 
 		{
 			double t0 = now();
@@ -337,8 +400,9 @@ int main(int argc, char **argv)
 	}
 
 	printf("iters=%lu size0=%lu size_bad=%lu read0=%lu short=%lu "
-	       "wrong=%lu stuck=%lu worst_window_ms=%.3f\n",
+	       "wrong=%lu stuck=%lu worst_window_ms=%.3f first_bad_size=%lld "
+	       "first_bad_n=%lld\n",
 	       iters, count[0], count[1], count[2], count[3], count[4],
-	       stuck, worst * 1000);
+	       stuck, worst * 1000, (long long)fail_size, (long long)fail_n);
 	return 0;
 }

@@ -2047,6 +2047,36 @@ pkgs.testers.nixosTest {
         rcT, outT = server.execute(
             "timeout 300 closeopen /mnt/self/t.bin 152135 20 twophase:152073 "
             "/mnt/selfb/t.bin 2>&1")
+        rcC, outC = server.execute(
+            "timeout 300 closeopen /mnt/self/c.bin 152135 20 chunked:152073 "
+            "/mnt/selfb/c.bin 2>&1")
+        server.log("same-host chunked idle: rc=%d %s" % (rcC, outC.strip()))
+        # ... and again with the flusher actually running while the writes are
+        # still going. On an idle box a 152KB file is written and closed inside
+        # one writeback period, so the flusher never gets to encode a partial
+        # range - which is the whole shape being looked for. The deployment has
+        # 3.2GB of concurrent dirty writes in the same directory and the
+        # client-side bed runs the timers at a centisecond; this is both.
+        server.succeed("sysctl -qw vm.dirty_writeback_centisecs=1 "
+                       "vm.dirty_expire_centisecs=1")
+        server.execute("rm -f /mnt/self/c*.bin")
+        server.execute(
+            "sh -c 'for n in $(seq 8); do mmapwrite /mnt/self/cload.$n "
+            "67108864 120 >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
+        server.succeed("sleep 10")
+        for tag, cmd in (
+            ("chunked-load", "closeopen /mnt/self/c.bin 152135 40 chunked:152073 /mnt/selfb/c.bin"),
+            ("twophase-load", "closeopen /mnt/self/c2.bin 152135 40 twophase:152073 /mnt/selfb/c2.bin"),
+        ):
+            rcL, outL = server.execute("timeout 300 sh -c '%s 2>&1'" % cmd)
+            server.log("same-host %-13s rc=%d %s" % (tag, rcL, outL.strip()))
+        server.execute("pkill -f mmapwrite; sleep 1; rm -f /mnt/self/c*.bin /mnt/self/cload.*")
+        server.log("same-host after load: df=%s" % server.succeed(
+            "df -h --output=avail /srv/export | tail -1").strip())
+        server.log("same-host after load: dmesg=%s" % server.execute(
+            "dmesg | grep -iE 'enospc|no space|bcachefs.*error|nfs.*error' | tail -5")[1].strip())
+        server.succeed("sysctl -qw vm.dirty_writeback_centisecs=500 "
+                       "vm.dirty_expire_centisecs=3000")
         server.log("same-host twophase: rc=%d %s" % (rcT, outT.strip()))
         assert "wrong=0" in outT and "short=0" in outT and "read0=0" in outT, \
             "an encoded read served the older frame's padding over the newer " \
