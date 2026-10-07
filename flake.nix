@@ -72,7 +72,8 @@
           src = self.packages.${pkgs.stdenv.hostPlatform.system}.bcachefs-tools-src;
           # The bcachefs suite takes the backend source; the btrfs one is the
           # control and takes none.
-          bcachefsArgs = { inherit pkgs src; lib = pkgs.lib; profile = "lan"; };
+          bcachefsArgs = { inherit pkgs src; lib = pkgs.lib; profile = "lan";
+                           serverThreads = 128; };
           btrfsArgs = { inherit pkgs; lib = pkgs.lib; profile = "lan"; };
           # The bed the deployment is, from nix/tests/profiles.nix. The kernel
           # is the same derivation for every profile, so a profile is another VM
