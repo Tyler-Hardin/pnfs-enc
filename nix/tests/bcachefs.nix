@@ -1929,40 +1929,32 @@ pkgs.testers.nixosTest {
         # load is not the trigger, and the dump below is the hang itself rather
         # than a queue behind a benchmark.
         server.succeed("mkdir -p /mnt/self")
-        server.succeed("mountpoint -q /mnt/self || mount -t nfs4 "
-                       "-o vers=4.1,timeo=20,retrans=2,write=lazy "
-                       "127.0.0.1:/ /mnt/self")
-        selfside = side.replace("/mnt/side.", "/mnt/self/side.")
-        ds_w1, ds_r1 = counter("ds_write_err"), counter("ds_read_err")
-        nfsd0 = server.succeed(
-            "awk '/^io /{print $2, $3}' /proc/net/rpc/nfsd").strip()
-        dswrite0 = ds_counter("write")
-        rc2, out2 = server.execute("timeout 120 sh -c '%s'" % selfside)
-        nfsd1 = server.succeed(
-            "awk '/^io /{print $2, $3}' /proc/net/rpc/nfsd").strip()
-        server.log("same-host side files (no load): rc=%d, %s" %
-                   (rc2, out2.strip()[-300:]))
-        server.log("same-host nfsd io (read write bytes): %s -> %s; service "
-                   "writes %d -> %d" %
-                   (nfsd0, nfsd1, dswrite0, ds_counter("write")))
-        if rc2 != 0:
-            server.log("same-host hang: tasks: " + server.succeed(
-                "ps -eLo stat,wchan:30,comm | grep -E '^[DRS]' | "
-                "grep -vE ' systemd-| kworker| kthreadd| bash|sshd| ps$| rpc' | head -40"))
-            server.log("same-host hang: stacks: " + server.succeed(
-                "for p in $(ps -eo pid,stat | awk '$2 ~ /^D/{print $1}' | head -6); "
-                "do echo \"== $p $(cat /proc/$p/comm)\"; "
-                "cat /proc/$p/stack 2>/dev/null | head -12; done"))
-            server.log("same-host hang: dmesg: " + server.succeed(
-                "dmesg | tail -12"))
-            server.log("same-host hang: ds: " + server.succeed(
-                "for f in write read not_encoded inflight errors; do "
-                "printf '%s=%s ' $f $(cat /sys/kernel/debug/encoded_ds/$f); done"))
-            server.log("same-host hang: pnfs: " + server.succeed(
-                "for f in write_pagelist ds_write_ok ds_write_err "
-                "ds_last_write_err ds_write_stable ds_down ds_down_skips "
-                "lseg_alloc unit_max; do printf '%s=%s ' $f "
-                "$(cat /sys/kernel/debug/pnfs_bcachefs/$f); done"))
+        short = side.replace("$i -lt 200", "$i -lt 40")
+        for opt, mnt in (("write=lazy", "/mnt/self"), ("write=eager", "/mnt/self2")):
+            server.succeed("mkdir -p " + mnt)
+            server.succeed("mountpoint -q %s || mount -t nfs4 "
+                           "-o vers=4.1,timeo=20,retrans=2,%s 127.0.0.1:/ %s"
+                           % (mnt, opt, mnt))
+            s = short.replace("/mnt/side.", mnt + "/side.")
+            ds_w1 = counter("ds_write_err")
+            nfsd0 = server.succeed(
+                "awk '/^io /{print $2, $3}' /proc/net/rpc/nfsd").strip()
+            dsw0 = ds_counter("write")
+            rc2, out2 = server.execute("timeout 90 sh -c '%s'" % s)
+            nfsd1 = server.succeed(
+                "awk '/^io /{print $2, $3}' /proc/net/rpc/nfsd").strip()
+            server.log("same-host %s: rc=%d, %s" % (opt, rc2, out2.strip()[-200:]))
+            server.log("same-host %s: nfsd io %s -> %s; service writes %d -> %d; "
+                       "client %s" %
+                       (opt, nfsd0, nfsd1, dsw0, ds_counter("write"),
+                        server.succeed(
+                            "for f in write_pagelist ds_write_ok ds_write_err "
+                            "ds_write_stable ds_last_write_err; do printf "
+                            "'%s=%s ' $f "
+                            "$(cat /sys/kernel/debug/pnfs_bcachefs/$f); done").strip()))
+            server.log("same-host %s: client write errors %d -> %d" %
+                       (opt, ds_w1, counter("ds_write_err")))
+            server.execute("umount " + mnt)
         assert rc2 == 0, "the same-host side-file loop did not run: rc=%d" % rc2
         assert "short=0" in out2 and "wrong=0" in out2, \
             ("a side file on the server's own mount was empty or wrong when "
