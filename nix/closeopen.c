@@ -54,6 +54,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -91,6 +92,28 @@ static int write_all(int fd, const char *buf, size_t size)
 			errno = EIO;
 			return -1;
 		}
+		off += n;
+	}
+	return 0;
+}
+
+/* Write @size bytes at @off, in full. Returns 0 or -1. */
+static int pwrite_all(int fd, const char *buf, size_t size, off_t off)
+{
+	while (size) {
+		ssize_t n = pwrite(fd, buf, size, off);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0) {
+			errno = EIO;
+			return -1;
+		}
+		buf += n;
+		size -= n;
 		off += n;
 	}
 	return 0;
@@ -170,6 +193,7 @@ int main(int argc, char **argv)
 	unsigned long stuck = 0;
 	double worst = 0;
 	int variation = 0;
+	long split = -1;
 	char *wbuf, *rbuf;
 
 	if (argc < 4 || argc > 6) {
@@ -189,6 +213,14 @@ int main(int argc, char **argv)
 			variation = 2;
 		else if (!strcmp(argv[4], "plain"))
 			variation = 0;
+		else if (!strncmp(argv[4], "twophase:", 9)) {
+			variation = 3;
+			split = strtol(argv[4] + 9, NULL, 0);
+			if (split <= 0 || (size_t)split >= size) {
+				fprintf(stderr, "twophase split out of range\n");
+				return 2;
+			}
+		}
 		else {
 			fprintf(stderr, "unknown variation: %s\n", argv[4]);
 			return 2;
@@ -215,6 +247,52 @@ int main(int argc, char **argv)
 		if (variation == 1 && unlink(path) && errno != ENOENT) {
 			perror("unlink");
 			return 2;
+		}
+		if (variation == 3) {
+			/*
+			 * The shape the deployment's failing file has. Write up to a
+			 * point that is not block aligned and let it flush: the range
+			 * that gets encoded is the page-rounded one containing it, so
+			 * the frame's tail past the split is padding. Only then write
+			 * the rest of that same page, which lands inside the first
+			 * range and trims the first extent's key under it - while the
+			 * frame behind that key still describes the older, longer
+			 * range. A read that starts before the trim then fills the
+			 * tail out of the old frame's padding.
+			 */
+			if (unlink(path) && errno != ENOENT) {
+				perror("unlink");
+				return 2;
+			}
+			memset(wbuf, 'A', split);
+			memset(wbuf + split, 'B', size - split);
+			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (fd < 0) {
+				perror("open for write");
+				return 2;
+			}
+			if (write_all(fd, wbuf, split) < 0) {
+				perror("write");
+				return 2;
+			}
+			close(fd);
+			fd = open(path, O_WRONLY, 0644);
+			if (fd < 0) {
+				perror("open for write 2");
+				return 2;
+			}
+			if (pwrite_all(fd, wbuf + split, size - split, split) < 0) {
+				perror("pwrite");
+				return 2;
+			}
+			close(fd);
+			bad = read_back(rpath, wbuf, rbuf, size);
+			if (!bad)
+				continue;
+			for (bit = 0; bit < 5; bit++)
+				if (bad & (1 << bit))
+					count[bit]++;
+			continue;
 		}
 		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (fd < 0) {

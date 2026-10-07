@@ -2032,6 +2032,25 @@ pkgs.testers.nixosTest {
             rc8, out8 = server.execute("timeout 300 sh -c '%s'" % cmd)
             server.log("same-host %-19s rc=%d: %s" %
                        (tag, rc8, out8.strip()[:220]))
+
+        # The regression this suite exists to keep out: write up to a
+        # non-block-aligned offset and let it flush, which encodes the
+        # page-rounded range containing it, then write the rest of that same
+        # page. The second write starts inside the first range, so the
+        # filesystem trims the first extent's key under it - but the frame
+        # behind that key still describes the older, longer range, and the
+        # encoded lookup reports the unit's length from the frame rather than
+        # from the key. A read that starts before the trim is then told the
+        # old unit covers the tail and fills it from the frame's padding:
+        # zeros over data that is on the device. Read through the second mount
+        # so the client's own cache cannot answer.
+        rcT, outT = server.execute(
+            "timeout 300 closeopen /mnt/self/t.bin 152135 20 twophase:152073 "
+            "/mnt/selfb/t.bin 2>&1")
+        server.log("same-host twophase: rc=%d %s" % (rcT, outT.strip()))
+        assert "wrong=0" in outT and "short=0" in outT and "read0=0" in outT, \
+            "an encoded read served the older frame's padding over the newer " \
+            "extent that trimmed it: %s" % outT.strip()
         # Which path serves a read, by request size. This is the fork the live
         # repro needs: if a bad >20KiB read is one the data service answered
         # (ds_read_ok moves), the zeros came from our read path; if the service

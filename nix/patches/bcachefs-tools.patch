@@ -484,10 +484,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..b6ebc46d7
+index 000000000..6c6ecfa05
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1034 @@
+@@ -0,0 +1,1054 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -696,6 +696,26 @@ index 000000000..b6ebc46d7
 +
 +	if (unit_len > c->opts.encoded_extent_max ||
 +	    payload_len > c->opts.encoded_extent_max)
++		return bch_err_throw(c, encoded_bad_size);
++
++	/*
++	 * The key, not the frame, says how far this unit reaches. A later write
++	 * over an existing extent trims that extent's key - it cannot change the
++	 * frame the key points at - so crc.uncompressed_size keeps describing
++	 * bytes the key no longer owns. Handing that length on tells a reader
++	 * this unit covers those bytes, and the reader fills them out of this
++	 * frame: for a frame whose tail is the block padding of an older, longer
++	 * write, that is zeros served over data that is on the device, which is
++	 * how a file written, flushed, and then appended to inside the same page
++	 * comes back with a zero tail through the layout while reading correctly
++	 * through the MDS.
++	 *
++	 * Refused rather than clipped: the frame really is longer than the unit,
++	 * and the reader decodes a unit's worth into a buffer sized by the length
++	 * it was given. The refusal is -ENODATA, so the range falls back to the
++	 * MDS and is read correctly.
++	 */
++	if (unit_len != (u64) k.k->size << 9)
 +		return bch_err_throw(c, encoded_bad_size);
 +
 +	*offset_into_extent	= iter.pos.offset - bkey_start_offset(k.k);
