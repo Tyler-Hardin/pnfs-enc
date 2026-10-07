@@ -9,7 +9,16 @@
  * an open() and nothing else, so whatever an application would see, this sees
  * first.
  *
- *   closeopen <path> <bytes> <iterations> [unlink|fsync]
+ *   closeopen <path> <bytes> <iterations> [unlink|fsync] [readpath]
+ *
+ * The optional trailing @readpath reads the file back through a second mount of
+ * the same export instead of through the one it was written to. That is the
+ * whole point of it: two mounts with different options are two NFS clients, so
+ * they do not share a page cache, and the read-back then has to come from the
+ * server. Through one mount the client answers out of the cache it just filled
+ * and a server-side read bug is invisible - which is exactly how this was
+ * missed: the write is correct, the read is served from the writer's own cache,
+ * and only a reader that goes to the server sees what the server returns.
  *
  * The optional word picks a variation:
  *
@@ -154,6 +163,7 @@ static int read_back(const char *path, const char *wbuf, char *rbuf,
 int main(int argc, char **argv)
 {
 	const char *path;
+	const char *rpath;
 	size_t size;
 	unsigned long iters, i;
 	unsigned long count[5] = { 0 };	/* indexed by bit position */
@@ -162,25 +172,30 @@ int main(int argc, char **argv)
 	int variation = 0;
 	char *wbuf, *rbuf;
 
-	if (argc != 4 && argc != 5) {
+	if (argc < 4 || argc > 6) {
 		fprintf(stderr,
-			"usage: %s <path> <bytes> <iterations> [unlink|fsync]\n",
-			argv[0]);
+			"usage: %s <path> <bytes> <iterations> [unlink|fsync] "
+			"[readpath]\n", argv[0]);
 		return 2;
 	}
 	path = argv[1];
+	rpath = path;
 	size = strtoul(argv[2], NULL, 0);
 	iters = strtoul(argv[3], NULL, 0);
-	if (argc == 5) {
+	if (argc >= 5) {
 		if (!strcmp(argv[4], "unlink"))
 			variation = 1;
 		else if (!strcmp(argv[4], "fsync"))
 			variation = 2;
+		else if (!strcmp(argv[4], "plain"))
+			variation = 0;
 		else {
 			fprintf(stderr, "unknown variation: %s\n", argv[4]);
 			return 2;
 		}
 	}
+	if (argc == 6)
+		rpath = argv[5];
 	if (!size || !iters) {
 		fprintf(stderr, "bytes and iterations must be non-zero\n");
 		return 2;
@@ -216,7 +231,7 @@ int main(int argc, char **argv)
 		}
 		close(fd);
 
-		bad = read_back(path, wbuf, rbuf, size);
+		bad = read_back(rpath, wbuf, rbuf, size);
 		if (!bad)
 			continue;
 
@@ -230,7 +245,7 @@ int main(int argc, char **argv)
 
 			for (tries = 0; bad && tries < RETRY_LIMIT; tries++) {
 				usleep(RETRY_PACE_US);
-				bad = read_back(path, wbuf, rbuf, size);
+				bad = read_back(rpath, wbuf, rbuf, size);
 			}
 			if (bad) {
 				stuck++;

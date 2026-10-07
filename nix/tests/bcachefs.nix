@@ -1991,6 +1991,30 @@ pkgs.testers.nixosTest {
             rc4, out4 = server.execute("timeout 300 sh -c '%s'" % cmd)
             server.log("same-host closeopen %-11s rc=%d: %s" %
                        (tag, rc4, out4.strip()[:220]))
+        # ... and again reading the file back through a *second* mount of the
+        # export. Two mounts with different options are two NFS clients -
+        # different superblocks, so different page caches - and the read-back
+        # then has to come from the server. Through one mount the client answers
+        # out of the cache the write just filled, which is correct by
+        # construction, and a server-side read bug is invisible: that is how
+        # this was missed, and why every run above is clean.
+        server.succeed("mkdir -p /mnt/selfb")
+        server.succeed("mountpoint -q /mnt/selfb || mount -t nfs4 "
+                       "-o vers=4.1,timeo=20,retrans=2,write=eager "
+                       "127.0.0.1:/ /mnt/selfb")
+        server.log("same-host split cache: /mnt/self dev=%s /mnt/selfb dev=%s" %
+                   (server.succeed("stat -c %d /mnt/self").strip(),
+                    server.succeed("stat -c %d /mnt/selfb").strip()))
+        for tag, cmd in (
+            ("split-152K", "closeopen /mnt/self/q.bin 155648 400 plain /mnt/selfb/q.bin"),
+            ("split-152K-unlink", "closeopen /mnt/self/q.bin 155648 400 unlink /mnt/selfb/q.bin"),
+            ("split-8K", "closeopen /mnt/self/q.bin 8192 400 plain /mnt/selfb/q.bin"),
+            ("split-260K", "closeopen /mnt/self/q.bin 266240 400 plain /mnt/selfb/q.bin"),
+            ("split-3M", "closeopen /mnt/self/q.bin 3145728 100 plain /mnt/selfb/q.bin"),
+        ):
+            rc8, out8 = server.execute("timeout 300 sh -c '%s'" % cmd)
+            server.log("same-host %-19s rc=%d: %s" %
+                       (tag, rc8, out8.strip()[:220]))
         # ... and again with the bed the deployment actually has: twenty large
         # files going through mmap at once, while the small write/close/read
         # happens. On its own the small file is never wrong - it takes the
