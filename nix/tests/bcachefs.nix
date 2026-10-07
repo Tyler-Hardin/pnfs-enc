@@ -1958,6 +1958,11 @@ pkgs.testers.nixosTest {
             server.log("same-host hang: ds: " + server.succeed(
                 "for f in write read not_encoded inflight errors; do "
                 "printf '%s=%s ' $f $(cat /sys/kernel/debug/encoded_ds/$f); done"))
+            server.log("same-host hang: pnfs: " + server.succeed(
+                "for f in write_pagelist ds_write_ok ds_write_err "
+                "ds_last_write_err ds_write_stable ds_down ds_down_skips "
+                "lseg_alloc unit_max; do printf '%s=%s ' $f "
+                "$(cat /sys/kernel/debug/pnfs_bcachefs/$f); done"))
         assert rc2 == 0, "the same-host side-file loop did not run: rc=%d" % rc2
         assert "short=0" in out2 and "wrong=0" in out2, \
             ("a side file on the server's own mount was empty or wrong when "
