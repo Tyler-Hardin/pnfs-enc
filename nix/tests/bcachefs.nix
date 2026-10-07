@@ -614,6 +614,17 @@ pkgs.testers.nixosTest {
       # not the same size as the test bed's node, and if the client is what
       # limits a single stream then pretending otherwise hides it.
       virtualisation.cores = bed.clientCores or 12;
+      # The deployment's client carries a dirty backlog an order of magnitude
+      # larger than this bed would build on its own: it is a small box behind
+      # tens of GiB of unflushed writes. That backlog, and the reclaim it
+      # forces, is the state the short write/read-back fails in, so the bed's
+      # client is made the same shape - most of its RAM dirty, most of the
+      # rest in reclaim.
+      virtualisation.memorySize = 3072;
+      boot.kernel.sysctl = {
+        "vm.dirty_ratio" = 60;
+        "vm.dirty_background_ratio" = 5;
+      };
     };
 
     # A second client of the same export: coherence between clients is the one
@@ -1893,8 +1904,11 @@ pkgs.testers.nixosTest {
     with subtest("write/close/read-back while the write points turn over"):
         side = " ".join([
             'set -u; yes abcdefghijklmnopqrstuvwxyz | head -c 3145728 > /tmp/side.ref;',
+            'rs=$(wc -c < /tmp/side.ref);',
+            '[ "$rs" = 3145728 ] || { echo side_badref=$rs; exit 1; };',
             'i=0; short=0; wrong=0;',
-            'while [ $i -lt 40 ]; do',
+            'while [ $i -lt 200 ]; do',
+            '[ $((i % 10)) = 0 ] && echo side_iter=$i;',
             'f=/mnt/side.$$.$i;',
             'cp /tmp/side.ref $f.tmp; mv $f.tmp $f;',
             'n=$(wc -c < $f);',
@@ -1905,13 +1919,32 @@ pkgs.testers.nixosTest {
             'echo side_short=$short side_wrong=$wrong',
         ])
         ds_w0, ds_r0 = counter("ds_write_err"), counter("ds_read_err")
-        # Sustained writes in the background: the write points fill and retire
-        # repeatedly while the side files are written, which is the state a
-        # whole-extent refusal needs.
-        client.succeed("setsid sh -c 'for n in 1 2 3 4; do "
-                       "dd if=/dev/zero of=/mnt/press.$n bs=1M count=192 "
-                       "conv=fsync >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
-        rc, out = client.execute("timeout 600 sh -c '%s'" % side)
+        # Memory pressure first: the deployment's client runs with ~10 GiB of
+        # dirty pages in flight behind the writes, and that is the state the
+        # short write/read-back fails in. Non-fatal: how much the bed's client
+        # can take is the bed's business, and a hog that does not fit is still
+        # pressure.
+        client.execute("dd if=/dev/zero of=/dev/shm/hog bs=1M count=768 "
+                       "status=none 2>/dev/null; true")
+        # The deployment's client runs a 32-deep transport; the kernel default
+        # this bed uses is two, which serialises the writes and hides exactly
+        # the queue-depth state a refusal needs.
+        client.execute("sysctl -w sunrpc.tcp_slot_table_entries=32 >/dev/null "
+                       "2>&1; true")
+        # Oversubscribe: many concurrent writers, each on its own file so each
+        # holds a write point of its own, all writing as fast as they can. The
+        # deployment runs 128 data-service threads against ~226 layouts; a
+        # whole-extent refusal needs the write points to be full at the same
+        # time, which is a concurrency state, not a volume one.
+        client.succeed(
+            "setsid sh -c 'n=0; while [ $n -lt 32 ]; do "
+            "dd if=/dev/zero of=/mnt/press.$n bs=1M count=64 conv=fsync "
+            ">/dev/null 2>&1 & n=$((n+1)); done; "
+            "n=0; while [ $n -lt 8 ]; do "
+            "dd if=/dev/zero of=/mnt/press.$n bs=1M count=64 conv=fsync "
+            ">/dev/null 2>&1; n=$((n+1)); done; "
+            "wait' >/dev/null 2>&1 &")
+        rc, out = client.execute("timeout 900 sh -c '%s'" % side)
         client.log("side files under write pressure: rc=%d, %s" %
                    (rc, out.strip()[-200:]))
         assert rc == 0, "the side-file loop did not run: rc=%d" % rc
@@ -1928,6 +1961,34 @@ pkgs.testers.nixosTest {
              (counter("ds_write_err") - ds_w0))
         assert counter("ds_read_err") == ds_r0, \
             "the client's reads failed while the side files were written"
+
+        # The deployment runs the client and the server on the same machine:
+        # the mount is of the node's *own* export, over loopback, with nfsd, the
+        # data service and the writer sharing one CPU, one page cache and one
+        # reclaim. Nothing else in this suite has that shape - every other arm
+        # mounts a remote server from a separate VM - and the short
+        # write/close/read-back fails here, so the same loop runs here too, on
+        # the server, against the server's own export.
+        server.succeed("mkdir -p /mnt/self")
+        server.succeed("mountpoint -q /mnt/self || mount -t nfs4 "
+                       "-o vers=4.1,timeo=20,retrans=2,write=lazy "
+                       "127.0.0.1:/ /mnt/self")
+        selfside = side.replace("/mnt/side.", "/mnt/self/side.")
+        ds_w1, ds_r1 = counter("ds_write_err"), counter("ds_read_err")
+        rc2, out2 = server.execute("timeout 240 sh -c '%s'" % selfside)
+        server.log("same-host side files: rc=%d, %s" % (rc2, out2.strip()[-200:]))
+        assert rc2 == 0, "the same-host side-file loop did not run: rc=%d" % rc2
+        assert "short=0" in out2 and "wrong=0" in out2, \
+            ("a side file on the server's own mount was empty or wrong when "
+             "read back: %s" % out2.strip()[-300:])
+        server.log("same-host side files: service write errors %d -> %d, "
+                   "read errors %d -> %d" %
+                   (ds_w1, counter("ds_write_err"), ds_r1,
+                    counter("ds_read_err")))
+        assert counter("ds_write_err") == ds_w1, \
+            ("the service refused %d whole-extent writes on the server's own "
+             "mount" % (counter("ds_write_err") - ds_w1))
+        server.succeed("umount /mnt/self")
         client.succeed("rm -f /mnt/press.1 /mnt/press.2 /mnt/press.3 /mnt/press.4")
   '' + lib.optionalString pgUnitsSweep pgUnitsSweepScript;
 }
