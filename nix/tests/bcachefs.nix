@@ -2005,6 +2005,23 @@ pkgs.testers.nixosTest {
         server.log("same-host split cache: /mnt/self dev=%s /mnt/selfb dev=%s" %
                    (server.succeed("stat -c %d /mnt/self").strip(),
                     server.succeed("stat -c %d /mnt/selfb").strip()))
+        # Read-back shape, with the file's end on and off a page boundary. Every
+        # size the arms above use is a multiple of 4096 - 8192, 40960, 155648,
+        # 262144, 3145728 - so none of them has ever had a file end *inside* its
+        # last page. The deployment's failing file is 152135 bytes: 583 into the
+        # last page. These are the same file either side of that line.
+        for tag, cmd in (
+            ("align-152135", "closeopen /mnt/self/q.bin 152135 200 plain /mnt/selfb/q.bin"),
+            ("align-152136", "closeopen /mnt/self/q.bin 152136 200 plain /mnt/selfb/q.bin"),
+            ("align-155647", "closeopen /mnt/self/q.bin 155647 200 plain /mnt/selfb/q.bin"),
+            ("align-155648", "closeopen /mnt/self/q.bin 155648 200 plain /mnt/selfb/q.bin"),
+            ("align-4097", "closeopen /mnt/self/q.bin 4097 400 plain /mnt/selfb/q.bin"),
+            ("align-4096", "closeopen /mnt/self/q.bin 4096 400 plain /mnt/selfb/q.bin"),
+            ("align-152135-same", "closeopen /mnt/self/q.bin 152135 200"),
+        ):
+            rcA, outA = server.execute("timeout 300 sh -c '%s'" % cmd)
+            server.log("same-host %-19s rc=%d: %s" %
+                       (tag, rcA, outA.strip()[:220]))
         for tag, cmd in (
             ("split-152K", "closeopen /mnt/self/q.bin 155648 400 plain /mnt/selfb/q.bin"),
             ("split-152K-unlink", "closeopen /mnt/self/q.bin 155648 400 unlink /mnt/selfb/q.bin"),
@@ -2015,6 +2032,50 @@ pkgs.testers.nixosTest {
             rc8, out8 = server.execute("timeout 300 sh -c '%s'" % cmd)
             server.log("same-host %-19s rc=%d: %s" %
                        (tag, rc8, out8.strip()[:220]))
+        # The third export is formatted --encoded_extent_max=1M, which is what
+        # the deployment has and four times the default the arms above ran with.
+        # Nothing above asked this path for a 1 MiB unit, and the deployment's
+        # failing file is 152 KB - sub-unit against 1 MiB, whole-unit-ish against
+        # 256 KiB - so it is the same file shape against a different unit.
+        server.succeed("mkdir -p /mnt/selfbig /mnt/selfbigb")
+        server.succeed("mountpoint -q /mnt/selfbig || mount -t nfs4 "
+                       "-o vers=4.1,timeo=20,retrans=2,write=lazy "
+                       "127.0.0.1:/big /mnt/selfbig")
+        server.succeed("mountpoint -q /mnt/selfbigb || mount -t nfs4 "
+                       "-o vers=4.1,timeo=20,retrans=2,write=eager "
+                       "127.0.0.1:/big /mnt/selfbigb")
+        # Which filesystem that mount landed on, and what unit it advertises:
+        # write through it and see where the file appears on the server. The
+        # unit_max counter is global and holds whatever the last layout parsed,
+        # so it is read after this I/O rather than before it.
+        server.execute("closeopen /mnt/selfbig/q.bin 155648 2 plain /mnt/selfbig/q.bin")
+        server.log("same-host big: landed in big=%s root=%s | unit_max=%s | "
+                   "dev=%s/%s" %
+                   (server.execute("stat -c %s /srv/export/big/q.bin")[1].strip() or "absent",
+                    server.execute("stat -c %s /srv/export/q.bin")[1].strip() or "absent",
+                    counter("unit_max"),
+                    server.succeed("stat -c %d /mnt/selfbig").strip(),
+                    server.succeed("stat -c %d /mnt/selfbigb").strip()))
+        for tag, cmd in (
+            ("big-152K", "closeopen /mnt/selfbig/q.bin 155648 200"),
+            ("big-152K-split", "closeopen /mnt/selfbig/q.bin 155648 200 plain /mnt/selfbigb/q.bin"),
+            ("big-152K-unlink", "closeopen /mnt/selfbig/q.bin 155648 200 unlink /mnt/selfbigb/q.bin"),
+            ("big-40K", "closeopen /mnt/selfbig/q.bin 40960 400 plain /mnt/selfbigb/q.bin"),
+            ("big-1M", "closeopen /mnt/selfbig/q.bin 1048576 100 plain /mnt/selfbigb/q.bin"),
+            ("big-4M", "closeopen /mnt/selfbig/q.bin 4194304 40 plain /mnt/selfbigb/q.bin"),
+        ):
+            rc9, out9 = server.execute("timeout 300 sh -c '%s'" % cmd)
+            server.log("same-host %-19s rc=%d: %s" %
+                       (tag, rc9, out9.strip()[:220]))
+        # ... and the same on the 1 MiB-unit export, which is the deployment's.
+        for tag, cmd in (
+            ("align-152135-big", "closeopen /mnt/selfbig/q.bin 152135 200 plain /mnt/selfbigb/q.bin"),
+            ("align-155647-big", "closeopen /mnt/selfbig/q.bin 155647 200 plain /mnt/selfbigb/q.bin"),
+            ("align-155648-big", "closeopen /mnt/selfbig/q.bin 155648 200 plain /mnt/selfbigb/q.bin"),
+        ):
+            rcB, outB = server.execute("timeout 300 sh -c '%s'" % cmd)
+            server.log("same-host %-19s rc=%d: %s" %
+                       (tag, rcB, outB.strip()[:220]))
         # ... and again with the bed the deployment actually has: twenty large
         # files going through mmap at once, while the small write/close/read
         # happens. On its own the small file is never wrong - it takes the
