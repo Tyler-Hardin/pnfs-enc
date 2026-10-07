@@ -2032,6 +2032,44 @@ pkgs.testers.nixosTest {
             rc8, out8 = server.execute("timeout 300 sh -c '%s'" % cmd)
             server.log("same-host %-19s rc=%d: %s" %
                        (tag, rc8, out8.strip()[:220]))
+        # Which path serves a read, by request size. This is the fork the live
+        # repro needs: if a bad >20KiB read is one the data service answered
+        # (ds_read_ok moves), the zeros came from our read path; if the service
+        # declined it (ds_read_not_encoded moves) and the MDS served it, they
+        # came from nfsd and bcachefs, and our read path is not in the picture.
+        # Read through the second mount so the client's own cache cannot answer.
+        # Where the tail actually lives. Write the small file, make it
+        # durable, drop *every* cache on the box, and read the tail back two
+        # ways: through the exported filesystem (no NFS in the path) and
+        # through the NFS mount. The direct view being correct while the cache
+        # is warm is not evidence that the device has the bytes - fadvise and
+        # depopulated client caches are not the same as a cold server, and a
+        # per-file view created before the tail was materialised would look
+        # exactly like this. Counting the bytes of the tail that are not 'A'
+        # says which of the two is true: closeopen writes 'A' throughout.
+        def tail_wrong(path):
+            return server.succeed(
+                "dd if=%s bs=1 skip=152073 count=62 status=none | tr -d A | "
+                "wc -c" % path).strip()
+        server.execute("closeopen /mnt/self/q.bin 152135 1 plain /mnt/selfb/q.bin")
+        server.succeed("sync")
+        server.log("same-host tail warm: direct=%s nfs=%s" %
+                   (tail_wrong("/srv/export/q.bin"), tail_wrong("/mnt/self/q.bin")))
+        server.succeed("echo 3 > /proc/sys/vm/drop_caches")
+        server.log("same-host tail cold: direct=%s nfs=%s" %
+                   (tail_wrong("/srv/export/q.bin"), tail_wrong("/mnt/self/q.bin")))
+        # ... and the same for a whole-file read, which is the shape the
+        # application's verify uses and the one that goes wrong on the live box.
+        server.succeed("echo 3 > /proc/sys/vm/drop_caches")
+        server.log("same-host whole cold: direct=%s nfs=%s" % (
+            server.succeed("tr -d A < /srv/export/q.bin | wc -c").strip(),
+            server.succeed("tr -d A < /mnt/self/q.bin | wc -c").strip()))
+        # Two mounts of the same export are two NFS clients; if the two NFS
+        # views disagree with each other the client's cache is in the answer.
+        server.succeed("echo 3 > /proc/sys/vm/drop_caches")
+        server.log("same-host two NFS views: self=%s selfb=%s" % (
+            server.succeed("tr -d A < /mnt/self/q.bin | wc -c").strip(),
+            server.succeed("tr -d A < /mnt/selfb/q.bin | wc -c").strip()))
         # The third export is formatted --encoded_extent_max=1M, which is what
         # the deployment has and four times the default the arms above ran with.
         # Nothing above asked this path for a 1 MiB unit, and the deployment's
