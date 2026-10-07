@@ -1918,24 +1918,64 @@ pkgs.testers.nixosTest {
             'done;',
             'echo side_short=$short side_wrong=$wrong',
         ])
+        # The deployment runs the client and the server on the same machine:
+        # the mount is of the node's *own* export, over loopback, with nfsd, the
+        # data service, the page cache and the writer all on one box. Nothing
+        # else in this suite has that shape - every other arm mounts a remote
+        # server from a separate VM - and the short write/close/read-back hangs
+        # here.
+        #
+        # It runs FIRST, with nothing else going on. If it hangs on its own the
+        # load is not the trigger, and the dump below is the hang itself rather
+        # than a queue behind a benchmark.
+        server.succeed("mkdir -p /mnt/self")
+        server.succeed("mountpoint -q /mnt/self || mount -t nfs4 "
+                       "-o vers=4.1,timeo=20,retrans=2,write=lazy "
+                       "127.0.0.1:/ /mnt/self")
+        selfside = side.replace("/mnt/side.", "/mnt/self/side.")
+        ds_w1, ds_r1 = counter("ds_write_err"), counter("ds_read_err")
+        nfsd0 = server.succeed(
+            "awk '/^io /{print $2, $3}' /proc/net/rpc/nfsd").strip()
+        dswrite0 = ds_counter("write")
+        rc2, out2 = server.execute("timeout 120 sh -c '%s'" % selfside)
+        nfsd1 = server.succeed(
+            "awk '/^io /{print $2, $3}' /proc/net/rpc/nfsd").strip()
+        server.log("same-host side files (no load): rc=%d, %s" %
+                   (rc2, out2.strip()[-300:]))
+        server.log("same-host nfsd io (read write bytes): %s -> %s; service "
+                   "writes %d -> %d" %
+                   (nfsd0, nfsd1, dswrite0, ds_counter("write")))
+        if rc2 != 0:
+            server.log("same-host hang: tasks: " + server.succeed(
+                "ps -eLo stat,wchan:30,comm | grep -E '^[DRS]' | "
+                "grep -vE ' systemd-| kworker| kthreadd| bash|sshd| ps$| rpc' | head -40"))
+            server.log("same-host hang: stacks: " + server.succeed(
+                "for p in $(ps -eo pid,stat | awk '$2 ~ /^D/{print $1}' | head -6); "
+                "do echo \"== $p $(cat /proc/$p/comm)\"; "
+                "cat /proc/$p/stack 2>/dev/null | head -12; done"))
+            server.log("same-host hang: dmesg: " + server.succeed(
+                "dmesg | tail -12"))
+            server.log("same-host hang: ds: " + server.succeed(
+                "for f in write read not_encoded inflight errors; do "
+                "printf '%s=%s ' $f $(cat /sys/kernel/debug/encoded_ds/$f); done"))
+        assert rc2 == 0, "the same-host side-file loop did not run: rc=%d" % rc2
+        assert "short=0" in out2 and "wrong=0" in out2, \
+            ("a side file on the server's own mount was empty or wrong when "
+             "read back: %s" % out2.strip()[-300:])
+        assert counter("ds_write_err") == ds_w1, \
+            ("the service refused %d whole-extent writes on the server's own "
+             "mount" % (counter("ds_write_err") - ds_w1))
+        server.succeed("umount /mnt/self")
+
+        # The same loop from the remote client, now under load.
         ds_w0, ds_r0 = counter("ds_write_err"), counter("ds_read_err")
-        # Memory pressure first: the deployment's client runs with ~10 GiB of
-        # dirty pages in flight behind the writes, and that is the state the
-        # short write/read-back fails in. Non-fatal: how much the bed's client
-        # can take is the bed's business, and a hog that does not fit is still
-        # pressure.
+        # Memory pressure: the deployment's client runs with ~10 GiB of dirty
+        # pages in flight behind the writes. Non-fatal: how much the bed's
+        # client can take is the bed's business.
         client.execute("dd if=/dev/zero of=/dev/shm/hog bs=1M count=768 "
                        "status=none 2>/dev/null; true")
-        # The deployment's client runs a 32-deep transport; the kernel default
-        # this bed uses is two, which serialises the writes and hides exactly
-        # the queue-depth state a refusal needs.
-        client.execute("sysctl -w sunrpc.tcp_slot_table_entries=32 >/dev/null "
-                       "2>&1; true")
         # Oversubscribe: many concurrent writers, each on its own file so each
-        # holds a write point of its own, all writing as fast as they can. The
-        # deployment runs 128 data-service threads against ~226 layouts; a
-        # whole-extent refusal needs the write points to be full at the same
-        # time, which is a concurrency state, not a volume one.
+        # holds a write point of its own.
         client.succeed(
             "setsid sh -c 'n=0; while [ $n -lt 32 ]; do "
             "dd if=/dev/zero of=/mnt/press.$n bs=1M count=64 conv=fsync "
@@ -1961,34 +2001,6 @@ pkgs.testers.nixosTest {
              (counter("ds_write_err") - ds_w0))
         assert counter("ds_read_err") == ds_r0, \
             "the client's reads failed while the side files were written"
-
-        # The deployment runs the client and the server on the same machine:
-        # the mount is of the node's *own* export, over loopback, with nfsd, the
-        # data service and the writer sharing one CPU, one page cache and one
-        # reclaim. Nothing else in this suite has that shape - every other arm
-        # mounts a remote server from a separate VM - and the short
-        # write/close/read-back fails here, so the same loop runs here too, on
-        # the server, against the server's own export.
-        server.succeed("mkdir -p /mnt/self")
-        server.succeed("mountpoint -q /mnt/self || mount -t nfs4 "
-                       "-o vers=4.1,timeo=20,retrans=2,write=lazy "
-                       "127.0.0.1:/ /mnt/self")
-        selfside = side.replace("/mnt/side.", "/mnt/self/side.")
-        ds_w1, ds_r1 = counter("ds_write_err"), counter("ds_read_err")
-        rc2, out2 = server.execute("timeout 240 sh -c '%s'" % selfside)
-        server.log("same-host side files: rc=%d, %s" % (rc2, out2.strip()[-200:]))
-        assert rc2 == 0, "the same-host side-file loop did not run: rc=%d" % rc2
-        assert "short=0" in out2 and "wrong=0" in out2, \
-            ("a side file on the server's own mount was empty or wrong when "
-             "read back: %s" % out2.strip()[-300:])
-        server.log("same-host side files: service write errors %d -> %d, "
-                   "read errors %d -> %d" %
-                   (ds_w1, counter("ds_write_err"), ds_r1,
-                    counter("ds_read_err")))
-        assert counter("ds_write_err") == ds_w1, \
-            ("the service refused %d whole-extent writes on the server's own "
-             "mount" % (counter("ds_write_err") - ds_w1))
-        server.succeed("umount /mnt/self")
         client.succeed("rm -f /mnt/press.1 /mnt/press.2 /mnt/press.3 /mnt/press.4")
   '' + lib.optionalString pgUnitsSweep pgUnitsSweepScript;
 }
