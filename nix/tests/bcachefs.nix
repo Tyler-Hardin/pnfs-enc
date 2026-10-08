@@ -144,7 +144,7 @@ let
     # it needs the module only as a codec provider, and loading it on demand
     # when a layout names "bcachefs-zstd" is itself being tested.
     boot.extraModulePackages = [ bcachefsModule ];
-    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen mmapwrite pkgs.nftables ]
+    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen mmapwrite pkgs.nftables pkgs.fio ]
       ++ lib.optionals walkProbe [ pkgs.fio ];
     networking.firewall.enable = false;
 
@@ -2086,6 +2086,38 @@ pkgs.testers.nixosTest {
         # load dependent, so this runs on an idle box. 85089285 is the size the
         # application reported and 84934656 is what the file came back as, so
         # the split sits exactly on the boundary that survives.
+        # The shape this suite has never had: writes that land on top of what
+        # is already there. Every other arm writes forward and reads once, so
+        # nothing here would notice a unit whose padding - the zeros a service
+        # write puts past the end of the request to reach its granularity -
+        # covers bytes that are already the file's.
+        #
+        # fio writes random blocks with a CRC header in each, and the CRCs are
+        # then checked by reading the file through the *other* mount, which is
+        # a different NFS client: those reads come from the filesystem and not
+        # from the writer's cache, so a unit stored wrong is a verification
+        # failure rather than a cached read that agrees with itself.
+        server.execute("rm -f /mnt/self/fio.bin /mnt/selfb/fio.bin")
+        rcF, outF = server.execute(
+            "timeout 300 fio --name=w --filename=/mnt/self/fio.bin "
+            "--rw=randwrite --bs=4k --size=4M --io_size=8M "
+            "--verify=crc32c --do_verify=0 --fsync_on_close=1 --direct=0 "
+            "--randseed=1234 --output-format=terse 2>&1 | tail -2")
+        server.log("same-host fio write: rc=%d %s" % (rcF, outF.strip()[:200]))
+        server.succeed("sync; echo 3 > /proc/sys/vm/drop_caches")
+        rcV, outV = server.execute(
+            "timeout 300 fio --name=r --filename=/mnt/selfb/fio.bin "
+            "--rw=read --bs=4k --size=4M "
+            "--verify=crc32c --do_verify=1 --direct=0 "
+            "--output-format=terse 2>&1 | tail -2")
+        server.log("same-host fio verify through the other mount: rc=%d %s"
+                   % (rcV, outV.strip()[:300]))
+        direct = server.succeed(
+            "echo 3 > /proc/sys/vm/drop_caches; md5sum /srv/export/fio.bin"
+            " | cut -d' ' -f1").strip()
+        server.log("same-host fio direct view: %s" % direct[:16])
+        assert rcV == 0, "fio could not verify the file through the other mount: %s" % outV.strip()
+        server.execute("rm -f /mnt/self/fio.bin /mnt/selfb/fio.bin")
         server.execute("rm -f /mnt/self/big.bin")
         rcB, outB = server.execute(
             "timeout 900 closeopen /mnt/self/big.bin 8389191 1 "
