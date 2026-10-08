@@ -2080,7 +2080,7 @@ pkgs.testers.nixosTest {
         # load dependent, so this runs on an idle box. 85089285 is the size the
         # application reported and 84934656 is what the file came back as, so
         # the split sits exactly on the boundary that survives.
-        server.execute("rm -f /mnt/self/big.bin /mnt/selfb/big.bin")
+        server.execute("rm -f /mnt/self/big.bin")
         rcB, outB = server.execute(
             "timeout 900 closeopen /mnt/self/big.bin 8389191 1 "
             "chunked:8388608 /mnt/selfb/big.bin 2>&1")
@@ -2091,7 +2091,7 @@ pkgs.testers.nixosTest {
                        server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/write_declined").strip(),
                        server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/write_redo_entry").strip(),
                        server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/local_io").strip()))
-        server.execute("rm -f /mnt/self/big.bin /mnt/selfb/big.bin")
+        server.execute("rm -f /mnt/self/big.bin")
         # ... and again with the flusher actually running while the writes are
         # still going. On an idle box a 152KB file is written and closed inside
         # one writeback period, so the flusher never gets to encode a partial
@@ -2103,7 +2103,7 @@ pkgs.testers.nixosTest {
         server.execute("rm -f /mnt/self/c*.bin")
         server.execute(
             "sh -c 'for n in $(seq 8); do mmapwrite /mnt/self/cload.$n "
-            "67108864 120 >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
+            "67108864 60 >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
         server.succeed("sleep 10")
         def wstat():
             f = ("write_handoff", "write_handoff_refused", "write_redo_entry",
@@ -2153,7 +2153,6 @@ pkgs.testers.nixosTest {
                 server.log("same-host FAIL iter=%d last_write_off=%s "
                            "last_write_len=%s %s" %
                            (it, off, ln, outI.strip()))
-        server.log("same-host per-iteration loop done")
         server.execute("rm -f /mnt/self/c*.bin")
         server.log("same-host after load: df=%s" % server.succeed(
             "df -h --output=avail /srv/export | tail -1").strip())
