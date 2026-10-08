@@ -2051,9 +2051,18 @@ pkgs.testers.nixosTest {
         rcT, outT = server.execute(
             "timeout 300 closeopen /mnt/self/t.bin 152135 20 twophase:152073 "
             "/mnt/selfb/t.bin 2>&1")
+        ne1, ok1 = dcnt("ds_read_not_encoded"), dcnt("ds_read_ok")
         server.log("same-host twophase: served by the service: not_encoded "
-                   "%d->%d, ds_read_ok %d->%d" %
-                   (ne0, dcnt("ds_read_not_encoded"), ok0, dcnt("ds_read_ok")))
+                   "%d->%d, ds_read_ok %d->%d" % (ne0, ne1, ok0, ok1))
+        assert "wrong=0" in outT and "short=0" in outT, \
+            "twophase read-back wrong: %s" % outT.strip()
+        # The point of describing a unit by its live range - length and base -
+        # is that such a range stays serviceable. A refusal passes the read
+        # back correctly and pays the fallback, so a correct read is not
+        # enough: the range must not have gone to the MDS either.
+        assert ne1 == ne0, \
+            "the read fell back to the MDS: not_encoded %d->%d" % (ne0, ne1)
+        assert ok1 > ok0, "no encoded read was served by the service"
         rcC, outC = server.execute(
             "timeout 300 closeopen /mnt/self/c.bin 152135 20 chunked:152073 "
             "/mnt/selfb/c.bin 2>&1")

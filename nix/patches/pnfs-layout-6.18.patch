@@ -1174,10 +1174,10 @@ index 9fb2f2cac..f58d3f05b 100644
 +nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
 diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
 new file mode 100644
-index 000000000..4d3a2d897
+index 000000000..805f05ac1
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.c
-@@ -0,0 +1,747 @@
+@@ -0,0 +1,753 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The client side of the encoded-extent data service.
@@ -1257,10 +1257,13 @@ index 000000000..4d3a2d897
 + * READ - a payload that does not go through the reply buffer at all.
 + * BC_DS_READ_HEAD_WORDS is both what call_allocate() sizes that buffer from
 + * (p_replen) and what the receive is told is in front of the pages, so the two
-+ * have to be the same number or the payload lands in the wrong place.
++ * have to be the same number or the payload lands in the wrong place. It is
++ * derived from the descriptor's own word count for that reason: this is the
++ * number that has to move when the descriptor gains a field, and a hand count
++ * here that did not would land the payload at an offset nothing reports.
 + */
 +#define BC_DS_ADDR_WORDS	(1 + XDR_QUADLEN(ENCODED_DS_MAX_FH))
-+#define BC_DS_READ_HEAD_WORDS	(1 + 8 + 1)
++#define BC_DS_READ_HEAD_WORDS	(1 + ENCODED_DS_DESC_WORDS + 1)
 +
 +static void
 +bc_ds_encode_addr(struct xdr_stream *xdr, const struct bc_layout *bl)
@@ -1274,6 +1277,7 @@ index 000000000..4d3a2d897
 +{
 +	xdr_stream_encode_u64(xdr, desc->unit_offset);
 +	xdr_stream_encode_u64(xdr, desc->unit_len);
++	xdr_stream_encode_u64(xdr, desc->plain_offset);
 +	xdr_stream_encode_u64(xdr, desc->unencoded_offset);
 +	xdr_stream_encode_u32(xdr, codec);
 +	xdr_stream_encode_u32(xdr, desc->encrypted ? 1 : 0);
@@ -1288,6 +1292,8 @@ index 000000000..4d3a2d897
 +	if (xdr_stream_decode_u64(xdr, &desc->unit_offset) < 0)
 +		return -EIO;
 +	if (xdr_stream_decode_u64(xdr, &desc->unit_len) < 0)
++		return -EIO;
++	if (xdr_stream_decode_u64(xdr, &desc->plain_offset) < 0)
 +		return -EIO;
 +	if (xdr_stream_decode_u64(xdr, &desc->unencoded_offset) < 0)
 +		return -EIO;
@@ -2159,10 +2165,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..ae3a9c318
+index 000000000..0ab7a2da6
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1391 @@
+@@ -0,0 +1,1410 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2900,8 +2906,12 @@ index 000000000..ae3a9c318
 +	if (io->offset < desc->unit_offset || io->offset >= unit_end)
 +		goto out_not_encoded;
 +
-+	/* A unit larger than the segment allowed would overrun @plain. */
-+	if (desc->unit_len > io->bl->unit_max)
++	/*
++	 * The peer decodes the frame from its start and the live range begins
++	 * desc->plain_offset into it, so what has to fit a unit's buffer is where
++	 * the live range ends inside the frame, not the live length on its own.
++	 */
++	if (desc->plain_offset + desc->unit_len > io->bl->unit_max)
 +		goto out_failed;
 +
 +	atomic_set(&bc_stat_ds_last_unit_len, desc->unit_len);
@@ -2917,11 +2927,14 @@ index 000000000..ae3a9c318
 +	};
 +
 +	/*
-+	 * A request that covers the whole unit decodes straight into the pages
-+	 * it is filling; only a request that starts or ends inside a unit needs
-+	 * the scratch buffer and the copy out of it.
++	 * A request that covers the whole unit decodes straight into the pages it
++	 * is filling - but only when the live range starts at the frame's start.
++	 * With a base the frame's plaintext before it is not the file's, so
++	 * decoding in place would put that at the destination and shift the live
++	 * bytes along; those go through the scratch buffer.
 +	 */
-+	if (io->offset == desc->unit_offset && len == desc->unit_len) {
++	if (!desc->plain_offset && io->offset == desc->unit_offset &&
++	    len == desc->unit_len) {
 +		dst = (struct encoded_extent_pages) {
 +			.pages		= io->hdr->args.pages,
 +			.nr_pages	= io->hdr->page_array.npages,
@@ -2933,18 +2946,30 @@ index 000000000..ae3a9c318
 +		if (ret || declen != desc->unit_len)
 +			goto out_failed;
 +	} else {
++		size_t live = desc->plain_offset +
++			      (io->offset - desc->unit_offset);
++
++		/*
++		 * Decode as far as the live range reaches inside the frame - not
++		 * the frame's length, which may be longer than the key backs, and
++		 * not the unit's, which would stop before the live range starts.
++		 */
 +		dst = (struct encoded_extent_pages) {
 +			.pages		= io->plain_pages,
 +			.nr_pages	= io->plain_nr_pages,
 +			.offset		= 0,
-+			.len		= desc->unit_len,
++			.len		= desc->plain_offset + desc->unit_len,
 +		};
 +		ret = c->decode(&src, &dst, &declen);
-+		if (ret || declen != desc->unit_len)
++		/*
++		 * The slice the request needs has to be inside what the frame
++		 * actually decoded: a frame shorter than its live range is a
++		 * truncated one and must not be served as the file's bytes.
++		 */
++		if (ret || declen < live + len)
 +			goto out_failed;
 +		bc_copy_to_pages(io->hdr, io->offset - io->hdr->args.offset,
-+				 io->plain + (io->offset - desc->unit_offset),
-+				 len);
++				 io->plain + live, len);
 +	}
 +	spin_lock(&bc_read_bytes_lock);
 +	bc_ds_read_bytes += len;
@@ -3876,10 +3901,10 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..6eadfe312
+index 000000000..96b01a59e
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
-@@ -0,0 +1,1062 @@
+@@ -0,0 +1,1067 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The encoded-extent data service: move a filesystem's compressed, checksummed
@@ -4173,6 +4198,8 @@ index 000000000..6eadfe312
 +		return false;
 +	if (xdr_stream_decode_u64(xdr, &wire.unit_len) < 0)
 +		return false;
++	if (xdr_stream_decode_u64(xdr, &wire.plain_offset) < 0)
++		return false;
 +	if (xdr_stream_decode_u64(xdr, &wire.unencoded_offset) < 0)
 +		return false;
 +	if (xdr_stream_decode_u32(xdr, &wire.codec) < 0)
@@ -4183,6 +4210,7 @@ index 000000000..6eadfe312
 +
 +	desc->unit_offset	= wire.unit_offset;
 +	desc->unit_len		= wire.unit_len;
++	desc->plain_offset	= wire.plain_offset;
 +	desc->unencoded_offset	= wire.unencoded_offset;
 +	desc->encrypted		= wire.encrypted;
 +	desc->compression	= 0;
@@ -4294,6 +4322,8 @@ index 000000000..6eadfe312
 +	if (xdr_stream_encode_u64(xdr, reply->desc.unit_offset) < 0)
 +		return false;
 +	if (xdr_stream_encode_u64(xdr, reply->desc.unit_len) < 0)
++		return false;
++	if (xdr_stream_encode_u64(xdr, reply->desc.plain_offset) < 0)
 +		return false;
 +	if (xdr_stream_encode_u64(xdr, reply->desc.unencoded_offset) < 0)
 +		return false;
@@ -5031,10 +5061,10 @@ index db9af7804..c5a3db7c0 100644
  		struct nfsd4_compound_state *cstate, stateid_t *stateid,
 diff --git a/include/linux/encoded_extent.h b/include/linux/encoded_extent.h
 new file mode 100644
-index 000000000..be6dc62f7
+index 000000000..52d18c45b
 --- /dev/null
 +++ b/include/linux/encoded_extent.h
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,398 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_H
 +#define _LINUX_ENCODED_EXTENT_H
@@ -5083,8 +5113,21 @@ index 000000000..be6dc62f7
 + * refuses falls back to ordinary I/O, which is always correct.
 + */
 +struct encoded_extent_desc {
-+	u64	unit_offset;		/* logical offset of the unit's start */
-+	u64	unit_len;		/* plaintext the unit covers */
++	u64	unit_offset;		/* logical offset of the live range's start */
++	u64	unit_len;		/* the live range's length */
++	/*
++	 * Where the live range begins inside the frame's plaintext.
++	 *
++	 * A frame is written for a range and then the extent's key can be trimmed
++	 * or split - the frame cannot be changed, so the extent keeps the whole
++	 * frame and names the part of it still live. The plaintext a peer decodes
++	 * is therefore the frame's, and the bytes that belong to the file start
++	 * here, not at zero. Describing a unit without it makes the peer read the
++	 * wrong part of the frame, which is the same class of mistake as
++	 * describing it with the frame's length: one is where the live range
++	 * starts, the other how long it is.
++	 */
++	u64	plain_offset;
 +	u64	unencoded_offset;	/* start of the requested range in it */
 +	u32	compression;		/* backend's codec numbering */
 +	bool	encrypted;
@@ -5422,10 +5465,10 @@ index 000000000..be6dc62f7
 +#endif /* _LINUX_ENCODED_EXTENT_H */
 diff --git a/include/linux/encoded_extent_ds.h b/include/linux/encoded_extent_ds.h
 new file mode 100644
-index 000000000..ad1ddf43e
+index 000000000..9b31a797e
 --- /dev/null
 +++ b/include/linux/encoded_extent_ds.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,135 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_DS_H
 +#define _LINUX_ENCODED_EXTENT_DS_H
@@ -5533,10 +5576,23 @@ index 000000000..ad1ddf43e
 +struct encoded_ds_desc {
 +	__u64	unit_offset;
 +	__u64	unit_len;
++	/* Where the live range begins inside the frame's plaintext. */
++	__u64	plain_offset;
 +	__u64	unencoded_offset;
 +	__u32	codec;
 +	__u32	encrypted;
 +};
++
++/*
++ * The descriptor's size in XDR words, kept next to the struct because a READ
++ * reply's payload does not go through the reply buffer: the receive is told how
++ * many bytes precede the payload's pages, and that number is this (plus the
++ * reply's status and its payload length). Adding a field here without moving
++ * that number puts the payload at an offset no one reports - it arrives, and
++ * the peer fails to decode it, which reads as a data path bug rather than as a
++ * protocol one.
++ */
++#define ENCODED_DS_DESC_WORDS	(4 * XDR_QUADLEN(sizeof(__u64)) + 2)
 +
 +/*
 + * Server side (fs/nfsd/encoded_ds.c). The service is started and stopped with

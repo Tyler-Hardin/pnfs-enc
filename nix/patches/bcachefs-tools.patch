@@ -484,10 +484,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..b3ab1d9fa
+index 000000000..61f516018
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1062 @@
+@@ -0,0 +1,1069 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -627,7 +627,7 @@ index 000000000..b3ab1d9fa
 +	struct bch_fs *c = trans->c;
 +	struct extent_ptr_decoded pick;
 +	struct bkey_s_c k;
-+	u64 unit_len, payload_len;
++	u64 unit_len, plain_offset, payload_len;
 +	u32 snapshot;
 +	int ret;
 +
@@ -691,43 +691,47 @@ index 000000000..b3ab1d9fa
 +	if (!crc_is_compressed(pick.crc))
 +		return bch_err_throw(c, encoded_no_extent);
 +
-+	unit_len	= (u64) pick.crc.uncompressed_size << 9;
++	/*
++	 * A unit is described by its live range, not by its frame.
++	 *
++	 * The frame was written for a range of some length and the key is what
++	 * says how much of it still belongs to the file: a later write over the
++	 * extent trims or splits the key and cannot change the frame, so
++	 * uncompressed_size - the frame's plaintext length - keeps describing
++	 * bytes the key no longer owns, and crc.offset says how far into that
++	 * plaintext the live part begins. live_size is the key's size (see
++	 * bch2_extent_crc_unpack), so it is what can be handed out. The two
++	 * answer different questions - where the live range starts inside the
++	 * frame, and how long it is - and a description that gets either wrong
++	 * hands a peer bytes that are not the file's.
++	 *
++	 * A peer decodes from the frame's start, so how far it has to decode to
++	 * reach the live end is what has to fit the wire's ceiling.
++	 */
++	unit_len	= (u64) pick.crc.live_size << 9;
++	plain_offset	= (u64) pick.crc.offset << 9;
 +	payload_len	= (u64) pick.crc.compressed_size << 9;
 +
-+	if (unit_len > c->opts.encoded_extent_max ||
++	if (plain_offset + unit_len > c->opts.encoded_extent_max ||
 +	    payload_len > c->opts.encoded_extent_max)
 +		return bch_err_throw(c, encoded_bad_size);
 +
 +	/*
-+	 * The key, not the frame, says how far this unit reaches.
-+	 *
-+	 * The data path reads this range by the key; the frame behind the key is
-+	 * however long it was when it was written. A later write over the extent
-+	 * trims the key and cannot change the frame, so crc.uncompressed_size
-+	 * goes on describing bytes the key no longer owns - and a unit described
-+	 * by the frame is one bcachefs would never hand out. The peer fills the
-+	 * tail out of this frame, and where that tail is the block padding of an
-+	 * older, longer write it serves zeros over data that is on the device.
-+	 * That is how a file written, flushed and then appended to inside the
-+	 * same page came back with a zero tail through the layout while reading
-+	 * correctly through the MDS.
-+	 *
-+	 * Clipped, not refused, and the frame is still the whole frame: the
-+	 * payload is what the device has, and the length is what it always
-+	 * should have been. Refusing instead sent a range that is perfectly
-+	 * readable to the MDS for no reason - it read correctly and paid the
-+	 * fallback, which the counters show as ds_read_not_encoded climbing.
-+	 *
-+	 * No peer change is needed for the shorter length because the decoder
-+	 * stops when the destination is full (encoded_extent_zstd_decode, which
-+	 * says so), so it reports exactly the unit it was asked for even when
-+	 * the frame it decoded was longer.
++	 * live_size is the key's size by construction, so this cannot fire
++	 * today; it is here because everything else follows from it, and a
++	 * change that broke it would otherwise hand out a length the key does
++	 * not back.
 +	 */
-+	unit_len = min_t(u64, unit_len, (u64) k.k->size << 9);
++	if (unit_len != (u64) k.k->size << 9)
++		return bch_err_throw(c, encoded_bad_size);
 +
 +	*offset_into_extent	= iter.pos.offset - bkey_start_offset(k.k);
 +	out->logical_offset	= bkey_start_offset(k.k) << 9;
 +	out->crc		= pick.crc;
++	/*
++	 * The unit's length is the live one, so the accessor everything
++	 * downstream uses reports that and not the frame's.
++	 */
 +	out->crc.uncompressed_size = unit_len >> 9;
 +	*k_out			= k;
 +	return 0;
@@ -982,6 +986,7 @@ index 000000000..b3ab1d9fa
 +	 */
 +	if (!len || (offset & (block_bytes(c) - 1)) ||
 +	    (desc->unit_len & (block_bytes(c) - 1)) ||
++	    desc->plain_offset ||
 +	    desc->unencoded_offset ||
 +	    offset != desc->unit_offset ||
 +	    desc->unit_len > c->opts.encoded_extent_max)
@@ -1215,6 +1220,7 @@ index 000000000..b3ab1d9fa
 +
 +	desc->unit_offset	= unit.logical_offset;
 +	desc->unit_len		= bch2_encoded_unit_len(&unit);
++	desc->plain_offset	= (u64) unit.crc.offset << 9;
 +	desc->unencoded_offset	= offset - unit.logical_offset;
 +	desc->compression	= unit.crc.compression_type;
 +	desc->encrypted		= false;
@@ -1242,6 +1248,7 @@ index 000000000..b3ab1d9fa
 +
 +	desc->unit_offset	= unit.logical_offset;
 +	desc->unit_len		= bch2_encoded_unit_len(&unit);
++	desc->plain_offset	= (u64) unit.crc.offset << 9;
 +	desc->unencoded_offset	= offset - unit.logical_offset;
 +	desc->compression	= unit.crc.compression_type;
 +	desc->encrypted		= false;
