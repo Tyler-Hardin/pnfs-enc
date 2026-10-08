@@ -148,6 +148,9 @@ static ssize_t read_all(int fd, char *buf, size_t size)
 static off_t rb_size;
 static ssize_t rb_n;
 
+static long long wrong_off = -1;
+static int wrong_exp, wrong_got;
+
 static int read_back(const char *path, const char *wbuf, char *rbuf,
 		     size_t size)
 {
@@ -182,8 +185,19 @@ static int read_back(const char *path, const char *wbuf, char *rbuf,
 		bad |= B_READ0;
 	else if (n != (ssize_t)size)
 		bad |= B_SHORT;
-	else if (memcmp(wbuf, rbuf, size))
+	else if (memcmp(wbuf, rbuf, size)) {
+		size_t i;
+
 		bad |= B_WRONG;
+		if (wrong_off < 0)
+			for (i = 0; i < size; i++)
+				if (wbuf[i] != rbuf[i]) {
+					wrong_off = (long long)i;
+					wrong_exp = (unsigned char)wbuf[i];
+					wrong_got = (unsigned char)rbuf[i];
+					break;
+				}
+	}
 
 	return bad;
 }
@@ -413,8 +427,9 @@ int main(int argc, char **argv)
 
 	printf("iters=%lu size0=%lu size_bad=%lu read0=%lu short=%lu "
 	       "wrong=%lu stuck=%lu worst_window_ms=%.3f first_bad_size=%lld "
-	       "first_bad_n=%lld\n",
+	       "first_bad_n=%lld first_wrong=%lld exp=%02x got=%02x\n",
 	       iters, count[0], count[1], count[2], count[3], count[4],
-	       stuck, worst * 1000, (long long)fail_size, (long long)fail_n);
+	       stuck, worst * 1000, (long long)fail_size, (long long)fail_n,
+	       wrong_off, wrong_exp, wrong_got);
 	return 0;
 }

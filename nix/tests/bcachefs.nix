@@ -2047,6 +2047,12 @@ pkgs.testers.nixosTest {
         def dcnt(f):
             return int(server.succeed(
                 "cat /sys/kernel/debug/pnfs_bcachefs/" + f).strip())
+        server.log("twophase before: write_ok=%s write_not_enc=%s declined=%s "
+                   "last_off=%s last_len=%s" % (
+                       dcnt("ds_write_ok"), dcnt("ds_write_not_encoded"),
+                       dcnt("write_declined"),
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_off").strip(),
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_len").strip()))
         ne0, ok0 = dcnt("ds_read_not_encoded"), dcnt("ds_read_ok")
         rcT, outT = server.execute(
             "timeout 300 closeopen /mnt/self/t.bin 152135 20 twophase:152073 "

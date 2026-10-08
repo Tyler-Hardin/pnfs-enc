@@ -1174,10 +1174,10 @@ index 9fb2f2cac..f58d3f05b 100644
 +nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
 diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
 new file mode 100644
-index 000000000..805f05ac1
+index 000000000..436a708d7
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.c
-@@ -0,0 +1,753 @@
+@@ -0,0 +1,756 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The client side of the encoded-extent data service.
@@ -1278,6 +1278,7 @@ index 000000000..805f05ac1
 +	xdr_stream_encode_u64(xdr, desc->unit_offset);
 +	xdr_stream_encode_u64(xdr, desc->unit_len);
 +	xdr_stream_encode_u64(xdr, desc->plain_offset);
++	xdr_stream_encode_u64(xdr, desc->valid_len);
 +	xdr_stream_encode_u64(xdr, desc->unencoded_offset);
 +	xdr_stream_encode_u32(xdr, codec);
 +	xdr_stream_encode_u32(xdr, desc->encrypted ? 1 : 0);
@@ -1294,6 +1295,8 @@ index 000000000..805f05ac1
 +	if (xdr_stream_decode_u64(xdr, &desc->unit_len) < 0)
 +		return -EIO;
 +	if (xdr_stream_decode_u64(xdr, &desc->plain_offset) < 0)
++		return -EIO;
++	if (xdr_stream_decode_u64(xdr, &desc->valid_len) < 0)
 +		return -EIO;
 +	if (xdr_stream_decode_u64(xdr, &desc->unencoded_offset) < 0)
 +		return -EIO;
@@ -2165,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..e499de750
+index 000000000..bda4b1867
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1500 @@
+@@ -0,0 +1,1606 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2828,6 +2831,26 @@ index 000000000..e499de750
 +	}
 +}
 +
++/* The reverse: the request's bytes, in order, into a linear buffer. */
++static void
++bc_copy_from_pages(struct nfs_pgio_header *hdr, size_t skip, void *dst,
++		   size_t len)
++{
++	unsigned int pgindex = (hdr->args.pgbase + skip) >> PAGE_SHIFT;
++	unsigned int pgoff = (hdr->args.pgbase + skip) & (PAGE_SIZE - 1);
++
++	while (len) {
++		struct page *page = hdr->args.pages[pgindex];
++		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
++
++		memcpy_from_page(dst, page, pgoff, n);
++		dst += n;
++		len -= n;
++		pgoff = 0;
++		pgindex++;
++	}
++}
++
 +/* ------------------------------------------------------------ the read -- */
 +
 +/*
@@ -2880,6 +2903,8 @@ index 000000000..e499de750
 +	kfree(io);
 +
 +	if (status) {
++		pr_info_ratelimited("bcenc rd finish: status=%d off=%llu len=%zu\n",
++				    status, io->offset, io->hdr->args.count);
 +		if (status == -ENODATA)
 +			atomic_inc(&bc_stat_ds_read_not_encoded);
 +		else {
@@ -2919,8 +2944,10 @@ index 000000000..e499de750
 +	if (status)
 +		goto out_status;
 +
-+	if (desc->encrypted)
++	if (desc->encrypted) {
++		pr_info_ratelimited("bcenc rd decline A encrypted\n");
 +		goto out_not_encoded;
++	}
 +
 +	/*
 +	 * The descriptor names its codec by position in the layout's list. A
@@ -2929,21 +2956,31 @@ index 000000000..e499de750
 +	 * being guessed at.
 +	 */
 +	if (codec >= io->bl->nr_codecs || !io->bl->codec[codec] ||
-+	    !io->bl->codec[codec]->decode)
++	    !io->bl->codec[codec]->decode) {
++		pr_info_ratelimited("bcenc rd decline B codec=%u nr=%u\n",
++				    codec, io->bl->nr_codecs);
 +		goto out_not_encoded;
++	}
 +	c = io->bl->codec[codec];
 +
 +	unit_end = desc->unit_offset + desc->unit_len;
-+	if (io->offset < desc->unit_offset || io->offset >= unit_end)
++	if (io->offset < desc->unit_offset || io->offset >= unit_end) {
++		pr_info_ratelimited("bcenc rd decline C off=%llu uoff=%llu uend=%llu ulen=%llu plain=%llu\n",
++			io->offset, desc->unit_offset, unit_end,
++			desc->unit_len, desc->plain_offset);
 +		goto out_not_encoded;
++	}
 +
 +	/*
 +	 * The peer decodes the frame from its start and the live range begins
 +	 * desc->plain_offset into it, so what has to fit a unit's buffer is where
 +	 * the live range ends inside the frame, not the live length on its own.
 +	 */
-+	if (desc->plain_offset + desc->unit_len > io->bl->unit_max)
++	if (desc->plain_offset + desc->unit_len > io->bl->unit_max) {
++		pr_info_ratelimited("bcenc rd decline D reach=%llu umax=%u\n",
++			desc->plain_offset + desc->unit_len, io->bl->unit_max);
 +		goto out_failed;
++	}
 +
 +	atomic_set(&bc_stat_ds_last_unit_len, desc->unit_len);
 +	atomic_set(&bc_stat_ds_last_payload_len, payload_len);
@@ -3348,8 +3385,9 @@ index 000000000..e499de750
 +	struct encoded_extent_pages src, dst;
 +	struct encoded_extent_desc desc;
 +	struct bc_ds_payload payload;
-+	struct bc_write_unit *u;
-+	size_t done, complen;
++	struct bc_write_unit *u, *pad;
++	size_t done, complen, unit_len, front, span;
++	u64 unit_off;
 +	int ret;
 +
 +	if (!io->left) {
@@ -3360,6 +3398,24 @@ index 000000000..e499de750
 +	io->unit = min_t(size_t, io->left, io->bl->unit_max);
 +	done = io->hdr->args.count - io->left;
 +
++	/*
++	 * The unit the service stores is aligned at both ends. It begins at the
++	 * page the request's first byte is in - for the first unit only, and
++	 * those bytes are the file's own, already in the page cache, so writing
++	 * them back changes nothing - and it ends on a unit boundary, with zeros
++	 * past the request's last byte, because a reader past the old end is
++	 * owed zeros. It is never smaller than two units: once the payload is
++	 * itself padded to the filesystem's block size, a one-unit payload
++	 * cannot be smaller than the unit it describes, so the backend refuses
++	 * it as having compressed nothing - which is how a padded tail ends up
++	 * back on the MDS, where it was before any of this.
++	 */
++	front		= done ? 0 : io->hdr->args.pgbase;
++	span		= front + io->unit;
++	unit_off	= io->offset - front;
++	unit_len	= max_t(size_t, round_up(span, io->bl->unit_align),
++				 2 * (size_t) io->bl->unit_align);
++
 +	u = bc_write_unit_alloc(io->bl->unit_max);
 +	if (!u) {
 +		bc_write_finish(io, -ENOMEM);
@@ -3367,8 +3423,9 @@ index 000000000..e499de750
 +	}
 +
 +	memset(&desc, 0, sizeof(desc));
-+	desc.unit_offset = io->offset;
-+	desc.unit_len = io->unit;
++	desc.unit_offset = unit_off;
++	desc.unit_len = unit_len;
++	desc.valid_len = span;
 +
 +	/*
 +	 * The dirty pages are the codec's input and this unit's buffer is its
@@ -3376,12 +3433,49 @@ index 000000000..e499de750
 +	 * encoder and straight out of it into the transport - no flattening
 +	 * buffer and no second pass over the unit anywhere.
 +	 */
-+	src = (struct encoded_extent_pages) {
-+		.pages		= io->hdr->args.pages,
-+		.nr_pages	= io->hdr->page_array.npages,
-+		.offset		= io->hdr->args.pgbase + done,
-+		.len		= io->unit,
-+	};
++	/*
++	 * An aligned unit needs nothing copied: it is already the page cache's
++	 * bytes, in order, at the length asked for. Anything else is assembled,
++	 * which is only ever the last unit of a request and at most one unit's
++	 * worth of copying.
++	 */
++	if (!front && unit_len == io->unit) {
++		pad = NULL;
++		src = (struct encoded_extent_pages) {
++			.pages		= io->hdr->args.pages,
++			.nr_pages	= io->hdr->page_array.npages,
++			.offset		= io->hdr->args.pgbase + done,
++			.len		= io->unit,
++		};
++	} else {
++		pad = bc_write_unit_alloc(unit_len);
++		if (!pad) {
++			bc_write_unit_free(u);
++			bc_write_finish(io, -ENOMEM);
++			return;
++		}
++		/* The file's own bytes ahead of the request in that page ... */
++		if (front)
++			memcpy_from_page(pad->buf, io->hdr->args.pages[0], 0,
++					 front);
++		/* ... then the request's ... */
++		bc_copy_from_pages(io->hdr, io->hdr->args.pgbase + done,
++				   pad->buf + front, io->unit);
++		/* ... then the zeros a reader past the end is owed. */
++		memset(pad->buf + span, 0, unit_len - span);
++		pr_info_ratelimited("bcenc pad: front=%zu span=%zu done=%zu pgbase=%u unit=%zu ulen=%zu buf[0]=%02x buf[front]=%02x buf[span-1]=%02x comp=%u codec=%u\n",
++			front, span, done, io->hdr->args.pgbase, io->unit, unit_len,
++			((unsigned char *)pad->buf)[0],
++			((unsigned char *)pad->buf)[front],
++			((unsigned char *)pad->buf)[span - 1],
++			desc.compression, io->bl->write_codec);
++		src = (struct encoded_extent_pages) {
++			.pages		= pad->pages,
++			.nr_pages	= pad->nr_pages,
++			.offset		= 0,
++			.len		= unit_len,
++		};
++	}
 +	dst = (struct encoded_extent_pages) {
 +		.pages		= u->pages,
 +		.nr_pages	= u->nr_pages,
@@ -3390,6 +3484,9 @@ index 000000000..e499de750
 +	};
 +
 +	ret = c->encode(&src, &dst, &complen);
++	/* The codec has read it; the transport's payload is the other buffer. */
++	if (pad)
++		bc_write_unit_free(pad);
 +	if (ret) {
 +		bc_write_unit_free(u);
 +		bc_write_finish(io, ret);
@@ -3411,7 +3508,12 @@ index 000000000..e499de750
 +	};
 +
 +	/* On failure the call has already run ->release, as its contract says. */
-+	ret = bc_ds_write_async(io->blh, io->bl, io->hdr->cred, io->offset,
++	/*
++	 * The unit's offset, not the request's: the service requires the write's
++	 * offset to be the descriptor's and to be on a block boundary, and a
++	 * unit padded at the front begins before the request does.
++	 */
++	ret = bc_ds_write_async(io->blh, io->bl, io->hdr->cred, unit_off,
 +				&payload, &desc, io->bl->write_codec,
 +				(u32)io->hdr->args.stable, bc_write_done, io);
 +	if (ret)
@@ -3477,11 +3579,18 @@ index 000000000..e499de750
 +		return PNFS_NOT_ATTEMPTED;
 +	}
 +
++	/*
++	 * A request that fits in one unit is always servable: the unit can be
++	 * aligned at both ends around it. Only a request too big for one unit
++	 * has to start on a boundary, because its later units are addressed as
++	 * the request's offset plus a whole number of units and nothing can pad
++	 * their front.
++	 */
 +	if (!bl->unit_align || !bl->unit_max ||
 +	    bl->write_codec >= bl->nr_codecs ||
-+	    hdr->args.offset % bl->unit_align ||
-+	    hdr->args.count % bl->unit_align ||
-+	    hdr->args.pgbase % bl->unit_align) {
++	    (hdr->args.count > bl->unit_max &&
++	     (hdr->args.offset % bl->unit_align ||
++	      hdr->args.pgbase % bl->unit_align))) {
 +		atomic_inc(&bc_stat_write_declined);
 +		atomic_inc(&bc_stat_write_declined_align);
 +		return PNFS_NOT_ATTEMPTED;
@@ -4048,10 +4157,10 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..96b01a59e
+index 000000000..0f72ef2e3
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
-@@ -0,0 +1,1067 @@
+@@ -0,0 +1,1076 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The encoded-extent data service: move a filesystem's compressed, checksummed
@@ -4347,6 +4456,8 @@ index 000000000..96b01a59e
 +		return false;
 +	if (xdr_stream_decode_u64(xdr, &wire.plain_offset) < 0)
 +		return false;
++	if (xdr_stream_decode_u64(xdr, &wire.valid_len) < 0)
++		return false;
 +	if (xdr_stream_decode_u64(xdr, &wire.unencoded_offset) < 0)
 +		return false;
 +	if (xdr_stream_decode_u32(xdr, &wire.codec) < 0)
@@ -4358,6 +4469,7 @@ index 000000000..96b01a59e
 +	desc->unit_offset	= wire.unit_offset;
 +	desc->unit_len		= wire.unit_len;
 +	desc->plain_offset	= wire.plain_offset;
++	desc->valid_len		= wire.valid_len;
 +	desc->unencoded_offset	= wire.unencoded_offset;
 +	desc->encrypted		= wire.encrypted;
 +	desc->compression	= 0;
@@ -4471,6 +4583,8 @@ index 000000000..96b01a59e
 +	if (xdr_stream_encode_u64(xdr, reply->desc.unit_len) < 0)
 +		return false;
 +	if (xdr_stream_encode_u64(xdr, reply->desc.plain_offset) < 0)
++		return false;
++	if (xdr_stream_encode_u64(xdr, reply->desc.valid_len) < 0)
 +		return false;
 +	if (xdr_stream_encode_u64(xdr, reply->desc.unencoded_offset) < 0)
 +		return false;
@@ -4682,6 +4796,10 @@ index 000000000..96b01a59e
 +		goto out_err;
 +
 +	ret = f.ops->probe(f.file, args->offset, args->len, &reply->desc);
++	if (ret)
++		pr_info_ratelimited("encoded_ds probe failed: ret=%d off=%llu len=%u\n",
++				    ret, (unsigned long long)args->offset,
++				    args->len);
 +	encoded_ds_close(&f);
 +	if (ret)
 +		goto out_err;
@@ -5208,10 +5326,10 @@ index db9af7804..c5a3db7c0 100644
  		struct nfsd4_compound_state *cstate, stateid_t *stateid,
 diff --git a/include/linux/encoded_extent.h b/include/linux/encoded_extent.h
 new file mode 100644
-index 000000000..52d18c45b
+index 000000000..a36a8bd2a
 --- /dev/null
 +++ b/include/linux/encoded_extent.h
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,412 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_H
 +#define _LINUX_ENCODED_EXTENT_H
@@ -5275,6 +5393,20 @@ index 000000000..52d18c45b
 +	 * starts, the other how long it is.
 +	 */
 +	u64	plain_offset;
++	/*
++	 * The exact byte length of the unit's data, when the frame had to be
++	 * padded to reach the path's granularity.
++	 *
++	 * An encoded extent is described in sectors - crc.uncompressed_size is a
++	 * sector count and the backend refuses a unit whose length is not block
++	 * aligned - so a request whose last byte is not on a block boundary
++	 * cannot be written as itself. It is written padded up, and this says how
++	 * much of it is the file's: the inode's size is set from this and not
++	 * from the padded length, or a file written this way comes back longer
++	 * than it was written. Zero means the whole unit, which is what every
++	 * aligned write sends.
++	 */
++	u64	valid_len;
 +	u64	unencoded_offset;	/* start of the requested range in it */
 +	u32	compression;		/* backend's codec numbering */
 +	bool	encrypted;
@@ -5612,10 +5744,10 @@ index 000000000..52d18c45b
 +#endif /* _LINUX_ENCODED_EXTENT_H */
 diff --git a/include/linux/encoded_extent_ds.h b/include/linux/encoded_extent_ds.h
 new file mode 100644
-index 000000000..9b31a797e
+index 000000000..a0bc0e25c
 --- /dev/null
 +++ b/include/linux/encoded_extent_ds.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,137 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_DS_H
 +#define _LINUX_ENCODED_EXTENT_DS_H
@@ -5725,6 +5857,8 @@ index 000000000..9b31a797e
 +	__u64	unit_len;
 +	/* Where the live range begins inside the frame's plaintext. */
 +	__u64	plain_offset;
++	/* Exact length of the unit's data; zero means the whole of it. */
++	__u64	valid_len;
 +	__u64	unencoded_offset;
 +	__u32	codec;
 +	__u32	encrypted;
@@ -5739,7 +5873,7 @@ index 000000000..9b31a797e
 + * the peer fails to decode it, which reads as a data path bug rather than as a
 + * protocol one.
 + */
-+#define ENCODED_DS_DESC_WORDS	(4 * XDR_QUADLEN(sizeof(__u64)) + 2)
++#define ENCODED_DS_DESC_WORDS	(5 * XDR_QUADLEN(sizeof(__u64)) + 2)
 +
 +/*
 + * Server side (fs/nfsd/encoded_ds.c). The service is started and stopped with

@@ -410,7 +410,7 @@ index 6f079d191..a756100a7 100644
  	for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
  		if (bch2_dev_list_has_dev(*devs_have, i))
 diff --git a/fs/data/write.c b/fs/data/write.c
-index 2b221c573..6e52bb737 100644
+index 2b221c573..eeece29cb 100644
 --- a/fs/data/write.c
 +++ b/fs/data/write.c
 @@ -1814,6 +1814,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
@@ -454,6 +454,23 @@ index 2b221c573..6e52bb737 100644
  			int ret2 = PTR_ERR_OR_ZERO(req) ?:
  			bch2_alloc_sectors_req(trans, req, op->write_point, &wp);
  
+@@ -2773,7 +2797,16 @@ CLOSURE_CALLBACK(bch2_write)
+ 	data_len = min_t(u64, bio->bi_iter.bi_size,
+ 			 op->new_i_size - (op->pos.offset << 9));
+ 
++	/*
++	 * Never inline an encoded write: what the bio holds is the codec's
++	 * frame, not the file's data, and inline storage keeps a key's bytes
++	 * verbatim - so the file would read back the compressed frame, and read
++	 * it back short, since the frame is smaller than the unit it describes.
++	 * The encoded extent has to go to the device, which is the only place
++	 * the decoder is told to look for it.
++	 */
+ 	if (c->opts.inline_data &&
++	    !(op->flags & BCH_WRITE_data_encoded) &&
+ 	    data_len <= min(block_bytes(c) / 2, 1024U)) {
+ 		bch2_write_data_inline(op, data_len);
+ 		return;
 diff --git a/fs/data/write_types.h b/fs/data/write_types.h
 index b0dc9839e..9e16cda0b 100644
 --- a/fs/data/write_types.h
@@ -484,10 +501,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..61f516018
+index 000000000..4c7a07166
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1069 @@
+@@ -0,0 +1,1124 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -658,12 +675,17 @@ index 000000000..61f516018
 +	 * names one is not getting a unit it may later rewrite, so the
 +	 * indirect pointer itself is refused.
 +	 */
-+	if (k.k->type == KEY_TYPE_reflink_p)
++	if (k.k->type == KEY_TYPE_reflink_p) {
++		pr_info_ratelimited("bcenc probe A reflink\n");
 +		return bch_err_throw(c, encoded_reflink);
++	}
 +
 +	/* Hole, reservation, inline data: no separate payload to move. */
-+	if (!bkey_extent_is_direct_data(k.k))
++	if (!bkey_extent_is_direct_data(k.k)) {
++		pr_info_ratelimited("bcenc probe B type=%u not direct data\n",
++				    k.k->type);
 +		return bch_err_throw(c, encoded_no_extent);
++	}
 +
 +	ret = bch2_bkey_buf_reassemble(sk, k);
 +	if (ret)
@@ -673,14 +695,21 @@ index 000000000..61f516018
 +	ret = bch2_bkey_pick_read_device(c, k, NULL, &pick, -1, 0);
 +	if (ret < 0)
 +		return ret;
-+	if (!ret)
++	if (!ret) {
++		pr_info_ratelimited("bcenc probe C nothing pickable ksize=%u\n",
++				    k.k->size);
 +		return bch_err_throw(c, encoded_no_extent);
++	}
 +
-+	if (bch2_csum_type_is_encryption(pick.crc.csum_type))
++	if (bch2_csum_type_is_encryption(pick.crc.csum_type)) {
++		pr_info_ratelimited("bcenc probe D encrypted\n");
 +		return bch_err_throw(c, encoded_encrypted);
++	}
 +
-+	if (!bch2_checksum_type_valid(c, pick.crc.csum_type))
++	if (!bch2_checksum_type_valid(c, pick.crc.csum_type)) {
++		pr_info_ratelimited("bcenc probe E csum invalid\n");
 +		return bch_err_throw(c, encoded_metadata_invalid);
++	}
 +
 +	/*
 +	 * An extent stored without a codec has no codec work to offload: the
@@ -688,8 +717,12 @@ index 000000000..61f516018
 +	 * and it is why a probe never sends a caller looking for a codec it
 +	 * cannot use.
 +	 */
-+	if (!crc_is_compressed(pick.crc))
++	if (!crc_is_compressed(pick.crc)) {
++		pr_info_ratelimited("bcenc probe F not compressed ctype=%u ksize=%u usize=%u\n",
++			pick.crc.compression_type, k.k->size,
++			pick.crc.uncompressed_size);
 +		return bch_err_throw(c, encoded_no_extent);
++	}
 +
 +	/*
 +	 * A unit is described by its live range, not by its frame.
@@ -989,8 +1022,18 @@ index 000000000..61f516018
 +	    desc->plain_offset ||
 +	    desc->unencoded_offset ||
 +	    offset != desc->unit_offset ||
-+	    desc->unit_len > c->opts.encoded_extent_max)
++	    desc->unit_len > c->opts.encoded_extent_max ||
++	    desc->valid_len > desc->unit_len) {
++		pr_info_ratelimited("bcenc wr refuse A: len=%zu off=%llu uoff=%llu ulen=%llu valid=%llu plain=%llu unenc=%llu max=%u blk=%u\n",
++			len, (unsigned long long)offset,
++			(unsigned long long)desc->unit_offset,
++			(unsigned long long)desc->unit_len,
++			(unsigned long long)desc->valid_len,
++			(unsigned long long)desc->plain_offset,
++			(unsigned long long)desc->unencoded_offset,
++			c->opts.encoded_extent_max, block_bytes(c));
 +		return bch_err_throw(c, encoded_bad_size);
++	}
 +
 +	/*
 +	 * A codec that did not shrink the unit has nothing to offload, and a
@@ -1000,16 +1043,23 @@ index 000000000..61f516018
 +	 * compresses or not on its own.
 +	 */
 +	padded_len = round_up(len, block_bytes(c));
-+	if (padded_len > c->opts.encoded_extent_max || padded_len >= desc->unit_len)
++	if (padded_len > c->opts.encoded_extent_max || padded_len >= desc->unit_len) {
++		pr_info_ratelimited("bcenc wr refuse B: len=%zu padded=%zu ulen=%llu valid=%llu max=%u blk=%u\n",
++			len, padded_len, (unsigned long long)desc->unit_len,
++			(unsigned long long)desc->valid_len,
++			c->opts.encoded_extent_max, block_bytes(c));
 +		return bch_err_throw(c, encoded_bad_size);
++	}
 +
 +	ret = bch2_inode_find_by_inum(c, inum, &inode_u);
 +	if (ret)
 +		return ret;
 +
 +	/* Only a regular file's data is served encoded. */
-+	if (!S_ISREG(inode_u.bi_mode))
++	if (!S_ISREG(inode_u.bi_mode)) {
++		pr_info_ratelimited("bcenc wr refuse C: not a regular file\n");
 +		return bch_err_throw(c, encoded_no_extent);
++	}
 +
 +	if (offset > MAX_LFS_FILESIZE || desc->unit_len > MAX_LFS_FILESIZE - offset)
 +		return bch_err_throw(c, encoded_bad_size);
@@ -1038,8 +1088,21 @@ index 000000000..61f516018
 +
 +	crc.compression_type	= desc->compression;
 +	crc.compressed_size	= padded_len >> 9;
++	/*
++	 * The key is the frame, including any padding: bch2_write_prep_
++	 * encoded_data() will only store the payload as it stands when
++	 * uncompressed_size and live_size agree, and a payload that is
++	 * recompressed as though it were plaintext is stored as itself. What
++	 * keeps the padding from being the file's data is the inode's size,
++	 * which the write op takes from valid_len rather than from here.
++	 */
 +	crc.uncompressed_size	= desc->unit_len >> 9;
 +	crc.live_size		= desc->unit_len >> 9;
++	pr_info_ratelimited("bcenc wr: comp=%u want=%u ctype=%u csize=%u usize=%u live=%u ulen=%llu valid=%llu len=%zu\n",
++		desc->compression, want, crc.compression_type,
++		crc.compressed_size, crc.uncompressed_size, crc.live_size,
++		(unsigned long long)desc->unit_len,
++		(unsigned long long)desc->valid_len, len);
 +	crc.offset		= 0;
 +	crc.nonce		= 0;
 +	crc.csum_type		= want_csum;
@@ -1119,8 +1182,17 @@ index 000000000..61f516018
 +	 * the check above, which also keeps this out of the small-write inline
 +	 * path - the payload is packed data, not plaintext.
 +	 */
++	/*
++	 * The file's size is the end of the unit's *data*, which is the unit's
++	 * length only when it was not padded to reach this path's granularity.
++	 * A unit is described in sectors, so a request whose last byte is not on
++	 * a block boundary is written padded up and reports how much of it is
++	 * the file's - taking the padded length here would leave every such file
++	 * longer than it was written.
++	 */
 +	op->new_i_size		= max_t(u64, inode_u.bi_size,
-+					 offset + desc->unit_len);
++					 offset + (desc->valid_len ?:
++						   desc->unit_len));
 +	op->end_io		= bch2_encoded_write_end_io;
 +
 +	ret = bch2_disk_reservation_get(c, &op->res, padded_len >> 9,
