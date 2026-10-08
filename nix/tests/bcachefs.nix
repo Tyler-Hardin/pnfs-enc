@@ -113,6 +113,22 @@ let
     '';
   };
 
+  # The sizes and offsets are the point. An arm writes a length someone chose,
+  # and the shapes this path breaks on sit one byte either side of a boundary:
+  # 265 bytes, 4097, 262145, a hundred megabytes, and writes that land on top
+  # of earlier ones. The seed picks them, the model knows what the file should
+  # hold, and the verified reads are taken through the other mount.
+  randwr = pkgs.stdenv.mkDerivation {
+    name = "randwr";
+    dontUnpack = true;
+    buildPhase = ''
+      $CC -O2 -Wall -o randwr ${../randwr.c}
+    '';
+    installPhase = ''
+      install -Dm755 randwr $out/bin/randwr
+    '';
+  };
+
   # A large file written through mmap for as long as it is asked for (see
   # mmapwrite.c): the load the deployment's real jobs put on a mount, and what
   # a small write/close/read-back needs around it to go wrong.
@@ -144,7 +160,7 @@ let
     # it needs the module only as a codec provider, and loading it on demand
     # when a layout names "bcachefs-zstd" is itself being tested.
     boot.extraModulePackages = [ bcachefsModule ];
-    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen mmapwrite pkgs.nftables pkgs.fio
+    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen randwr mmapwrite pkgs.nftables pkgs.fio
       # fsx is not in the xfstests package's bin/, and it is the whole reason
       # for having it: random reads, writes, overwrites and truncates with
       # every read verified, and -f dropping the cache after each operation so
@@ -2143,6 +2159,32 @@ pkgs.testers.nixosTest {
             assert rcX == 0, \
                 "fsx failed (seed %d): %s" % (seed, outX.strip()[:400])
         server.execute("rm -f /mnt/self/fsx.bin")
+        # randwr, with the sizes nothing else here tries. Every arm in this
+        # suite writes a length someone chose, so they check the shapes
+        # someone thought of: the bugs in this path have all been one byte
+        # either side of a boundary, and in writes landing on top of what is
+        # already there. The seed picks the size, the offset and the data; the
+        # model says what the file should hold; and the verified reads are
+        # taken through the other mount, so they cannot be the writer's cache
+        # agreeing with itself.
+        server.succeed("touch /mnt/self/rw.bin /mnt/selfb/rw.bin")
+        for seed in (11, 12, 13):
+            rcR, outR = server.execute(
+                "timeout 300 randwr --seed=%d --ops=150 --max-size=4194304 "
+                "--file=/mnt/self/rw.bin --verify-file=/mnt/selfb/rw.bin "
+                "2>&1 | tail -2" % seed)
+            server.log("same-host randwr seed=%d rc=%d %s"
+                       % (seed, rcR, outR.strip()[:240]))
+            assert rcR == 0, \
+                "randwr failed (seed %d): %s" % (seed, outR.strip()[:400])
+        # and the far end: single writes spanning hundreds of units
+        rcR, outR = server.execute(
+            "timeout 600 randwr --seed=21 --ops=14 --max-size=125829120 "
+            "--file=/mnt/self/rw.bin --verify-file=/mnt/selfb/rw.bin "
+            "2>&1 | tail -2")
+        server.log("same-host randwr large rc=%d %s" % (rcR, outR.strip()[:240]))
+        assert rcR == 0, "randwr failed (large): %s" % outR.strip()[:400]
+        server.execute("rm -f /mnt/self/rw.bin")
         server.execute("rm -f /mnt/self/big.bin")
         rcB, outB = server.execute(
             "timeout 900 closeopen /mnt/self/big.bin 8389191 1 "
