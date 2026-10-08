@@ -589,6 +589,12 @@ pkgs.testers.nixosTest {
   # different machines' numbers.
   name = "pnfs-bcachefs-encoded-extent" + lib.optionalString (profile != "lan") "-${profile}";
 
+  # The suite reached the driver's fifteen-minute default once the arm that
+  # reproduces the deployment's file was added, and died in the load arms with
+  # everything before them green. The driver's knob is global_timeout, which is
+  # globalTimeout here; testTimeout is not an argument makeTest takes.
+  globalTimeout = 2400;
+
   nodes = {
     server = { pkgs, ... }: {
       imports = [ common ];
