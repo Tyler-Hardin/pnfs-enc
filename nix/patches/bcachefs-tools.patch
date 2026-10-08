@@ -501,10 +501,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..430179a7e
+index 000000000..c3daa643a
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1132 @@
+@@ -0,0 +1,1104 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -676,14 +676,11 @@ index 000000000..430179a7e
 +	 * indirect pointer itself is refused.
 +	 */
 +	if (k.k->type == KEY_TYPE_reflink_p) {
-+		pr_info_ratelimited("bcenc probe A reflink\n");
 +		return bch_err_throw(c, encoded_reflink);
 +	}
 +
 +	/* Hole, reservation, inline data: no separate payload to move. */
 +	if (!bkey_extent_is_direct_data(k.k)) {
-+		pr_info_ratelimited("bcenc probe B type=%u not direct data\n",
-+				    k.k->type);
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
@@ -696,18 +693,14 @@ index 000000000..430179a7e
 +	if (ret < 0)
 +		return ret;
 +	if (!ret) {
-+		pr_info_ratelimited("bcenc probe C nothing pickable ksize=%u\n",
-+				    k.k->size);
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
 +	if (bch2_csum_type_is_encryption(pick.crc.csum_type)) {
-+		pr_info_ratelimited("bcenc probe D encrypted\n");
 +		return bch_err_throw(c, encoded_encrypted);
 +	}
 +
 +	if (!bch2_checksum_type_valid(c, pick.crc.csum_type)) {
-+		pr_info_ratelimited("bcenc probe E csum invalid\n");
 +		return bch_err_throw(c, encoded_metadata_invalid);
 +	}
 +
@@ -718,9 +711,6 @@ index 000000000..430179a7e
 +	 * cannot use.
 +	 */
 +	if (!crc_is_compressed(pick.crc)) {
-+		pr_info_ratelimited("bcenc probe F not compressed ctype=%u ksize=%u usize=%u\n",
-+			pick.crc.compression_type, k.k->size,
-+			pick.crc.uncompressed_size);
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
@@ -1024,14 +1014,6 @@ index 000000000..430179a7e
 +	    offset != desc->unit_offset ||
 +	    desc->unit_len > c->opts.encoded_extent_max ||
 +	    desc->valid_len > desc->unit_len) {
-+		pr_info_ratelimited("bcenc wr refuse A: len=%zu off=%llu uoff=%llu ulen=%llu valid=%llu plain=%llu unenc=%llu max=%u blk=%u\n",
-+			len, (unsigned long long)offset,
-+			(unsigned long long)desc->unit_offset,
-+			(unsigned long long)desc->unit_len,
-+			(unsigned long long)desc->valid_len,
-+			(unsigned long long)desc->plain_offset,
-+			(unsigned long long)desc->unencoded_offset,
-+			c->opts.encoded_extent_max, block_bytes(c));
 +		return bch_err_throw(c, encoded_bad_size);
 +	}
 +
@@ -1052,10 +1034,6 @@ index 000000000..430179a7e
 +	 * that in turn is what wrote zeros over the file's own bytes.
 +	 */
 +	if (padded_len > c->opts.encoded_extent_max || len >= desc->unit_len) {
-+		pr_info_ratelimited("bcenc wr refuse B: len=%zu padded=%zu ulen=%llu valid=%llu max=%u blk=%u\n",
-+			len, padded_len, (unsigned long long)desc->unit_len,
-+			(unsigned long long)desc->valid_len,
-+			c->opts.encoded_extent_max, block_bytes(c));
 +		return bch_err_throw(c, encoded_bad_size);
 +	}
 +
@@ -1065,7 +1043,6 @@ index 000000000..430179a7e
 +
 +	/* Only a regular file's data is served encoded. */
 +	if (!S_ISREG(inode_u.bi_mode)) {
-+		pr_info_ratelimited("bcenc wr refuse C: not a regular file\n");
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
@@ -1106,11 +1083,6 @@ index 000000000..430179a7e
 +	 */
 +	crc.uncompressed_size	= desc->unit_len >> 9;
 +	crc.live_size		= desc->unit_len >> 9;
-+	pr_info_ratelimited("bcenc wr: comp=%u want=%u ctype=%u csize=%u usize=%u live=%u ulen=%llu valid=%llu len=%zu\n",
-+		desc->compression, want, crc.compression_type,
-+		crc.compressed_size, crc.uncompressed_size, crc.live_size,
-+		(unsigned long long)desc->unit_len,
-+		(unsigned long long)desc->valid_len, len);
 +	crc.offset		= 0;
 +	crc.nonce		= 0;
 +	crc.csum_type		= want_csum;

@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..784bea655
+index 000000000..d1004fb2f
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1654 @@
+@@ -0,0 +1,1637 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2903,8 +2903,6 @@ index 000000000..784bea655
 +	kfree(io);
 +
 +	if (status) {
-+		pr_info_ratelimited("bcenc rd finish: status=%d off=%llu len=%zu\n",
-+				    status, io->offset, io->hdr->args.count);
 +		if (status == -ENODATA)
 +			atomic_inc(&bc_stat_ds_read_not_encoded);
 +		else {
@@ -2945,7 +2943,6 @@ index 000000000..784bea655
 +		goto out_status;
 +
 +	if (desc->encrypted) {
-+		pr_info_ratelimited("bcenc rd decline A encrypted\n");
 +		goto out_not_encoded;
 +	}
 +
@@ -2957,17 +2954,12 @@ index 000000000..784bea655
 +	 */
 +	if (codec >= io->bl->nr_codecs || !io->bl->codec[codec] ||
 +	    !io->bl->codec[codec]->decode) {
-+		pr_info_ratelimited("bcenc rd decline B codec=%u nr=%u\n",
-+				    codec, io->bl->nr_codecs);
 +		goto out_not_encoded;
 +	}
 +	c = io->bl->codec[codec];
 +
 +	unit_end = desc->unit_offset + desc->unit_len;
 +	if (io->offset < desc->unit_offset || io->offset >= unit_end) {
-+		pr_info_ratelimited("bcenc rd decline C off=%llu uoff=%llu uend=%llu ulen=%llu plain=%llu\n",
-+			io->offset, desc->unit_offset, unit_end,
-+			desc->unit_len, desc->plain_offset);
 +		goto out_not_encoded;
 +	}
 +
@@ -2977,8 +2969,6 @@ index 000000000..784bea655
 +	 * the live range ends inside the frame, not the live length on its own.
 +	 */
 +	if (desc->plain_offset + desc->unit_len > io->bl->unit_max) {
-+		pr_info_ratelimited("bcenc rd decline D reach=%llu umax=%u\n",
-+			desc->plain_offset + desc->unit_len, io->bl->unit_max);
 +		goto out_failed;
 +	}
 +
@@ -3510,13 +3500,6 @@ index 000000000..784bea655
 +				memset(pad->buf + span, 0, n);
 +			}
 +		}
-+		pr_info_ratelimited("bcenc pad: front=%zu span=%zu unit=%zu ulen=%zu eof=%llu tail=%s buf[front]=%02x buf[span]=%02x buf[ulen-1]=%02x\n",
-+			front, span, io->unit, unit_len,
-+			(unsigned long long)i_size_read(io->hdr->inode),
-+			unit_len > span ? "pages" : "whole",
-+			((unsigned char *)pad->buf)[front],
-+			span < unit_len ? ((unsigned char *)pad->buf)[span] : 0,
-+			((unsigned char *)pad->buf)[unit_len - 1]);
 +		src = (struct encoded_extent_pages) {
 +			.pages		= pad->pages,
 +			.nr_pages	= pad->nr_pages,
@@ -4205,10 +4188,10 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..0f72ef2e3
+index 000000000..307ae681d
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
-@@ -0,0 +1,1076 @@
+@@ -0,0 +1,1073 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The encoded-extent data service: move a filesystem's compressed, checksummed
@@ -4845,9 +4828,6 @@ index 000000000..0f72ef2e3
 +
 +	ret = f.ops->probe(f.file, args->offset, args->len, &reply->desc);
 +	if (ret)
-+		pr_info_ratelimited("encoded_ds probe failed: ret=%d off=%llu len=%u\n",
-+				    ret, (unsigned long long)args->offset,
-+				    args->len);
 +	encoded_ds_close(&f);
 +	if (ret)
 +		goto out_err;
