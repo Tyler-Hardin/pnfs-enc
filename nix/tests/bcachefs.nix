@@ -2414,6 +2414,58 @@ pkgs.testers.nixosTest {
         client.succeed("mountpoint -q /mnt || mount -t nfs4 "
                        "-o vers=4.1,timeo=20,retrans=2,write=lazy "
                        "server:/ /mnt")
+
+        # The three checks that verify data, with the two ends on different
+        # machines. The same-host copies above share a page cache between the
+        # writer and the filesystem, so a verifier reading through a mount can
+        # be reading something the other end wrote; here the reader is another
+        # kernel and the read crosses a network, and for fio the verifier is
+        # the server itself, so nothing can answer from the writer's cache.
+        for seed in (7, 8):
+            client.succeed("rm -f /mnt/fsx.bin")
+            rcR, outR = client.execute(
+                "timeout 300 fsx -f -N 1200 -S %d -l 1048576 /mnt/fsx.bin "
+                "2>&1 | tail -3" % seed)
+            client.log("remote fsx seed=%d rc=%d %s"
+                       % (seed, rcR, outR.strip()[:220]))
+            assert rcR == 0, \
+                "remote fsx failed (seed %d): %s" % (seed, outR.strip()[:400])
+
+        client.succeed("rm -f /mnt/fio.bin")
+        rcR, outR = client.execute(
+            "timeout 300 fio --name=w --filename=/mnt/fio.bin --rw=randwrite "
+            "--bs=4k --size=4M --io_size=8M --verify=crc32c --do_verify=0 "
+            "--fsync_on_close=1 --direct=0 --randseed=4242 "
+            "--output-format=terse 2>&1 | tail -1")
+        client.log("remote fio write: rc=%d %s" % (rcR, outR.strip()[:160]))
+        assert rcR == 0, "remote fio write failed: %s" % outR.strip()[:300]
+        # written by one machine's client, verified by the other machine
+        server.succeed("sync; echo 3 > /proc/sys/vm/drop_caches")
+        rcR, outR = server.execute(
+            "timeout 300 fio --name=r --filename=/srv/export/fio.bin --rw=read "
+            "--bs=4k --size=4M --verify=crc32c --do_verify=1 --direct=0 "
+            "--output-format=terse 2>&1 | tail -1")
+        server.log("remote fio verified on the server: rc=%d %s"
+                   % (rcR, outR.strip()[:200]))
+        assert rcR == 0, \
+            "the server could not verify the client's file: %s" % outR.strip()[:300]
+
+        client.succeed("rm -f /mnt/rw.bin")
+        for seed in (31, 32):
+            rcR, outR = client.execute(
+                "timeout 300 randwr --seed=%d --ops=60 --max-size=4194304 "
+                "--file=/mnt/rw.bin 2>&1 | tail -3" % seed)
+            client.log("remote randwr seed=%d rc=%d %s"
+                       % (seed, rcR, outR.strip()[:2000]))
+            assert rcR == 0, \
+                "remote randwr failed (seed %d): %s" % (seed, outR.strip()[:400])
+        server.succeed("sync; echo 3 > /proc/sys/vm/drop_caches")
+        cm = client.succeed("md5sum /mnt/rw.bin | cut -d' ' -f1").strip()
+        sm = server.succeed("md5sum /srv/export/rw.bin | cut -d' ' -f1").strip()
+        client.log("remote randwr views: client=%s server=%s" % (cm[:16], sm[:16]))
+        assert cm == sm, \
+            "the client and the server disagree about the file: %s vs %s" % (cm[:16], sm[:16])
+        client.execute("rm -f /mnt/fsx.bin /mnt/fio.bin /mnt/rw.bin")
         for how in ("", "unlink"):
             rc5, out5 = client.execute(
                 "timeout 240 closeopen /mnt/q.bin 3145728 200 %s" % how)
