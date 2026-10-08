@@ -2067,6 +2067,25 @@ pkgs.testers.nixosTest {
             "timeout 300 closeopen /mnt/self/c.bin 152135 20 chunked:152073 "
             "/mnt/selfb/c.bin 2>&1")
         server.log("same-host chunked idle: rc=%d %s" % (rcC, outC.strip()))
+        # The deployment's failing shape, at the deployment's size: an ~81MB
+        # file written the way the application writes it - kilobyte chunks with
+        # time between them, so the flusher runs throughout - then renamed and
+        # read back through a second mount. It fails every time there and is not
+        # load dependent, so this runs on an idle box. 85089285 is the size the
+        # application reported and 84934656 is what the file came back as, so
+        # the split sits exactly on the boundary that survives.
+        server.execute("rm -f /mnt/self/big.bin /mnt/selfb/big.bin")
+        rcB, outB = server.execute(
+            "timeout 1800 closeopen /mnt/self/big.bin 85089285 1 "
+            "chunked:84934656 /mnt/selfb/big.bin 2>&1")
+        server.log("same-host bigfile idle: %s" % outB.strip())
+        server.log("same-host bigfile counters: handoff=%s declined=%s redo=%s "
+                   "local_io=%s" % (
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/write_handoff").strip(),
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/write_declined").strip(),
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/write_redo_entry").strip(),
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/local_io").strip()))
+        server.execute("rm -f /mnt/self/big.bin /mnt/selfb/big.bin")
         # ... and again with the flusher actually running while the writes are
         # still going. On an idle box a 152KB file is written and closed inside
         # one writeback period, so the flusher never gets to encode a partial
