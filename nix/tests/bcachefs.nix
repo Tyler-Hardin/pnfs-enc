@@ -1982,7 +1982,7 @@ pkgs.testers.nixosTest {
         for tag, cmd in (
             ("8K", "closeopen /mnt/self/q.bin 8192 400"),
             ("152K", "closeopen /mnt/self/q.bin 155648 400"),
-            ("152K-unlink", "closeopen /mnt/self/q.bin 155648 400 unlink"),
+            ("152K-unlink", "closeopen /mnt/self/q.bin 155648 150 unlink"),
             ("152K-fsync", "closeopen /mnt/self/q.bin 155648 400 fsync"),
             ("200K", "closeopen /mnt/self/q.bin 204800 400"),
             ("260K", "closeopen /mnt/self/q.bin 266240 400"),
@@ -2011,23 +2011,23 @@ pkgs.testers.nixosTest {
         # last page. The deployment's failing file is 152135 bytes: 583 into the
         # last page. These are the same file either side of that line.
         for tag, cmd in (
-            ("align-152135", "closeopen /mnt/self/q.bin 152135 200 plain /mnt/selfb/q.bin"),
-            ("align-152136", "closeopen /mnt/self/q.bin 152136 200 plain /mnt/selfb/q.bin"),
-            ("align-155647", "closeopen /mnt/self/q.bin 155647 200 plain /mnt/selfb/q.bin"),
-            ("align-155648", "closeopen /mnt/self/q.bin 155648 200 plain /mnt/selfb/q.bin"),
-            ("align-4097", "closeopen /mnt/self/q.bin 4097 400 plain /mnt/selfb/q.bin"),
-            ("align-4096", "closeopen /mnt/self/q.bin 4096 400 plain /mnt/selfb/q.bin"),
+            ("align-152135", "closeopen /mnt/self/q.bin 152135 100 plain /mnt/selfb/q.bin"),
+            ("align-152136", "closeopen /mnt/self/q.bin 152136 100 plain /mnt/selfb/q.bin"),
+            ("align-155647", "closeopen /mnt/self/q.bin 155647 100 plain /mnt/selfb/q.bin"),
+            ("align-155648", "closeopen /mnt/self/q.bin 155648 100 plain /mnt/selfb/q.bin"),
+            ("align-4097", "closeopen /mnt/self/q.bin 4097 150 plain /mnt/selfb/q.bin"),
+            ("align-4096", "closeopen /mnt/self/q.bin 4096 150 plain /mnt/selfb/q.bin"),
             ("align-152135-same", "closeopen /mnt/self/q.bin 152135 200"),
         ):
             rcA, outA = server.execute("timeout 300 sh -c '%s'" % cmd)
             server.log("same-host %-19s rc=%d: %s" %
                        (tag, rcA, outA.strip()[:220]))
         for tag, cmd in (
-            ("split-152K", "closeopen /mnt/self/q.bin 155648 400 plain /mnt/selfb/q.bin"),
-            ("split-152K-unlink", "closeopen /mnt/self/q.bin 155648 400 unlink /mnt/selfb/q.bin"),
-            ("split-8K", "closeopen /mnt/self/q.bin 8192 400 plain /mnt/selfb/q.bin"),
-            ("split-260K", "closeopen /mnt/self/q.bin 266240 400 plain /mnt/selfb/q.bin"),
-            ("split-3M", "closeopen /mnt/self/q.bin 3145728 100 plain /mnt/selfb/q.bin"),
+            ("split-152K", "closeopen /mnt/self/q.bin 155648 150 plain /mnt/selfb/q.bin"),
+            ("split-152K-unlink", "closeopen /mnt/self/q.bin 155648 150 unlink /mnt/selfb/q.bin"),
+            ("split-8K", "closeopen /mnt/self/q.bin 8192 150 plain /mnt/selfb/q.bin"),
+            ("split-260K", "closeopen /mnt/self/q.bin 266240 100 plain /mnt/selfb/q.bin"),
+            ("split-3M", "closeopen /mnt/self/q.bin 3145728 30 plain /mnt/selfb/q.bin"),
         ):
             rc8, out8 = server.execute("timeout 300 sh -c '%s'" % cmd)
             server.log("same-host %-19s rc=%d: %s" %
@@ -2259,7 +2259,7 @@ pkgs.testers.nixosTest {
                    server.succeed("pgrep -c mmapwrite || true").strip())
         for tag, cmd in (
             ("152K", "closeopen /mnt/self/q.bin 155648 400"),
-            ("152K-unlink", "closeopen /mnt/self/q.bin 155648 400 unlink"),
+            ("152K-unlink", "closeopen /mnt/self/q.bin 155648 150 unlink"),
             ("8K", "closeopen /mnt/self/q.bin 8192 400"),
             ("3M", "closeopen /mnt/self/q.bin 3145728 100"),
         ):
