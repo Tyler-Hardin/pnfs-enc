@@ -48,6 +48,8 @@ files=(
 	fs/nfsd/bcachefs_layout.c
 	fs/nfs/Makefile
 	fs/nfs/Kconfig
+	fs/nfs/internal.h
+	fs/nfs/localio.c
 	fs/nfs/pnfs.h
 	fs/nfs/bcachefs_layout.c
 	fs/nfs/bcachefs_ds.c

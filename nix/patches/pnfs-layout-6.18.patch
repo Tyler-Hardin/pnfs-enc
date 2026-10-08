@@ -2165,10 +2165,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..0ab7a2da6
+index 000000000..61aef443f
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1410 @@
+@@ -0,0 +1,1408 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -3170,30 +3170,28 @@ index 000000000..0ab7a2da6
 + * The data service is a network service even when the server is local - the
 + * client reaches it on 127.0.0.1 - so the verifier its reply carries is the
 + * server's hashed one. A commit on a local mount is not a network operation
-+ * though: local I/O answers it, and local I/O builds the verifier from the
-+ * client's cl_nfssvc_boot instead (nfs_copy_boot_verifier()). Handing the
-+ * service's value on leaves the two different, nfs_write_match_verf() then
-+ * fails for every page, and nfs_commit_release_pages() re-dirties what it was
-+ * finishing: the writeback sends the same pages again, forever, and the caller
-+ * never returns from fsync(). That is a livelock on the first write of a client
-+ * mounted on its own server, and no arm of this suite saw it because every
-+ * other arm's client is a separate machine, where the commit does go over the
-+ * wire and both sides use the hashed value.
++ * though: local I/O answers it, and local I/O fills in the verifier from the
++ * client's own record of the server's boot rather than from anything that came
++ * over the wire. Handing the service's value on leaves the two different,
++ * nfs_write_match_verf() then fails for every page, and
++ * nfs_commit_release_pages() re-dirties what it was finishing: the writeback
++ * sends the same pages again, forever, and the caller never returns from
++ * fsync(). That is a livelock on the first write of a client mounted on its own
++ * server, and no arm of this suite saw it because every other arm's client is a
++ * separate machine, where the commit does go over the wire and both sides use
++ * the hashed value.
++ *
++ * A local mount asks local I/O for the verifier rather than building one here:
++ * this is the same writeverf that file fills in for its own writes and commits,
++ * and it has to stay that way for the match above to hold. The committed level
++ * is already decided by the caller and is passed through unchanged.
 + */
 +static void bc_write_set_verf(struct nfs_pgio_header *hdr, const u8 *verf)
 +{
 +#if IS_ENABLED(CONFIG_NFS_LOCALIO)
-+	struct nfs_client *clp = NFS_SERVER(hdr->inode)->nfs_client;
-+
-+	if (nfs_server_is_local(clp)) {
-+		u32 *v = (u32 *)hdr->verf.verifier.data;
-+		unsigned int seq;
-+
-+		do {
-+			seq = read_seqbegin(&clp->cl_boot_lock);
-+			v[0] = (u32)clp->cl_nfssvc_boot.tv_sec;
-+			v[1] = (u32)clp->cl_nfssvc_boot.tv_nsec;
-+		} while (read_seqretry(&clp->cl_boot_lock, seq));
++	if (nfs_server_is_local(NFS_SERVER(hdr->inode)->nfs_client)) {
++		nfs_set_local_verifier(hdr->inode, &hdr->verf,
++				       hdr->verf.committed);
 +		return;
 +	}
 +#endif
@@ -3579,6 +3577,63 @@ index 000000000..0ab7a2da6
 +
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION("pNFS layout driver for bcachefs encoded extents");
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index ea239a7e5..e203dc6c3 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -482,6 +482,8 @@ extern int nfs_local_commit(struct nfsd_file *,
+ 			    struct nfs_commit_data *,
+ 			    const struct rpc_call_ops *, int);
+ extern bool nfs_server_is_local(const struct nfs_client *clp);
++extern void nfs_set_local_verifier(struct inode *, struct nfs_writeverf *,
++				   enum nfs3_stable_how);
+ 
+ #else /* CONFIG_NFS_LOCALIO */
+ static inline void nfs_local_probe(struct nfs_client *clp) {}
+@@ -510,6 +512,11 @@ static inline bool nfs_server_is_local(const struct nfs_client *clp)
+ {
+ 	return false;
+ }
++static inline void nfs_set_local_verifier(struct inode *inode,
++					  struct nfs_writeverf *verf,
++					  enum nfs3_stable_how how)
++{
++}
+ #endif /* CONFIG_NFS_LOCALIO */
+ 
+ /* super.c */
+diff --git a/fs/nfs/localio.c b/fs/nfs/localio.c
+index 358d686d2..480abb4cb 100644
+--- a/fs/nfs/localio.c
++++ b/fs/nfs/localio.c
+@@ -749,7 +749,18 @@ nfs_reset_boot_verifier(struct inode *inode)
+ 	write_sequnlock(&clp->cl_boot_lock);
+ }
+ 
+-static void
++/*
++ * Fill in a writeverf the way this client answers its own writes and commits
++ * on a local mount: the verifier is the client's record of the server's boot,
++ * not one that came over the wire, and the commit that follows is checked
++ * against it.
++ *
++ * Exported because a layout driver serving a local mount reports a write
++ * completion the same way this file does, and it must produce the same
++ * writeverf - a client that got the hashed value here instead re-dirties every
++ * page nfs_write_match_verf() rejects, forever.
++ */
++void
+ nfs_set_local_verifier(struct inode *inode,
+ 		struct nfs_writeverf *verf,
+ 		enum nfs3_stable_how how)
+@@ -757,6 +768,7 @@ nfs_set_local_verifier(struct inode *inode,
+ 	nfs_copy_boot_verifier(&verf->verifier, inode);
+ 	verf->committed = how;
+ }
++EXPORT_SYMBOL_GPL(nfs_set_local_verifier);
+ 
+ /* Factored out from fs/nfsd/vfs.h:fh_getattr() */
+ static int __vfs_getattr(const struct path *p, struct kstat *stat, int version)
 diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
 index 3db8f13d8..0e855beb9 100644
 --- a/fs/nfs/pnfs.h
