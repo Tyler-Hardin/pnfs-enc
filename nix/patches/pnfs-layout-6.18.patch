@@ -2165,10 +2165,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..61aef443f
+index 000000000..36fc66929
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1408 @@
+@@ -0,0 +1,1418 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -3204,6 +3204,16 @@ index 000000000..61aef443f
 +	struct nfs_pgio_header *hdr = io->hdr;
 +	struct bc_layout_hdr *blh = io->blh;
 +	u32 committed = io->committed;
++	/*
++	 * Everything this function needs off @io has to be taken off it here,
++	 * because @io is freed below. The completion then runs on a header, an
++	 * end offset and a verifier - never on the io that carried them. Reading
++	 * it after the free is a use-after-free whether or not the value is used
++	 * for anything, and WARN_ON_ONCE() in particular evaluates its condition
++	 * on every call and not only the once it reports, so a check that reads
++	 * @io after the free is both a bug and a check that checks nothing.
++	 */
++	u64 end = io->offset;
 +	u8 verf[ENCODED_DS_WRITEVERF];
 +
 +	memcpy(verf, io->verf, ENCODED_DS_WRITEVERF);
@@ -3233,7 +3243,7 @@ index 000000000..61aef443f
 +	 * WARN and a counter, not a BUG, because a peer must not be able to take
 +	 * the box down.
 +	 */
-+	WARN_ON_ONCE(io->offset != hdr->args.offset + hdr->args.count);
++	WARN_ON_ONCE(end != hdr->args.offset + hdr->args.count);
 +	hdr->res.count = hdr->args.count;
 +	hdr->pnfs_error = 0;
 +	hdr->task.tk_status = 0;
