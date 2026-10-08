@@ -589,6 +589,12 @@ pkgs.testers.nixosTest {
   # different machines' numbers.
   name = "pnfs-bcachefs-encoded-extent" + lib.optionalString (profile != "lan") "-${profile}";
 
+  # An 85MB file written a kilobyte at a time, the flusher running throughout,
+  # and the same again under a load that keeps the box dirty: the arm that
+  # reproduces the deployment's short file costs minutes on its own, and the
+  # default fifteen is not enough for it and everything after it.
+  testTimeout = 3000;
+
   nodes = {
     server = { pkgs, ... }: {
       imports = [ common ];
