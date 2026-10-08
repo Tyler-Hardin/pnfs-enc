@@ -484,10 +484,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..6c6ecfa05
+index 000000000..b3ab1d9fa
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1054 @@
+@@ -0,0 +1,1062 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -699,28 +699,36 @@ index 000000000..6c6ecfa05
 +		return bch_err_throw(c, encoded_bad_size);
 +
 +	/*
-+	 * The key, not the frame, says how far this unit reaches. A later write
-+	 * over an existing extent trims that extent's key - it cannot change the
-+	 * frame the key points at - so crc.uncompressed_size keeps describing
-+	 * bytes the key no longer owns. Handing that length on tells a reader
-+	 * this unit covers those bytes, and the reader fills them out of this
-+	 * frame: for a frame whose tail is the block padding of an older, longer
-+	 * write, that is zeros served over data that is on the device, which is
-+	 * how a file written, flushed, and then appended to inside the same page
-+	 * comes back with a zero tail through the layout while reading correctly
-+	 * through the MDS.
++	 * The key, not the frame, says how far this unit reaches.
 +	 *
-+	 * Refused rather than clipped: the frame really is longer than the unit,
-+	 * and the reader decodes a unit's worth into a buffer sized by the length
-+	 * it was given. The refusal is -ENODATA, so the range falls back to the
-+	 * MDS and is read correctly.
++	 * The data path reads this range by the key; the frame behind the key is
++	 * however long it was when it was written. A later write over the extent
++	 * trims the key and cannot change the frame, so crc.uncompressed_size
++	 * goes on describing bytes the key no longer owns - and a unit described
++	 * by the frame is one bcachefs would never hand out. The peer fills the
++	 * tail out of this frame, and where that tail is the block padding of an
++	 * older, longer write it serves zeros over data that is on the device.
++	 * That is how a file written, flushed and then appended to inside the
++	 * same page came back with a zero tail through the layout while reading
++	 * correctly through the MDS.
++	 *
++	 * Clipped, not refused, and the frame is still the whole frame: the
++	 * payload is what the device has, and the length is what it always
++	 * should have been. Refusing instead sent a range that is perfectly
++	 * readable to the MDS for no reason - it read correctly and paid the
++	 * fallback, which the counters show as ds_read_not_encoded climbing.
++	 *
++	 * No peer change is needed for the shorter length because the decoder
++	 * stops when the destination is full (encoded_extent_zstd_decode, which
++	 * says so), so it reports exactly the unit it was asked for even when
++	 * the frame it decoded was longer.
 +	 */
-+	if (unit_len != (u64) k.k->size << 9)
-+		return bch_err_throw(c, encoded_bad_size);
++	unit_len = min_t(u64, unit_len, (u64) k.k->size << 9);
 +
 +	*offset_into_extent	= iter.pos.offset - bkey_start_offset(k.k);
 +	out->logical_offset	= bkey_start_offset(k.k) << 9;
 +	out->crc		= pick.crc;
++	out->crc.uncompressed_size = unit_len >> 9;
 +	*k_out			= k;
 +	return 0;
 +}

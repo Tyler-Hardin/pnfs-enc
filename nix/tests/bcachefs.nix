@@ -2044,9 +2044,16 @@ pkgs.testers.nixosTest {
         # old unit covers the tail and fills it from the frame's padding:
         # zeros over data that is on the device. Read through the second mount
         # so the client's own cache cannot answer.
+        def dcnt(f):
+            return int(server.succeed(
+                "cat /sys/kernel/debug/pnfs_bcachefs/" + f).strip())
+        ne0, ok0 = dcnt("ds_read_not_encoded"), dcnt("ds_read_ok")
         rcT, outT = server.execute(
             "timeout 300 closeopen /mnt/self/t.bin 152135 20 twophase:152073 "
             "/mnt/selfb/t.bin 2>&1")
+        server.log("same-host twophase: served by the service: not_encoded "
+                   "%d->%d, ds_read_ok %d->%d" %
+                   (ne0, dcnt("ds_read_not_encoded"), ok0, dcnt("ds_read_ok")))
         rcC, outC = server.execute(
             "timeout 300 closeopen /mnt/self/c.bin 152135 20 chunked:152073 "
             "/mnt/selfb/c.bin 2>&1")
