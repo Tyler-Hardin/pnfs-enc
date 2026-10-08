@@ -2172,17 +2172,17 @@ pkgs.testers.nixosTest {
             rcR, outR = server.execute(
                 "timeout 300 randwr --seed=%d --ops=150 --max-size=4194304 "
                 "--file=/mnt/self/rw.bin --verify-file=/mnt/selfb/rw.bin "
-                "2>&1 | tail -2" % seed)
+                "2>&1 | tail -40" % seed)
             server.log("same-host randwr seed=%d rc=%d %s"
-                       % (seed, rcR, outR.strip()[:240]))
+                       % (seed, rcR, outR.strip()[:3000]))
             assert rcR == 0, \
                 "randwr failed (seed %d): %s" % (seed, outR.strip()[:400])
         # and the far end: single writes spanning hundreds of units
         rcR, outR = server.execute(
             "timeout 600 randwr --seed=21 --ops=14 --max-size=125829120 "
             "--file=/mnt/self/rw.bin --verify-file=/mnt/selfb/rw.bin "
-            "2>&1 | tail -2")
-        server.log("same-host randwr large rc=%d %s" % (rcR, outR.strip()[:240]))
+            "2>&1 | tail -40")
+        server.log("same-host randwr large rc=%d %s" % (rcR, outR.strip()[:3000]))
         assert rcR == 0, "randwr failed (large): %s" % outR.strip()[:400]
         server.execute("rm -f /mnt/self/rw.bin")
         server.execute("rm -f /mnt/self/big.bin")
