@@ -333,8 +333,17 @@ int main(int argc, char **argv)
 
 			if (ftruncate(fd, want) < 0)
 				die("ftruncate");
+			/*
+			 * A shrink discards for good, so the model has to
+			 * forget those bytes rather than keep them: a later
+			 * write, or a grow, leaves zeros there and a model
+			 * still holding the old data would call that a
+			 * failure. Zeroing is what "forget" means here.
+			 */
 			if (want > size)
 				memset(model + size, 0, want - size);
+			else if (want < size)
+				memset(model + want, 0, size - want);
 			size = want;
 			printf("randwr: %llu truncate to %llu\n",
 			       (unsigned long long)i, (unsigned long long)want);
