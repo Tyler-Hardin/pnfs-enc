@@ -96,12 +96,55 @@ those two disagree, the write is re-dirtied forever with no diagnostic.
   fix), that is a protocol change and should be its own decision, not smuggled
   into a hardening pass.
 
-## The one design change worth making
+## The one design change worth making: stop owning a read path
 
-Of the three, the third generalises. `nfs_server_is_local()` is asked by
-different layers at different times about the same I/O, and the answer decides
-which verifier namespace, which commit path and which page cache applies. That
-is a property of the *mount*, not of the call. It should be read once, stored
-on the client's mount state with the write, and the commit should compare
-against the copy the write recorded — which turns "these two layers disagree"
-from a livelock into a warning.
+Everything above is a tripwire. This is the actual change, and it supersedes
+the rest.
+
+The encoded read picks its own device:
+
+```c
+	fs/encoded_extent.c:183   bch2_bkey_pick_read_device(c, k, NULL, &pick, -1, 0);
+	                          if (!ret) return bch_err_throw(c, encoded_no_extent);
+```
+
+Mainline's read does the same call with the state that makes it correct:
+
+```c
+	fs/data/read.c:1591       bch2_bkey_pick_read_device(c, k, failed, &pick, dev, flags);
+	                          if (unlikely(!ret)) return read_extent_hole(...);
+```
+
+Two things are missing as a result, and both are the sort that only show up on
+a filesystem that is not healthy:
+
+- **`failed` is NULL.** It is what lets a second attempt avoid the device that
+  just failed; with NULL we re-pick the same device every time and cannot
+  retry around a bad one, a stale one, or a cached copy that is not the
+  authoritative one.
+- **`flags` is 0, and a hole is a refusal rather than a hole.** `read_extent_hole`
+  exists to zero-fill a hole or reservation with the right accounting; going to
+  the MDS instead is safe but is a different behaviour from every other reader
+  on the same file.
+
+Neither is visible on a healthy single-device filesystem, which is why a bed
+that has never been degraded, never had a promote cache and never lost a member
+cannot reproduce any of it.
+
+The narrow duplication is deliberate and should stay: the *bio* already goes
+through mainline with `BCH_READ_encoded|BCH_READ_last_fragment`, because the
+point of this path is to hand a peer the stored frame rather than decoded
+plaintext. What must not be duplicated is the **lookup and its error
+semantics**. The rule:
+
+> Call the same helper the data path calls, with the same arguments it passes.
+> Where a difference is genuinely required - here, not decoding - copy the
+> mainline function and change the minimum, so the diff against upstream stays
+> readable and a future fix upstream is one this code inherits rather than
+> misses.
+
+Concretely: drive the encoded read through `__bch2_read_extent()` with the
+encoded flag and let it do the pick, the retry, the EC reconstruction and the
+hole, rather than reaching into `bch2_bkey_pick_read_device()` directly. Every
+one of the three bugs in this document is a divergence from the data path in
+exactly this sense, and each was found the hard way rather than by diffing.
