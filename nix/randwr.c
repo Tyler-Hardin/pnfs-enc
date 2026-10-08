@@ -222,6 +222,14 @@ int main(int argc, char **argv)
 
 	rng_state = seed;
 
+	/*
+	 * Piped output is block-buffered by default, which puts the stderr
+	 * failure line ahead of the progress lines it belongs after - and the
+	 * harness reading the tail then keeps the wrong end of it. A tester
+	 * whose failure output is lost at the moment it matters is no tester.
+	 */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	model = malloc(max_file);
 	buf = malloc(max_file);
 	if (!model || !buf)
@@ -284,6 +292,17 @@ int main(int argc, char **argv)
 			/* the read has to come from the filesystem */
 			if (fsync(fd) < 0)
 				die("fsync");
+			/*
+			 * Reopened so the size and the data are the far side's
+			 * current view: an fd held from before the first write
+			 * has the size the file had then, which is zero.
+			 */
+			if (vpath) {
+				close(vfd);
+				vfd = open(vpath, O_RDONLY);
+				if (vfd < 0)
+					die(vpath);
+			}
 			if (posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) < 0)
 				die("fadvise");
 			if (vfd != fd &&
