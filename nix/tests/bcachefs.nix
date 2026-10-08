@@ -160,8 +160,8 @@ let
     # does the codec work, the server runs nfsd, the filesystem and the data
     # service's own threads, and on one core they take turns. The numbers the
     # tests print are only about the path when both sides have cores to run on.
-    virtualisation.cores = lib.mkDefault 12;
-    virtualisation.memorySize = lib.mkDefault 8192;
+    virtualisation.cores = lib.mkDefault 32;
+    virtualisation.memorySize = lib.mkDefault 24576;
 
     # The link this run is about. Half the round trip at each end, because netem
     # shapes egress and a round trip is both ends.
@@ -655,14 +655,14 @@ pkgs.testers.nixosTest {
       # The reader's cores, if the profile names them: a deployment's client is
       # not the same size as the test bed's node, and if the client is what
       # limits a single stream then pretending otherwise hides it.
-      virtualisation.cores = bed.clientCores or 12;
+      virtualisation.cores = bed.clientCores or 32;
       # The deployment's client carries a dirty backlog an order of magnitude
       # larger than this bed would build on its own: it is a small box behind
       # tens of GiB of unflushed writes. That backlog, and the reclaim it
       # forces, is the state the short write/read-back fails in, so the bed's
       # client is made the same shape - most of its RAM dirty, most of the
       # rest in reclaim.
-      virtualisation.memorySize = 3072;
+      virtualisation.memorySize = 8192;
       boot.kernel.sysctl = {
         "vm.dirty_ratio" = 60;
         "vm.dirty_background_ratio" = 5;
@@ -674,8 +674,8 @@ pkgs.testers.nixosTest {
     # need the resources the two working nodes get.
     client2 = { ... }: {
       imports = [ common ];
-      virtualisation.cores = 4;
-      virtualisation.memorySize = 4096;
+      virtualisation.cores = 8;
+      virtualisation.memorySize = 8192;
     };
   };
 
