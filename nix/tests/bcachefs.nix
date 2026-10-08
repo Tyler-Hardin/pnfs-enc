@@ -2080,12 +2080,54 @@ pkgs.testers.nixosTest {
             "sh -c 'for n in $(seq 8); do mmapwrite /mnt/self/cload.$n "
             "67108864 120 >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &")
         server.succeed("sleep 10")
+        def wstat():
+            f = ("write_handoff", "write_handoff_refused", "write_redo_entry",
+                 "write_handoff_off", "write_handoff_len", "write_handoff_done",
+                 "write_handoff_status")
+            return tuple(server.succeed(
+                "cat /sys/kernel/debug/pnfs_bcachefs/" + n).strip() for n in f)
+        server.log("same-host before load: handoff/refused/redo_entry/off/len/done/status = %s"
+                   % (wstat(),))
+        server.log("same-host local I/O = %s (1 = the mount really is a local one); "
+                   "declined/align = %s/%s" % (
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/local_io").strip(),
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/write_declined").strip(),
+                       server.succeed("cat /sys/kernel/debug/pnfs_bcachefs/write_declined_align").strip()))
         for tag, cmd in (
             ("chunked-load", "closeopen /mnt/self/c.bin 152135 40 chunked:152073 /mnt/selfb/c.bin"),
             ("twophase-load", "closeopen /mnt/self/c2.bin 152135 40 twophase:152073 /mnt/selfb/c2.bin"),
+            # A file larger than one unit whose length is not a page multiple.
+            # Every other file here is smaller than unit_max, so its whole body
+            # is one request and a refusal hands the whole thing back; this one
+            # has whole units served by the service and a last, partial unit
+            # that the alignment test refuses - which is the deployment's shape
+            # and the shape that has been losing its tail.
+            ("chunked-big", "closeopen /mnt/self/cb.bin 1100005 10 chunked:1097728 /mnt/selfb/cb.bin"),
         ):
             rcL, outL = server.execute("timeout 300 sh -c '%s 2>&1'" % cmd)
             server.log("same-host %-13s rc=%d %s" % (tag, rcL, outL.strip()))
+        # Every iteration, under the load, with the last write the driver was
+        # asked for. A failure here says whether the tail was ever handed over:
+        # ds_last_write_len is 583 and off 151552 if the driver saw the tail
+        # request and lost it above this point, and something else if the
+        # client never asked.
+        for it in range(40):
+            rcI, outI = server.execute(
+                "timeout 60 closeopen /mnt/self/ci.bin 152135 1 chunked:152073 "
+                "/mnt/selfb/ci.bin 2>&1")
+            off = server.succeed(
+                "cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_off").strip()
+            ln = server.succeed(
+                "cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_len").strip()
+            dec = server.succeed(
+                "cat /sys/kernel/debug/pnfs_bcachefs/write_declined").strip()
+            server.log("same-host iter %2d off=%s len=%s declined=%s %s" %
+                       (it, off, ln, dec, outI.strip()))
+        server.execute("rm -f /mnt/self/ci.bin")
+        server.log("same-host after load: handoff/refused/redo_entry/off/len/done/status = %s"
+                   % (wstat(),))
+        server.log("same-host pnfs warnings: %s" % server.succeed(
+            "dmesg | grep -c 'with REDO already set' || true").strip())
         server.execute("pkill -f mmapwrite; sleep 1; rm -f /mnt/self/c*.bin /mnt/self/cload.*")
         # One iteration per invocation, so the counters - which are globals -
         # describe the iteration that just failed rather than the last one in

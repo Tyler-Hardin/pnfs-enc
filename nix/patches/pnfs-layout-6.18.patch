@@ -2165,10 +2165,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..36fc66929
+index 000000000..e499de750
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1418 @@
+@@ -0,0 +1,1500 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2229,6 +2229,37 @@ index 000000000..36fc66929
 + * keep.
 + */
 +static struct dentry *bc_debugfs_dir;
++/*
++ * The hand-off to the MDS.
++ *
++ * A unit the service will not take - one that is not block-aligned, most
++ * often the last, partial unit of a file - is given back through the MDS, and
++ * those ranges have been coming back short: a file whose last unit was
++ * refused ends up a byte-exact prefix of what was written, cut at the last
++ * unit that did go to the service. These say how many hand-offs there were,
++ * what they were, and - through the offsets - whether the range that went
++ * missing is one of them.
++ */
++static atomic_t bc_stat_write_handoff = ATOMIC_INIT(0);
++static atomic_t bc_stat_write_handoff_refused = ATOMIC_INIT(0);
++static atomic_t bc_stat_write_handoff_status = ATOMIC_INIT(0);
++/* Offsets, so u64 and WRITE_ONCE like the other diagnostic pair here. */
++static u64 bc_stat_write_handoff_off;
++static u64 bc_stat_write_handoff_len;
++static u64 bc_stat_write_handoff_done;
++static atomic_t bc_stat_write_redo_entry = ATOMIC_INIT(0);
++/*
++ * Whether the mount this driver is serving is a local one - the question the
++ * whole local-I/O special case turns on, and the one thing a bed can silently
++ * get wrong: a same-host mount that is not local I/O exercises the other
++ * branch of the verifier and the other commit path, and looks identical from
++ * the outside. One if nfs_server_is_local() said so for the last write.
++ */
++static atomic_t bc_stat_local_io = ATOMIC_INIT(-1);
++/* Requests the driver declined itself - the alignment test, mostly - which
++ * therefore never reached the service and went to the MDS instead. */
++static atomic_t bc_stat_write_declined = ATOMIC_INIT(0);
++static atomic_t bc_stat_write_declined_align = ATOMIC_INIT(0);
 +static atomic_t bc_stat_lseg_alloc = ATOMIC_INIT(0);
 +static atomic_t bc_stat_lseg_alloc_err = ATOMIC_INIT(0);
 +static atomic_t bc_stat_read_pagelist = ATOMIC_INIT(0);
@@ -3017,8 +3048,10 @@ index 000000000..36fc66929
 +
 +	atomic_inc(&bc_stat_read_pagelist);
 +
-+	if (!hdr->lseg)
++	if (!hdr->lseg) {
++		atomic_inc(&bc_stat_write_declined);
 +		return PNFS_NOT_ATTEMPTED;
++	}
 +
 +	bl = container_of(hdr->lseg, struct bc_layout, lseg);
 +	blh = container_of(bl->lseg.pls_layout, struct bc_layout_hdr, plh);
@@ -3227,7 +3260,18 @@ index 000000000..36fc66929
 +			atomic_set(&bc_stat_ds_last_write_err, status);
 +		}
 +		bc_ds_mark_down(blh, status);
-+		/* Same hand-back as the read side: through the MDS. */
++		/*
++		 * Same hand-back as the read side: through the MDS. Record it
++		 * before it happens, so a range that never arrives can be
++		 * matched against the hand-off that should have carried it.
++		 */
++		if (status == -ENODATA)
++			atomic_inc(&bc_stat_write_handoff_refused);
++		atomic_inc(&bc_stat_write_handoff);
++		WRITE_ONCE(bc_stat_write_handoff_off, hdr->args.offset);
++		WRITE_ONCE(bc_stat_write_handoff_len, hdr->args.count);
++		WRITE_ONCE(bc_stat_write_handoff_done, end - hdr->args.offset);
++		atomic_set(&bc_stat_write_handoff_status, status);
 +		hdr->pnfs_error = status;
 +		pnfs_ld_write_done(hdr);
 +		return;
@@ -3403,9 +3447,22 @@ index 000000000..36fc66929
 +	atomic_inc(&bc_stat_write_pagelist);
 +	WRITE_ONCE(bc_stat_ds_last_write_off, hdr->args.offset);
 +	WRITE_ONCE(bc_stat_ds_last_write_len, hdr->args.count);
++	/*
++	 * A header that has already been through the MDS write-through is one
++	 * this driver should not be seeing; if it does, the request has two
++	 * writers and the second one's error is the one that would release it.
++	 */
++	if (test_bit(NFS_IOHDR_REDO, &hdr->flags))
++		atomic_inc(&bc_stat_write_redo_entry);
++#if IS_ENABLED(CONFIG_NFS_LOCALIO)
++	atomic_set(&bc_stat_local_io,
++		   nfs_server_is_local(NFS_SERVER(hdr->inode)->nfs_client));
++#endif
 +
-+	if (!hdr->lseg)
++	if (!hdr->lseg) {
++		atomic_inc(&bc_stat_write_declined);
 +		return PNFS_NOT_ATTEMPTED;
++	}
 +
 +	if (hdr->args.stable != NFS_UNSTABLE)
 +		atomic_inc(&bc_stat_ds_write_stable);
@@ -3424,8 +3481,11 @@ index 000000000..36fc66929
 +	    bl->write_codec >= bl->nr_codecs ||
 +	    hdr->args.offset % bl->unit_align ||
 +	    hdr->args.count % bl->unit_align ||
-+	    hdr->args.pgbase % bl->unit_align)
++	    hdr->args.pgbase % bl->unit_align) {
++		atomic_inc(&bc_stat_write_declined);
++		atomic_inc(&bc_stat_write_declined_align);
 +		return PNFS_NOT_ATTEMPTED;
++	}
 +
 +	io = kzalloc(sizeof(*io), GFP_NOFS);
 +	if (!io)
@@ -3496,6 +3556,28 @@ index 000000000..36fc66929
 +
 +	bc_debugfs_dir = debugfs_create_dir("pnfs_bcachefs", NULL);
 +	if (!IS_ERR_OR_NULL(bc_debugfs_dir)) {
++		debugfs_create_atomic_t("write_handoff", 0444, bc_debugfs_dir,
++					&bc_stat_write_handoff);
++		debugfs_create_atomic_t("write_handoff_refused", 0444,
++					bc_debugfs_dir,
++					&bc_stat_write_handoff_refused);
++		debugfs_create_x64("write_handoff_off", 0444, bc_debugfs_dir,
++				   &bc_stat_write_handoff_off);
++		debugfs_create_x64("write_handoff_len", 0444, bc_debugfs_dir,
++				   &bc_stat_write_handoff_len);
++		debugfs_create_x64("write_handoff_done", 0444, bc_debugfs_dir,
++				   &bc_stat_write_handoff_done);
++		debugfs_create_atomic_t("write_handoff_status", 0444,
++					bc_debugfs_dir,
++					&bc_stat_write_handoff_status);
++		debugfs_create_atomic_t("write_redo_entry", 0444, bc_debugfs_dir,
++					&bc_stat_write_redo_entry);
++		debugfs_create_atomic_t("local_io", 0444, bc_debugfs_dir,
++					&bc_stat_local_io);
++		debugfs_create_atomic_t("write_declined", 0444, bc_debugfs_dir,
++					&bc_stat_write_declined);
++		debugfs_create_atomic_t("write_declined_align", 0444, bc_debugfs_dir,
++					&bc_stat_write_declined_align);
 +		debugfs_create_atomic_t("lseg_alloc", 0444, bc_debugfs_dir,
 +					&bc_stat_lseg_alloc);
 +		debugfs_create_atomic_t("lseg_alloc_err", 0444, bc_debugfs_dir,
