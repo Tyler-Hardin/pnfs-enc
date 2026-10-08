@@ -144,7 +144,14 @@ let
     # it needs the module only as a codec provider, and loading it on demand
     # when a layout names "bcachefs-zstd" is itself being tested.
     boot.extraModulePackages = [ bcachefsModule ];
-    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen mmapwrite pkgs.nftables pkgs.fio ]
+    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen mmapwrite pkgs.nftables pkgs.fio
+      # fsx is not in the xfstests package's bin/, and it is the whole reason
+      # for having it: random reads, writes, overwrites and truncates with
+      # every read verified, and -f dropping the cache after each operation so
+      # the verification comes from the filesystem, not the writer's cache.
+      (pkgs.writeShellScriptBin "fsx" ''
+        exec ${import ../xfstests.nix { inherit pkgs; }}/lib/xfstests/ltp/fsx "$@"
+      '') ]
       ++ lib.optionals walkProbe [ pkgs.fio ];
     networking.firewall.enable = false;
 
@@ -2118,6 +2125,24 @@ pkgs.testers.nixosTest {
         server.log("same-host fio direct view: %s" % direct[:16])
         assert rcV == 0, "fio could not verify the file through the other mount: %s" % outV.strip()
         server.execute("rm -f /mnt/self/fio.bin /mnt/selfb/fio.bin")
+        # The generator this suite lacked. Every other arm writes forward and
+        # reads once, so nothing here notices a unit whose padding - the zeros
+        # a service write puts past the end of the request to reach its
+        # granularity - lands on bytes that are already the file's. fsx picks
+        # random offsets and lengths, overwrites what is there, truncates, and
+        # verifies every read against what it wrote; -f is what makes that
+        # verification mean something, because without it the reads come from
+        # the writer's own page cache and agree with themselves.
+        for seed in (7, 8, 9):
+            server.execute("rm -f /mnt/self/fsx.bin")
+            rcX, outX = server.execute(
+                "timeout 300 fsx -f -N 3000 -S %d -l 1048576 "
+                "/mnt/self/fsx.bin 2>&1 | tail -3" % seed)
+            server.log("same-host fsx seed=%d rc=%d %s"
+                       % (seed, rcX, outX.strip()[:220]))
+            assert rcX == 0, \
+                "fsx failed (seed %d): %s" % (seed, outX.strip()[:400])
+        server.execute("rm -f /mnt/self/fsx.bin")
         server.execute("rm -f /mnt/self/big.bin")
         rcB, outB = server.execute(
             "timeout 900 closeopen /mnt/self/big.bin 8389191 1 "
