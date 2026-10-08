@@ -2159,6 +2159,17 @@ pkgs.testers.nixosTest {
             assert rcX == 0, \
                 "fsx failed (seed %d): %s" % (seed, outX.strip()[:400])
         server.execute("rm -f /mnt/self/fsx.bin")
+        # Every unit this driver encodes is one work item, and the queue those
+        # run on is capped at half the CPUs by default - unbounded, the
+        # compression competes with the writeback that feeds it and with the
+        # rest of the machine.
+        mx = server.succeed(
+            "cat /sys/module/nfsv4/parameters/max_active").strip()
+        ncpu = int(server.succeed("getconf _NPROCESSORS_ONLN").strip())
+        server.log("same-host enc queue: max_active=%s cpus=%d" % (mx, ncpu))
+        assert int(mx) == max(1, ncpu // 2), \
+            "the enc queue allows %s at once, not half of %d cpus" % (mx, ncpu)
+
         # randwr, with the sizes nothing else here tries. Every arm in this
         # suite writes a length someone chose, so they check the shapes
         # someone thought of: the bugs in this path have all been one byte

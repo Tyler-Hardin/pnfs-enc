@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..d1004fb2f
+index 000000000..57d9ed125
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1718 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2211,8 +2211,11 @@ index 000000000..d1004fb2f
 + */
 +
 +#include <linux/module.h>
++#include <linux/cpumask.h>
 +#include <linux/debugfs.h>
 +#include <linux/jiffies.h>
++#include <linux/moduleparam.h>
++#include <linux/workqueue.h>
 +#include <linux/nfs_fs.h>
 +#include <linux/nfs4.h>
 +#include <linux/encoded_extent_ds.h>
@@ -2221,6 +2224,61 @@ index 000000000..d1004fb2f
 +#include "pnfs.h"
 +#include "internal.h"
 +#include "bcachefs_ds.h"
++
++/*
++ * Every unit this driver sends costs one encode, and each encode is one work
++ * item - so the number of them allowed to run at once is the whole of the
++ * driver's CPU appetite. Queued on the shared system queue it had no limit of
++ * its own, which is how compressing a file ends up competing with everything
++ * else on the machine, and the writeback path is the wrong place to put
++ * unbounded work anyway: what feeds the queue is writeback, so crowding it out
++ * slows the thing doing the feeding.
++ *
++ * Half the CPUs by default. That is enough to keep them busy and few enough
++ * that the rest of the machine still runs, and it is the number of encodes in
++ * flight rather than the number of files being written that it bounds, because
++ * one file encodes one unit at a time and waits for the transport between
++ * them. Reached through the workqueue's own max_active, which can be set while
++ * it is running.
++ */
++static struct workqueue_struct *bc_enc_wq;
++static unsigned int bc_enc_wq_max_active;	/* 0 = half the CPUs */
++
++static unsigned int bc_enc_default_max_active(void)
++{
++	return max_t(unsigned int, num_online_cpus() / 2, 1);
++}
++
++static int bc_enc_max_active_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int n;
++	int ret;
++
++	ret = kstrtouint(val, 0, &n);
++	if (ret)
++		return ret;
++
++	/*
++	 * The parameter holds the effective limit rather than what was asked
++	 * for, so that reading it back says what is running. Zero is only an
++	 * input, meaning "half the CPUs".
++	 */
++	bc_enc_wq_max_active = n ?: bc_enc_default_max_active();
++	if (bc_enc_wq)
++		workqueue_set_max_active(bc_enc_wq, bc_enc_wq_max_active);
++	return 0;
++}
++
++static const struct kernel_param_ops bc_enc_max_active_ops = {
++	.set	= bc_enc_max_active_set,
++	.get	= param_get_uint,
++};
++
++module_param_cb(max_active, &bc_enc_max_active_ops, &bc_enc_wq_max_active,
++		0644);
++MODULE_PARM_DESC(max_active,
++	"Units compressed at once; writing 0 asks for half the online CPUs, "
++	"which is the default and what this reads back as");
 +
 +/*
 + * Counters, in debugfs, of the points where this driver either steps in or
@@ -3649,7 +3707,18 @@ index 000000000..d1004fb2f
 +	 * context, which is what the codec and the RPC client need.
 +	 */
 +	INIT_WORK(&io->work, bc_write_work);
-+	schedule_work(&io->work);
++	if (!queue_work(bc_enc_wq, &io->work)) {
++		/*
++		 * Only reachable if the queue has gone, which the layout
++		 * driver's own registration should prevent: the module cannot go
++		 * while a layout is in use, and taking the queue down drains it.
++		 * Nothing has been sent and nothing refers to this yet, so there
++		 * is nothing to finish - give the request to the MDS, which is
++		 * always correct.
++		 */
++		kfree(io);
++		return PNFS_NOT_ATTEMPTED;
++	}
 +	return PNFS_ATTEMPTED;
 +}
 +
@@ -3693,6 +3762,14 @@ index 000000000..d1004fb2f
 +static int __init bc_layout_init(void)
 +{
 +	int ret;
++
++	if (!bc_enc_wq_max_active)
++		bc_enc_wq_max_active = bc_enc_default_max_active();
++
++	bc_enc_wq = alloc_workqueue("pnfs-enc", WQ_MEM_RECLAIM | WQ_UNBOUND,
++				    bc_enc_wq_max_active);
++	if (!bc_enc_wq)
++		return -ENOMEM;
 +
 +	bc_debugfs_dir = debugfs_create_dir("pnfs_bcachefs", NULL);
 +	if (!IS_ERR_OR_NULL(bc_debugfs_dir)) {
@@ -3791,6 +3868,8 @@ index 000000000..d1004fb2f
 +
 +	ret = pnfs_register_layoutdriver(&bc_layout_type);
 +	if (ret) {
++		destroy_workqueue(bc_enc_wq);
++		bc_enc_wq = NULL;
 +		debugfs_remove_recursive(bc_debugfs_dir);
 +		bc_debugfs_dir = NULL;
 +	}
@@ -3800,6 +3879,8 @@ index 000000000..d1004fb2f
 +static void __exit bc_layout_exit(void)
 +{
 +	pnfs_unregister_layoutdriver(&bc_layout_type);
++	destroy_workqueue(bc_enc_wq);
++	bc_enc_wq = NULL;
 +	debugfs_remove_recursive(bc_debugfs_dir);
 +	bc_debugfs_dir = NULL;
 +}
