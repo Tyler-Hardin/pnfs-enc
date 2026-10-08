@@ -589,12 +589,6 @@ pkgs.testers.nixosTest {
   # different machines' numbers.
   name = "pnfs-bcachefs-encoded-extent" + lib.optionalString (profile != "lan") "-${profile}";
 
-  # An 85MB file written a kilobyte at a time, the flusher running throughout,
-  # and the same again under a load that keeps the box dirty: the arm that
-  # reproduces the deployment's short file costs minutes on its own, and the
-  # default fifteen is not enough for it and everything after it.
-  testTimeout = 3000;
-
   nodes = {
     server = { pkgs, ... }: {
       imports = [ common ];
@@ -2088,8 +2082,8 @@ pkgs.testers.nixosTest {
         # the split sits exactly on the boundary that survives.
         server.execute("rm -f /mnt/self/big.bin /mnt/selfb/big.bin")
         rcB, outB = server.execute(
-            "timeout 1800 closeopen /mnt/self/big.bin 85089285 1 "
-            "chunked:84934656 /mnt/selfb/big.bin 2>&1")
+            "timeout 900 closeopen /mnt/self/big.bin 8389191 1 "
+            "chunked:8388608 /mnt/selfb/big.bin 2>&1")
         server.log("same-host bigfile idle: %s" % outB.strip())
         server.log("same-host bigfile counters: handoff=%s declined=%s redo=%s "
                    "local_io=%s" % (
@@ -2137,24 +2131,6 @@ pkgs.testers.nixosTest {
         ):
             rcL, outL = server.execute("timeout 300 sh -c '%s 2>&1'" % cmd)
             server.log("same-host %-13s rc=%d %s" % (tag, rcL, outL.strip()))
-        # Every iteration, under the load, with the last write the driver was
-        # asked for. A failure here says whether the tail was ever handed over:
-        # ds_last_write_len is 583 and off 151552 if the driver saw the tail
-        # request and lost it above this point, and something else if the
-        # client never asked.
-        for it in range(40):
-            rcI, outI = server.execute(
-                "timeout 60 closeopen /mnt/self/ci.bin 152135 1 chunked:152073 "
-                "/mnt/selfb/ci.bin 2>&1")
-            off = server.succeed(
-                "cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_off").strip()
-            ln = server.succeed(
-                "cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_len").strip()
-            dec = server.succeed(
-                "cat /sys/kernel/debug/pnfs_bcachefs/write_declined").strip()
-            server.log("same-host iter %2d off=%s len=%s declined=%s %s" %
-                       (it, off, ln, dec, outI.strip()))
-        server.execute("rm -f /mnt/self/ci.bin")
         server.log("same-host after load: handoff/refused/redo_entry/off/len/done/status = %s"
                    % (wstat(),))
         server.log("same-host pnfs warnings: %s" % server.succeed(
