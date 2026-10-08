@@ -2078,6 +2078,25 @@ pkgs.testers.nixosTest {
             rcL, outL = server.execute("timeout 300 sh -c '%s 2>&1'" % cmd)
             server.log("same-host %-13s rc=%d %s" % (tag, rcL, outL.strip()))
         server.execute("pkill -f mmapwrite; sleep 1; rm -f /mnt/self/c*.bin /mnt/self/cload.*")
+        # One iteration per invocation, so the counters - which are globals -
+        # describe the iteration that just failed rather than the last one in
+        # the batch. That is the difference between "the driver was asked to
+        # write the tail and the write was lost above it" and "the client never
+        # asked", which are two different bugs in two different files.
+        for it in range(40):
+            rcI, outI = server.execute(
+                "timeout 60 closeopen /mnt/self/c.bin 152135 1 chunked:152073 "
+                "/mnt/selfb/c.bin 2>&1")
+            off = server.succeed(
+                "cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_off").strip()
+            ln = server.succeed(
+                "cat /sys/kernel/debug/pnfs_bcachefs/ds_last_write_len").strip()
+            if "wrong=0" not in outI or "short=0" not in outI:
+                server.log("same-host FAIL iter=%d last_write_off=%s "
+                           "last_write_len=%s %s" %
+                           (it, off, ln, outI.strip()))
+        server.log("same-host per-iteration loop done")
+        server.execute("rm -f /mnt/self/c*.bin")
         server.log("same-host after load: df=%s" % server.succeed(
             "df -h --output=avail /srv/export | tail -1").strip())
         server.log("same-host after load: dmesg=%s" % server.execute(

@@ -272,14 +272,22 @@ int main(int argc, char **argv)
 			 * bytes that are written afterwards.
 			 */
 			size_t off = 0;
+			char tmp[4096];
 
-			if (unlink(path) && errno != ENOENT) {
-				perror("unlink");
-				return 2;
-			}
+			/*
+			 * The application writes a temporary file and renames it into
+			 * place - it does not unlink and recreate the name it is about
+			 * to read. That matters here: an earlier version unlinked, and
+			 * with the read going through a *second* mount (a different NFS
+			 * client, so a different lookup cache) an unlink-and-recreate is
+			 * a coherence path of this program's own invention, not the
+			 * application's. Rename is what the trace shows and what the
+			 * reader actually meets.
+			 */
+			snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 			memset(wbuf, 'A', split);
 			memset(wbuf + split, 'B', size - split);
-			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 			if (fd < 0) {
 				perror("open for write");
 				return 2;
@@ -295,6 +303,10 @@ int main(int argc, char **argv)
 				usleep(1000);
 			}
 			close(fd);
+			if (rename(tmp, path)) {
+				perror("rename");
+				return 2;
+			}
 			bad = read_back(rpath, wbuf, rbuf, size);
 			if (!bad)
 				continue;
