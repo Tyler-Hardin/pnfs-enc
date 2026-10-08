@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..bda4b1867
+index 000000000..784bea655
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1606 @@
+@@ -0,0 +1,1654 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -3395,26 +3395,47 @@ index 000000000..bda4b1867
 +		return;
 +	}
 +
-+	io->unit = min_t(size_t, io->left, io->bl->unit_max);
++	/*
++	 * The unit is capped so that what the unit becomes - the request's
++	 * bytes plus the front padding, rounded up to the granularity - still
++	 * fits the maximum the peer advertised. Chunking to exactly the
++	 * maximum and then rounding up made the first unit of an unaligned
++	 * request larger than the maximum, and the backend refused it as too
++	 * big to describe, sending a request that fit to the MDS.
++	 */
++	{
++		size_t cap = io->bl->unit_max;
++
++		if (io->bl->unit_align)
++			cap &= ~((size_t)io->bl->unit_align - 1);
++		if (!done)
++			cap -= min_t(size_t, cap, io->hdr->args.pgbase);
++		io->unit = min_t(size_t, io->left, cap);
++	}
 +	done = io->hdr->args.count - io->left;
 +
 +	/*
 +	 * The unit the service stores is aligned at both ends. It begins at the
 +	 * page the request's first byte is in - for the first unit only, and
 +	 * those bytes are the file's own, already in the page cache, so writing
-+	 * them back changes nothing - and it ends on a unit boundary, with zeros
-+	 * past the request's last byte, because a reader past the old end is
-+	 * owed zeros. It is never smaller than two units: once the payload is
-+	 * itself padded to the filesystem's block size, a one-unit payload
-+	 * cannot be smaller than the unit it describes, so the backend refuses
-+	 * it as having compressed nothing - which is how a padded tail ends up
-+	 * back on the MDS, where it was before any of this.
++	 * them back changes nothing - and it ends on a unit boundary.
++	 *
++	 * The unit reaches no further than that, because everything the key
++	 * covers is data this write owns. It used to reach two units so that a
++	 * padded payload would always be smaller than the unit it described,
++	 * since the backend refuses a payload that saved nothing; the cost of
++	 * that was a second page of zeros written over bytes that were already
++	 * the file's, which is a lost write to whoever read them.
++	 *
++	 * What fills the rest is the file's own bytes, taken from the pages the
++	 * request carried, so writing them back changes nothing either. Past the
++	 * end of the file there is nothing to write back and a gap is owed
++	 * zeros, so only that part is zeroed.
 +	 */
 +	front		= done ? 0 : io->hdr->args.pgbase;
 +	span		= front + io->unit;
 +	unit_off	= io->offset - front;
-+	unit_len	= max_t(size_t, round_up(span, io->bl->unit_align),
-+				 2 * (size_t) io->bl->unit_align);
++	unit_len	= round_up(span, io->bl->unit_align);
 +
 +	u = bc_write_unit_alloc(io->bl->unit_max);
 +	if (!u) {
@@ -3459,16 +3480,43 @@ index 000000000..bda4b1867
 +			memcpy_from_page(pad->buf, io->hdr->args.pages[0], 0,
 +					 front);
 +		/* ... then the request's ... */
-+		bc_copy_from_pages(io->hdr, io->hdr->args.pgbase + done,
-+				   pad->buf + front, io->unit);
-+		/* ... then the zeros a reader past the end is owed. */
-+		memset(pad->buf + span, 0, unit_len - span);
-+		pr_info_ratelimited("bcenc pad: front=%zu span=%zu done=%zu pgbase=%u unit=%zu ulen=%zu buf[0]=%02x buf[front]=%02x buf[span-1]=%02x comp=%u codec=%u\n",
-+			front, span, done, io->hdr->args.pgbase, io->unit, unit_len,
-+			((unsigned char *)pad->buf)[0],
++		/*
++		 * The skip is an offset into the request; bc_copy_from_pages()
++		 * adds the request's page offset to it itself. Passing that
++		 * offset again read from twice as far into the page and wrote
++		 * whatever was there into the file - so any request whose dirty
++		 * range did not start on a page boundary lost its own bytes.
++		 */
++		bc_copy_from_pages(io->hdr, done, pad->buf + front, io->unit);
++		/*
++		 * ... then the rest of the unit. Those bytes are the file's and
++		 * the request carried them in its pages, so they are read back
++		 * out and written unchanged: writing anything else there loses
++		 * whatever the file already held. Past the end of the file there
++		 * is nothing to read back, and a gap is owed zeros.
++		 */
++		if (unit_len > span) {
++			u64 eof = i_size_read(io->hdr->inode);
++			size_t n = unit_len - span;
++
++			if (unit_off + span < eof) {
++				size_t have = min_t(size_t, n,
++						    eof - (unit_off + span));
++
++				bc_copy_from_pages(io->hdr, done + io->unit,
++						   pad->buf + span, have);
++				memset(pad->buf + span + have, 0, n - have);
++			} else {
++				memset(pad->buf + span, 0, n);
++			}
++		}
++		pr_info_ratelimited("bcenc pad: front=%zu span=%zu unit=%zu ulen=%zu eof=%llu tail=%s buf[front]=%02x buf[span]=%02x buf[ulen-1]=%02x\n",
++			front, span, io->unit, unit_len,
++			(unsigned long long)i_size_read(io->hdr->inode),
++			unit_len > span ? "pages" : "whole",
 +			((unsigned char *)pad->buf)[front],
-+			((unsigned char *)pad->buf)[span - 1],
-+			desc.compression, io->bl->write_codec);
++			span < unit_len ? ((unsigned char *)pad->buf)[span] : 0,
++			((unsigned char *)pad->buf)[unit_len - 1]);
 +		src = (struct encoded_extent_pages) {
 +			.pages		= pad->pages,
 +			.nr_pages	= pad->nr_pages,
@@ -3586,7 +3634,7 @@ index 000000000..bda4b1867
 +	 * the request's offset plus a whole number of units and nothing can pad
 +	 * their front.
 +	 */
-+	if (!bl->unit_align || !bl->unit_max ||
++	if (!bl->unit_align || bl->unit_align > PAGE_SIZE || !bl->unit_max ||
 +	    bl->write_codec >= bl->nr_codecs ||
 +	    (hdr->args.count > bl->unit_max &&
 +	     (hdr->args.offset % bl->unit_align ||

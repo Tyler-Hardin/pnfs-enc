@@ -2175,6 +2175,26 @@ pkgs.testers.nixosTest {
                 "2>&1 | tail -40" % seed)
             server.log("same-host randwr seed=%d rc=%d %s"
                        % (seed, rcR, outR.strip()[:3000]))
+            if rcR != 0:
+                # Which view is wrong: the writer's, the other mount's, or the
+                # filesystem's own. A verifier that reads through a cache can
+                # only ever say "the file is fine", so when it says otherwise
+                # it matters which of the three disagrees.
+                for what, cmd in (
+                    ("size", "stat -c %s %s"),
+                    ("first16", "od -An -tx1 -N16 %s"),
+                ):
+                    server.log("randwr diag %s: self=[%s] other=[%s] direct=[%s]"
+                               % (what,
+                                  server.succeed((cmd % "/mnt/self/rw.bin")).strip(),
+                                  server.succeed((cmd % "/mnt/selfb/rw.bin")).strip(),
+                                  server.succeed((cmd % "/srv/export/rw.bin")).strip()))
+                server.log("randwr diag counters: write_ok=%s not_enc=%s declined=%s off=%s len=%s"
+                           % tuple(server.succeed(
+                               "cat /sys/kernel/debug/pnfs_bcachefs/%s" % c).strip()
+                                   for c in ("ds_write_ok", "ds_write_not_encoded",
+                                             "write_declined", "ds_last_write_off",
+                                             "ds_last_write_len")))
             assert rcR == 0, \
                 "randwr failed (seed %d): %s" % (seed, outR.strip()[:400])
         # and the far end: single writes spanning hundreds of units

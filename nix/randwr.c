@@ -356,7 +356,33 @@ int main(int argc, char **argv)
 
 		if (fsync(fd) < 0)
 			die("fsync");
+		/*
+		 * Closing is what makes the far side's view current: another NFS
+		 * client is entitled to serve its own cached pages until the
+		 * file is closed, and this is the check that reads everything,
+		 * so a version of the file from before the last few writes is
+		 * exactly what it must not compare against.
+		 *
+		 * The per-operation verifies were already honest because they
+		 * drop both caches first; this one dropped only the writer's,
+		 * which is how a correct file came back reading as stale.
+		 */
+		if (vpath) {
+			if (close(fd) < 0)
+				die("close");
+			fd = open(path, O_RDWR);
+			if (fd < 0)
+				die(path);
+			if (close(vfd) < 0)
+				die("close");
+			vfd = open(vpath, O_RDONLY);
+			if (vfd < 0)
+				die(vpath);
+		}
 		if (posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) < 0)
+			die("fadvise");
+		if (vfd != fd &&
+		    posix_fadvise(vfd, 0, 0, POSIX_FADV_DONTNEED) < 0)
 			die("fadvise");
 		get(vfd, buf, size, 0, "final");
 		for (at = 0; at < (size_t)size; at++) {

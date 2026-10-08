@@ -501,10 +501,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..4c7a07166
+index 000000000..430179a7e
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1124 @@
+@@ -0,0 +1,1132 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -1043,7 +1043,15 @@ index 000000000..4c7a07166
 +	 * compresses or not on its own.
 +	 */
 +	padded_len = round_up(len, block_bytes(c));
-+	if (padded_len > c->opts.encoded_extent_max || padded_len >= desc->unit_len) {
++	/*
++	 * Whether the codec shrank the unit is a question about the frame, not
++	 * about what the frame costs once it is padded out to a block: a 4096
++	 * byte unit whose frame is a hundred bytes compressed forty times over,
++	 * and comparing the padding instead refused it and sent the write to
++	 * the MDS - which is what made a two-unit minimum look necessary, and
++	 * that in turn is what wrote zeros over the file's own bytes.
++	 */
++	if (padded_len > c->opts.encoded_extent_max || len >= desc->unit_len) {
 +		pr_info_ratelimited("bcenc wr refuse B: len=%zu padded=%zu ulen=%llu valid=%llu max=%u blk=%u\n",
 +			len, padded_len, (unsigned long long)desc->unit_len,
 +			(unsigned long long)desc->valid_len,
