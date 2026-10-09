@@ -2415,6 +2415,12 @@ pkgs.testers.nixosTest {
                        "-o vers=4.1,timeo=20,retrans=2,write=lazy "
                        "server:/ /mnt")
 
+        # The remote client has to be reaching the service, not merely
+        # finishing. One that fell back to plain NFS would pass every arm below
+        # and test nothing, so the service's own counters are sampled either
+        # side of them and required to move.
+        ds_w0, ds_r0 = ds_counter("write"), ds_counter("read")
+
         # The three checks that verify data, with the two ends on different
         # machines. The same-host copies above share a page cache between the
         # writer and the filesystem, so a verifier reading through a mount can
@@ -2466,6 +2472,13 @@ pkgs.testers.nixosTest {
         assert cm == sm, \
             "the client and the server disagree about the file: %s vs %s" % (cm[:16], sm[:16])
         client.execute("rm -f /mnt/fsx.bin /mnt/fio.bin /mnt/rw.bin")
+        ds_w1, ds_r1 = ds_counter("write"), ds_counter("read")
+        client.log("remote arms reached the service: writes %d -> %d, reads %d -> %d"
+                   % (ds_w0, ds_w1, ds_r0, ds_r1))
+        assert ds_w1 > ds_w0, \
+            "the remote client's writes never reached the service (%d)" % ds_w1
+        assert ds_r1 > ds_r0, \
+            "the remote client's reads never reached the service (%d)" % ds_r1
         for how in ("", "unlink"):
             rc5, out5 = client.execute(
                 "timeout 240 closeopen /mnt/q.bin 3145728 200 %s" % how)
