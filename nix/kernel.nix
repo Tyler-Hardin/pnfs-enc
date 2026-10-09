@@ -5,12 +5,29 @@
 # the 6.18 series, which is what the check below allows. A kernel minor or major
 # bump needs the patch regenerated and the check raised with it - that is the
 # one piece of version coupling this feature has.
-{ pkgs }:
+# kmsan: build this kernel with Clang and KMSAN, to find reads of
+# uninitialised memory in the code under test. It is not a boot option and not
+# a kernel patch - NixOS' kernels are GCC builds, and KMSAN instrumentation
+# exists only in Clang - so this is a from-source rebuild with a different
+# compiler. It roughly doubles memory use and slows the machine a lot, and it
+# is mutually exclusive with KASAN, KCSAN and PREEMPT_RT.
+{ pkgs, kmsan ? false }:
 
 let
   inherit (pkgs) lib;
+  inherit (lib) kernel;
 
-  patched = pkgs.linuxPackages.kernel.override {
+  kmsanConfig = lib.optionalAttrs kmsan {
+    KMSAN = yes;
+    KMSAN_CHECK_PARAM_RETVAL = yes;
+    DEBUG_KERNEL = yes;
+    # Kconfig gives KMSAN "depends on !KASAN && !KCSAN && !PREEMPT_RT".
+    KASAN = lib.mkForce no;
+    KCSAN = lib.mkForce no;
+    PREEMPT_RT = lib.mkForce no;
+  };
+
+  patched = pkgs.linuxPackages.kernel.override ({
     kernelPatches = [
       {
         name = "pnfs-bcachefs-layout";
@@ -43,8 +60,22 @@ let
       NFSD_BLOCKLAYOUT = lib.mkForce no;
       NFSD_SCSILAYOUT = lib.mkForce no;
       NFSD_FLEXFILELAYOUT = lib.mkForce no;
-    };
-  };
+    } // kmsanConfig;
+  } // lib.optionalAttrs kmsan {
+    # nixpkgs' shared kernel config still lists options only GCC accepts, and
+    # KMSAN also turns off several hand-written assembly crypto drivers; the
+    # config stage fails on those rather than ignoring them.
+    stdenv = pkgs.llvmPackages.stdenv;
+    ignoreConfigErrors = true;
+    # KMSAN needs the kernel actually compiled by Clang. Setting the stdenv is
+    # not always enough for nixpkgs to notice, so say it the way a Clang kernel
+    # build does and let it be detected from there.
+    extraMakeFlags = [
+      "LLVM=1"
+      "CC=${pkgs.llvmPackages.clang}/bin/clang"
+      "LD=${pkgs.llvmPackages.lld}/bin/ld.lld"
+    ];
+  });
 in
 {
   kernel = patched;

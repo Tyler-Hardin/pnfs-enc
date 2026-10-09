@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..2393047ff
+index 000000000..0d642333c
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1732 @@
+@@ -0,0 +1,1750 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -3683,6 +3683,24 @@ index 000000000..2393047ff
 +	 */
 +	if (!bl->unit_align || bl->unit_align > PAGE_SIZE || !bl->unit_max ||
 +	    bl->write_codec >= bl->nr_codecs ||
++	    /*
++	     * A request that does not begin on a unit boundary needs the file's
++	     * own bytes ahead of it, because the service takes a unit that is
++	     * aligned at both ends and those bytes have to be written back
++	     * unchanged. They are read out of the page the request starts in,
++	     * and that page's leading bytes are not reliably the file's at
++	     * writeback time: the previous unit's writeback invalidates that
++	     * folio, and one flush in twenty reads it in the window where it is
++	     * not yet the file's again. Padding a unit with those bytes writes
++	     * zeros over data the file already had.
++	     *
++	     * Serving such a request needs the unit's key to exclude the front,
++	     * which needs the frame's length and its live length to differ -
++	     * something bch2_write_prep_encoded_data() refuses, because a
++	     * mismatch there stores the codec's frame as the file's data. Until
++	     * that is arranged, hand these to the MDS, which is always correct.
++	     */
++	    hdr->args.pgbase ||
 +	    (hdr->args.count > bl->unit_max &&
 +	     (hdr->args.offset % bl->unit_align ||
 +	      hdr->args.pgbase % bl->unit_align))) {
