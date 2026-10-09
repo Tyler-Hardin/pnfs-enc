@@ -476,8 +476,10 @@ let
   # round trips one after another. Which dominates is the measurement.
   # KMSAN reports every read of uninitialised memory, including upstream ones
   # this bed has no say over: the BPF trampoline path reports through __text_poke
-  # on every node at boot. The gate is the code this work touches, so the
-  # reports are counted and only those whose stack names it fail the test; the
+  # on every node at boot, and bcachefs reports through bch2_alloc_sectors_req
+  # on the truncate path. The gate is the code this work touches - the layout
+  # driver, the encoded write path, the data service - so the reports are
+  # counted and only those whose stack names one of them fail the test. The
   # rest are logged, so a change in them stays visible.
   kmsanScript = ''
         with subtest("KMSAN: no uninitialised reads in the code under test"):
@@ -487,7 +489,7 @@ let
                     "dmesg | grep -c 'BUG: KMSAN' || true").strip() or 0)
                 ours = int(node.succeed(
                     "dmesg | grep -A25 'BUG: KMSAN' | grep -cE "
-                    "' bc_| bch2_encoded| encoded_ds| bcachefs' || true"
+                    "' bc_| bch2_encoded| encoded_ds' || true"
                 ).strip() or 0)
                 server.log("kmsan: %s: %d report(s), %d in this code"
                            % (nm, n, ours))
@@ -673,7 +675,7 @@ pkgs.testers.nixosTest {
   # reproduces the deployment's file was added, and died in the load arms with
   # everything before them green. The driver's knob is global_timeout, which is
   # globalTimeout here; testTimeout is not an argument makeTest takes.
-  globalTimeout = 2400;
+  globalTimeout = if kmsan then 7200 else 2400;
 
   nodes = {
     server = { pkgs, ... }: {
