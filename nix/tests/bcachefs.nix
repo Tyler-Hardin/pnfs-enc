@@ -46,10 +46,17 @@ let
     KMSAN = lib.kernel.yes;
     KMSAN_CHECK_PARAM_RETVAL = lib.kernel.yes;
     DEBUG_KERNEL = lib.kernel.yes;
-    # Kconfig gives KMSAN "depends on !KASAN && !KCSAN && !PREEMPT_RT".
+    # Kconfig gives it "depends on !KASAN && !KCSAN && !PREEMPT_RT".
     KASAN = lib.mkForce lib.kernel.no;
     KCSAN = lib.mkForce lib.kernel.no;
     PREEMPT_RT = lib.mkForce lib.kernel.no;
+    # KMSAN inflates stack frames, and the kernel's -Werror turns
+    # -Wframe-larger-than into a build failure all over drivers/. The warnings
+    # do not matter on this bed, which boots headless on a serial console.
+    WERROR = lib.mkForce lib.kernel.no;
+    # objtool cannot unwind vmwgfx's hand-written assembly once KMSAN
+    # instruments it ("unknown CFA base reg 0"), and this bed never runs it.
+    DRM_VMWGFX = lib.mkForce lib.kernel.no;
   };
 
   patchedKernel = pkgs.linuxPackages.kernel.override (ccache.override // {
@@ -89,13 +96,10 @@ let
     # stage fails on those rather than ignoring them.
     stdenv = pkgs.llvmPackages.stdenv;
     ignoreConfigErrors = true;
-    # KMSAN needs the kernel actually built by Clang; setting the stdenv is not
-    # always enough for nixpkgs to notice, so say it the way such a build does.
-    extraMakeFlags = [
-      "LLVM=1"
-      "CC=${pkgs.llvmPackages.clang}/bin/clang"
-      "LD=${pkgs.llvmPackages.lld}/bin/ld.lld"
-    ];
+    # No explicit CC=/LD= here. nixpkgs takes the compiler from stdenv.cc, and
+    # the clang it gets that way is nix's wrapped one; naming the compiler in
+    # make flags as well collides with that wrapper, which passes -nostdlibinc
+    # and has clang reject it under -Werror.
   });
 
   linuxPackages = pkgs.linuxPackagesFor patchedKernel;

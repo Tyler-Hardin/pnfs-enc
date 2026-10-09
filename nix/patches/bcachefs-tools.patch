@@ -410,10 +410,48 @@ index 6f079d191..a756100a7 100644
  	for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
  		if (bch2_dev_list_has_dev(*devs_have, i))
 diff --git a/fs/data/write.c b/fs/data/write.c
-index 2b221c573..eeece29cb 100644
+index 2b221c573..1a5f13e28 100644
 --- a/fs/data/write.c
 +++ b/fs/data/write.c
-@@ -1814,6 +1814,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
+@@ -1573,11 +1573,19 @@ static void init_append_extent(struct bch_write_op *op,
+ {
+ 	struct bch_fs *c = op->c;
+ 
+-	op->pos.offset += crc.uncompressed_size;
++	/*
++	 * The live range, not the frame: an encoded extent may carry bytes
++	 * before the live range that nothing reads, and the key covers only
++	 * what the file owns. crc.offset says where the live range starts
++	 * inside the frame, and it is the position that accounts for it.
++	 */
++	u32 live = crc.live_size ?: crc.uncompressed_size;
++
++	op->pos.offset += live;
+ 
+ 	struct bkey_i_extent *e = bkey_extent_init(op->insert_keys.top);
+ 	e->k.p		= op->pos;
+-	e->k.size	= crc.uncompressed_size;
++	e->k.size	= live;
+ 	e->k.bversion	= version;
+ 
+ 	if (crc.csum_type ||
+@@ -1762,8 +1770,13 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
+ 
+ 	BUG_ON(bio_sectors(bio) != op->crc.compressed_size);
+ 
+-	/* Can we just write the entire extent as is? */
+-	if (op->crc.uncompressed_size == op->crc.live_size &&
++	/*
++	 * Can we just write the entire extent as is? The live range has to fit
++	 * inside the frame - it may be shorter, when the frame carries dead
++	 * bytes ahead of it, but it may not run past it.
++	 */
++	if (op->crc.live_size &&
++	    op->crc.offset + op->crc.live_size <= op->crc.uncompressed_size &&
+ 	    op->crc.uncompressed_size <= c->opts.encoded_extent_max >> 9 &&
+ 	    op->crc.compressed_size <= wp->sectors_free &&
+ 	    (bch2_csum_type_is_encryption(op->crc.csum_type) ==
+@@ -1814,6 +1827,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
  		return bch_err_throw(c, write_encoded_as_is);
  	}
  
@@ -434,7 +472,7 @@ index 2b221c573..eeece29cb 100644
  	/*
  	 * If the data is compressed and we couldn't write the entire extent as
  	 * is, we have to decompress it:
-@@ -2546,8 +2560,18 @@ again:
+@@ -2546,8 +2573,18 @@ again:
  						  op->watermark,
  						  op->flags,
  						  !io_in_flight ? &op->cl : NULL);
@@ -454,7 +492,7 @@ index 2b221c573..eeece29cb 100644
  			int ret2 = PTR_ERR_OR_ZERO(req) ?:
  			bch2_alloc_sectors_req(trans, req, op->write_point, &wp);
  
-@@ -2773,7 +2797,16 @@ CLOSURE_CALLBACK(bch2_write)
+@@ -2773,7 +2810,16 @@ CLOSURE_CALLBACK(bch2_write)
  	data_len = min_t(u64, bio->bi_iter.bi_size,
  			 op->new_i_size - (op->pos.offset << 9));
  
@@ -501,10 +539,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..694e8ca90
+index 000000000..a393d072d
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1131 @@
+@@ -0,0 +1,1140 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -842,7 +880,7 @@ index 000000000..694e8ca90
 +	DECLARE_COMPLETION_ONSTACK(done);
 +	int ret;
 +
-+	if (offset & (block_bytes(c) - 1))
++	if (offset & (512 - 1))
 +		return bch_err_throw(c, encoded_bad_size);
 +
 +	/*
@@ -1015,6 +1053,14 @@ index 000000000..694e8ca90
 +	 * or unit length would be indexed as something it is not. Refusing
 +	 * rather than clamping keeps the two ends agreeing about what happened.
 +	 *
++	 * unencoded_offset is where the file's data starts inside the unit. It
++	 * is not necessarily zero: a unit begins on a block, and a request that
++	 * begins part way into one is padded at the front, but the key covers
++	 * only what the write owns, so it starts at the request's sector with
++	 * everything before that dead. It has to be sector-aligned to be sayable
++	 * in a key and to leave a live range the length of a whole number of
++	 * sectors.
++	 *
 +	 * The payload length itself is the codec's business, not a fixed length:
 +	 * a peer's frame carries its own exact length inside it, so it is padded
 +	 * to the filesystem's block size below, exactly as the local encoder
@@ -1023,8 +1069,9 @@ index 000000000..694e8ca90
 +	 */
 +	if (!len || (offset & (block_bytes(c) - 1)) ||
 +	    (desc->unit_len & (block_bytes(c) - 1)) ||
++	    (desc->unencoded_offset & (512 - 1)) ||
++	    desc->unencoded_offset >= desc->unit_len ||
 +	    desc->plain_offset ||
-+	    desc->unencoded_offset ||
 +	    offset != desc->unit_offset ||
 +	    desc->unit_len > c->opts.encoded_extent_max ||
 +	    desc->valid_len > desc->unit_len) {
@@ -1096,8 +1143,8 @@ index 000000000..694e8ca90
 +	 * which the write op takes from valid_len rather than from here.
 +	 */
 +	crc.uncompressed_size	= desc->unit_len >> 9;
-+	crc.live_size		= desc->unit_len >> 9;
-+	crc.offset		= 0;
++	crc.live_size		= (desc->unit_len - desc->unencoded_offset) >> 9;
++	crc.offset		= desc->unencoded_offset >> 9;
 +	crc.nonce		= 0;
 +	crc.csum_type		= want_csum;
 +
@@ -1169,7 +1216,7 @@ index 000000000..694e8ca90
 +	 */
 +	op->write_point		= writepoint_hashed((unsigned long) inode);
 +	op->subvol		= inum.subvol;
-+	op->pos			= POS(inum.inum, offset >> 9);
++	op->pos			= POS(inum.inum, (offset + desc->unencoded_offset) >> 9);
 +	/*
 +	 * Never shrink: a write in the middle of a file must not truncate it,
 +	 * and a write past the end must extend it. The unit is block-aligned by
