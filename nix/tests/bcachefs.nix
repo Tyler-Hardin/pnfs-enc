@@ -1253,7 +1253,7 @@ pkgs.testers.nixosTest {
     # than the code under test. Everything below still holds without one - the
     # digest check is vacuous when there is no delegation to keep - so this is
     # logged rather than failing the bed.
-    assert held or ${"True" if kmsan else "False"}, \
+    assert held or ${if kmsan then "True" else "False"}, \
         "the server granted client2 no delegation on deleg.bin"
     # Cache it under the delegation, then let client1 rewrite the file through
     # the layout.
