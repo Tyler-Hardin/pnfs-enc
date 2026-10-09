@@ -2338,7 +2338,8 @@ pkgs.testers.nixosTest {
             # and the shape that has been losing its tail.
             ("chunked-big", "closeopen /mnt/self/cb.bin 1100005 10 chunked:1097728 /mnt/selfb/cb.bin"),
         ):
-            rcL, outL = server.execute("timeout 300 sh -c '%s 2>&1'" % cmd)
+            rcL, outL = server.execute(
+                "timeout ${if kmsan then "1800" else "300"} sh -c '%s 2>&1'" % cmd)
             server.log("same-host %-13s rc=%d %s" % (tag, rcL, outL.strip()))
         server.log("same-host after load: handoff/refused/redo_entry/off/len/done/status = %s"
                    % (wstat(),))

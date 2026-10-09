@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..3961bac1b
+index 000000000..7f17658b2
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1762 @@
+@@ -0,0 +1,1771 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -3252,7 +3252,16 @@ index 000000000..3961bac1b
 +		return NULL;
 +
 +	u->size = size;
-+	u->buf = alloc_pages_exact(size, GFP_NOFS);
++	/*
++	 * Zeroed, and not for tidiness: this buffer is the codec's input when
++	 * the unit is assembled, and its output always. A codec that reads
++	 * scratch it did not write - zstd reads and writes in words and does
++	 * not confine itself to the bytes it will ultimately emit - would
++	 * otherwise be handed whatever the allocator last held, and that shows
++	 * up in the frame it produces and therefore in what is stored and sent.
++	 * KMSAN caught exactly that on the write path.
++	 */
++	u->buf = alloc_pages_exact(size, GFP_NOFS|__GFP_ZERO);
 +	if (!u->buf)
 +		goto err;
 +
