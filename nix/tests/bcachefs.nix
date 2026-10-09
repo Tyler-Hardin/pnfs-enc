@@ -2396,6 +2396,36 @@ pkgs.testers.nixosTest {
         server.succeed("sleep 20")
         server.log("same-host under load: loaders running=%s" %
                    server.succeed("pgrep -c mmapwrite || true").strip())
+
+        # Twice as many mmap writers as CPUs, and the random write test run
+        # inside it. The failures left are rare and pressure-dependent: with
+        # the box idle the same seeds pass, and they pass with the queue
+        # depths the deployment actually runs. Oversubscribing the CPUs 2:1 is
+        # what turns a rare one into a reproducible one.
+        nproc = int(server.succeed("getconf _NPROCESSORS_ONLN").strip())
+        lanes = 2 * nproc
+        server.execute("pkill -f mmapwrite; sleep 2")
+        server.execute("rm -f /mnt/self/hload.*")
+        server.execute(
+            "sh -c 'for n in $(seq %d); do mmapwrite /mnt/self/hload.$n "
+            "67108864 600 >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &"
+            % lanes)
+        server.succeed("sleep 30")
+        server.log("under-load %d: %d mmap writers on %d cpus"
+                   % (lanes, int(server.succeed(
+                       "pgrep -c mmapwrite || true").strip() or 0), nproc))
+        server.succeed("touch /mnt/self/rw.bin /mnt/selfb/rw.bin")
+        for seed in (11, 12, 13, 14):
+            rcR, outR = server.execute(
+                "timeout 600 randwr --seed=%d --ops=200 --max-size=4194304 "
+                "--file=/mnt/self/rw.bin --verify-file=/mnt/selfb/rw.bin "
+                "2>&1 | tail -40" % seed)
+            server.log("under-load randwr seed=%d rc=%d %s"
+                       % (seed, rcR, outR.strip()[:3000]))
+            assert rcR == 0, \
+                "under-load randwr failed (seed %d): %s" % (seed, outR.strip()[:500])
+        server.execute("pkill -f mmapwrite; sleep 2")
+        server.execute("rm -f /mnt/self/hload.* /mnt/self/rw.bin")
         for tag, cmd in (
             ("152K", "closeopen /mnt/self/q.bin 155648 400"),
             ("152K-unlink", "closeopen /mnt/self/q.bin 155648 150 unlink"),
