@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..36dc16530
+index 000000000..2393047ff
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1731 @@
+@@ -0,0 +1,1732 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -3456,6 +3456,8 @@ index 000000000..36dc16530
 +	 * request larger than the maximum, and the backend refused it as too
 +	 * big to describe, sending a request that fit to the MDS.
 +	 */
++	done = io->hdr->args.count - io->left;
++
 +	{
 +		size_t cap = io->bl->unit_max;
 +
@@ -3465,7 +3467,6 @@ index 000000000..36dc16530
 +			cap -= min_t(size_t, cap, io->hdr->args.pgbase);
 +		io->unit = min_t(size_t, io->left, cap);
 +	}
-+	done = io->hdr->args.count - io->left;
 +
 +	/*
 +	 * The unit the service stores is aligned at both ends. It begins at the
