@@ -501,10 +501,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..22f70cc98
+index 000000000..694e8ca90
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1121 @@
+@@ -0,0 +1,1131 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -1310,10 +1310,20 @@ index 000000000..22f70cc98
 +	if (ret)
 +		return ret;
 +
++	memset(&unit, 0, sizeof(unit));
 +	ret = bch2_encoded_read_unit(c, inode_inum(inode), offset, dst, *dst_len,
 +				     &payload_len, &unit);
-+	if (ret)
++	if (ret) {
++		/*
++		 * The read path reaches the same refusal sites the probe does,
++		 * so the reason is already on the unit. It has to leave through
++		 * the descriptor because bch2_encoded_err() turns every one of
++		 * them into a bare -ENODATA, and a bare -ENODATA is what the
++		 * service counts as "not served" without knowing why.
++		 */
++		desc->refusal = unit.refusal;
 +		return bch2_encoded_err(ret);
++	}
 +
 +	desc->unit_offset	= unit.logical_offset;
 +	desc->unit_len		= bch2_encoded_unit_len(&unit);

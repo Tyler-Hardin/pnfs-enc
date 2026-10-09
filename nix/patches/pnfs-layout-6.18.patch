@@ -4282,10 +4282,10 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..5c6510aaa
+index 000000000..519210495
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
-@@ -0,0 +1,1090 @@
+@@ -0,0 +1,1092 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The encoded-extent data service: move a filesystem's compressed, checksummed
@@ -4987,6 +4987,8 @@ index 000000000..5c6510aaa
 +	ds_inflight_leave();
 +	encoded_ds_close(&f);
 +	if (ret) {
++		if (ret == -ENODATA && reply->desc.refusal < ENCODED_REFUSAL_NR)
++			atomic_inc(&ds_refused[reply->desc.refusal]);
 +		kvfree(buf);
 +		goto out_err;
 +	}
