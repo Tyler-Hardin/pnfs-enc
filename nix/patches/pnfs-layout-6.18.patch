@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..3eae6efe5
+index 000000000..3961bac1b
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1776 @@
+@@ -0,0 +1,1762 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -3459,29 +3459,34 @@ index 000000000..3eae6efe5
 +	done = io->hdr->args.count - io->left;
 +
 +	/*
-+	 * The unit the service stores is aligned at both ends to a sector, not
-+	 * to the filesystem's block.
++	 * The unit is aligned at both ends to a sector, and the first unit of a
++	 * request begins on the filesystem's block.
 +	 *
-+	 * A key's position is in sectors, so the unit has to start on one, and
-+	 * it has to cover the request: the first unit therefore begins at the
-+	 * sector the request's first byte is in, and everything from there to
-+	 * the request's start is padding. That padding is at most 511 bytes and
-+	 * lies inside the request's own first sector - which a write to part of
-+	 * a sector cannot proceed without reading in first, because the rest of
-+	 * the sector belongs to the file and has to be preserved. Those bytes
-+	 * are therefore the file's by construction.
++	 * It has to begin on the block because the payload is padded to one and
++	 * the backend refuses a payload that saved nothing, so a unit smaller
++	 * than a block can never be encoded at all. A request whose first byte
++	 * is not on a block boundary is therefore padded at the front with a
++	 * block's worth of what precedes it - and those bytes are not, in
++	 * general, the file's on this write: from the block boundary up to the
++	 * request's own sector is clean page cache that this write has no reason
++	 * to have populated, and padding a unit with it wrote whatever the cache
++	 * happened to hold over data the file already had.
 +	 *
-+	 * Rounding to the block instead put up to 4095 bytes of padding there,
-+	 * and the bytes between the sector boundary and the block boundary are
-+	 * clean page cache that a write has no reason to have populated. Filling
-+	 * the padding with those wrote whatever the cache happened to hold over
-+	 * data the file already had - one flush in twenty, and a lost write to
-+	 * whoever read it.
++	 * So the padding is not read back. The key begins at the sector the
++	 * request starts in - desc.unencoded_offset says where that is inside
++	 * the unit - and everything from the block boundary to it is dead: the
++	 * extent's position accounts for the offset, and nothing ever reads the
++	 * rest. That is what lets the padding be arbitrary.
 +	 *
-+	 * The rest of the padding is the file's own bytes, read back out of the
-+	 * pages the request carried, so writing them changes nothing. Past the
-+	 * end of the file there is nothing to read back and a gap is owed
-+	 * zeros, so only that part is zeroed.
++	 * The padding that survives is at most 511 bytes, inside the request's
++	 * own first sector, and that part is the file's by construction: a write
++	 * to part of a sector cannot proceed without reading the rest of that
++	 * sector in first, so those bytes are the file's whatever the cache held
++	 * before. Past the end of the file there is nothing to read back and a
++	 * gap is owed zeros, so only that part is zeroed.
++	 *
++	 * The cap leaves room for the front padding, so that rounding the span
++	 * up to the block cannot carry the unit past unit_max.
 +	 */
 +	{
 +		size_t cap = io->bl->unit_max;
@@ -3493,25 +3498,6 @@ index 000000000..3eae6efe5
 +		io->unit = min_t(size_t, io->left, cap);
 +	}
 +
-+
-+	/*
-+	 * The unit the service stores is aligned at both ends. It begins at the
-+	 * page the request's first byte is in - for the first unit only, and
-+	 * those bytes are the file's own, already in the page cache, so writing
-+	 * them back changes nothing - and it ends on a unit boundary.
-+	 *
-+	 * The unit reaches no further than that, because everything the key
-+	 * covers is data this write owns. It used to reach two units so that a
-+	 * padded payload would always be smaller than the unit it described,
-+	 * since the backend refuses a payload that saved nothing; the cost of
-+	 * that was a second page of zeros written over bytes that were already
-+	 * the file's, which is a lost write to whoever read them.
-+	 *
-+	 * What fills the rest is the file's own bytes, taken from the pages the
-+	 * request carried, so writing them back changes nothing either. Past the
-+	 * end of the file there is nothing to write back and a gap is owed
-+	 * zeros, so only that part is zeroed.
-+	 */
 +	front		= done ? 0 : io->hdr->args.pgbase;
 +	span		= front + io->unit;
 +	unit_off	= io->offset - front;
