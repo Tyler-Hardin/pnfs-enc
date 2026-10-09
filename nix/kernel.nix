@@ -18,13 +18,13 @@ let
   inherit (lib) kernel;
 
   kmsanConfig = lib.optionalAttrs kmsan {
-    KMSAN = yes;
-    KMSAN_CHECK_PARAM_RETVAL = yes;
-    DEBUG_KERNEL = yes;
+    KMSAN = lib.kernel.yes;
+    KMSAN_CHECK_PARAM_RETVAL = lib.kernel.yes;
+    DEBUG_KERNEL = lib.kernel.yes;
     # Kconfig gives KMSAN "depends on !KASAN && !KCSAN && !PREEMPT_RT".
-    KASAN = lib.mkForce no;
-    KCSAN = lib.mkForce no;
-    PREEMPT_RT = lib.mkForce no;
+    KASAN = lib.mkForce lib.kernel.no;
+    KCSAN = lib.mkForce lib.kernel.no;
+    PREEMPT_RT = lib.mkForce lib.kernel.no;
   };
 
   patched = pkgs.linuxPackages.kernel.override ({
