@@ -474,6 +474,32 @@ let
   # request and 8 is eight. Bigger requests cross fewer unit boundaries, so the
   # service re-fetches less; the walk is one unit deep, so they also pay their
   # round trips one after another. Which dominates is the measurement.
+  # KMSAN reports every read of uninitialised memory, including upstream ones
+  # this bed has no say over: the BPF trampoline path reports through __text_poke
+  # on every node at boot. The gate is the code this work touches, so the
+  # reports are counted and only those whose stack names it fail the test; the
+  # rest are logged, so a change in them stays visible.
+  kmsanScript = ''
+        with subtest("KMSAN: no uninitialised reads in the code under test"):
+            for nm, node in (("client", client), ("client2", client2),
+                             ("server", server)):
+                n = int(node.succeed(
+                    "dmesg | grep -c 'BUG: KMSAN' || true").strip() or 0)
+                ours = int(node.succeed(
+                    "dmesg | grep -A25 'BUG: KMSAN' | grep -cE "
+                    "' bc_| bch2_encoded| encoded_ds| bcachefs' || true"
+                ).strip() or 0)
+                server.log("kmsan: %s: %d report(s), %d in this code"
+                           % (nm, n, ours))
+                if ours:
+                    node.log("kmsan, naming this code:" +
+                             node.succeed("dmesg | grep -A25 'BUG: KMSAN'"))
+                assert ours == 0, (
+                    "KMSAN reported %d uninitialised read(s) in the code "
+                    "under test on %s" % (ours, nm))
+
+  '';
+
   pgUnitsSweepScript = ''
     # --- pg_units -----------------------------------------------------------
     # `bc_pg_bsize()` is max(unit_max * pg_units, rsize) capped at 8 MiB, so on
@@ -1210,7 +1236,9 @@ pkgs.testers.nixosTest {
     # once right after the open is a race - and one a loaded test machine
     # loses. Wait for the grant rather than for a fixed time.
     held = []
-    for _ in range(60):
+    # KMSAN's kernel is slow enough that a fixed window loses this race, so
+    # the window scales with it rather than the assertion being relaxed.
+    for _ in range(${if kmsan then "300" else "60"}):
         held = delegations("deleg.bin")
         if held:
             break
@@ -2621,7 +2649,8 @@ pkgs.testers.nixosTest {
         assert counter("ds_read_err") == ds_r0, \
             "the client's reads failed while the side files were written"
         client.succeed("rm -f /mnt/press.1 /mnt/press.2 /mnt/press.3 /mnt/press.4")
-  '' + lib.optionalString pgUnitsSweep pgUnitsSweepScript;
+  '' + lib.optionalString pgUnitsSweep pgUnitsSweepScript
+     + lib.optionalString kmsan kmsanScript;
 }
 
 # tree churn probe
