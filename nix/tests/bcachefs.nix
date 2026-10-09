@@ -16,7 +16,7 @@
 # doc/development.md for what the deployed bed shows that this one cannot.
 
 { pkgs, lib, src ? ../../bcachefs-tools, profile ? "lan", pgUnitsSweep ? false,
-  serverThreads ? 12, wedgeRepro ? false, walkProbe ? false }:
+  serverThreads ? 12, wedgeRepro ? false, walkProbe ? false, kmsan ? false }:
 
 let
   # The machine this run is about. A name that is not in the table should fail
@@ -38,6 +38,20 @@ let
 
   ccache = import ../../dev/ccache.nix { inherit pkgs lib; };
 
+  # KMSAN instrumentation exists only in Clang, so this is a from-source
+  # rebuild with a different compiler rather than a boot option or a kernel
+  # patch. It roughly doubles memory use, is slow, and is mutually exclusive
+  # with KASAN, KCSAN and PREEMPT_RT.
+  kmsanConfig = lib.optionalAttrs kmsan {
+    KMSAN = lib.kernel.yes;
+    KMSAN_CHECK_PARAM_RETVAL = lib.kernel.yes;
+    DEBUG_KERNEL = lib.kernel.yes;
+    # Kconfig gives KMSAN "depends on !KASAN && !KCSAN && !PREEMPT_RT".
+    KASAN = lib.mkForce lib.kernel.no;
+    KCSAN = lib.mkForce lib.kernel.no;
+    PREEMPT_RT = lib.mkForce lib.kernel.no;
+  };
+
   patchedKernel = pkgs.linuxPackages.kernel.override (ccache.override // {
     kernelPatches = [
       {
@@ -46,7 +60,7 @@ let
       }
     ];
 
-    structuredExtraConfig = with lib.kernel; {
+    structuredExtraConfig = (with lib.kernel; {
       # Server: nfsd with the bcachefs layout type and nothing else.
       NFSD = lib.mkForce yes;
       NFSD_V4 = lib.mkForce yes;
@@ -68,7 +82,20 @@ let
       # for (the option cannot be disabled outright - BTRFS_FS_POSIX_ACL then
       # becomes an "unused option" to kconfig).
       BTRFS_FS = lib.mkForce (lib.kernel.module);
-    };
+    }) // kmsanConfig;
+  } // lib.optionalAttrs kmsan {
+    # nixpkgs' shared kernel config still lists options only GCC accepts, and
+    # KMSAN turns off several hand-written assembly crypto drivers; the config
+    # stage fails on those rather than ignoring them.
+    stdenv = pkgs.llvmPackages.stdenv;
+    ignoreConfigErrors = true;
+    # KMSAN needs the kernel actually built by Clang; setting the stdenv is not
+    # always enough for nixpkgs to notice, so say it the way such a build does.
+    extraMakeFlags = [
+      "LLVM=1"
+      "CC=${pkgs.llvmPackages.clang}/bin/clang"
+      "LD=${pkgs.llvmPackages.lld}/bin/ld.lld"
+    ];
   });
 
   linuxPackages = pkgs.linuxPackagesFor patchedKernel;

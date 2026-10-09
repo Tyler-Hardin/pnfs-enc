@@ -85,6 +85,12 @@
           btrfs-gce-network-storage =
             import ./nix/tests/btrfs.nix (btrfsArgs // gce);
           bcachefs = import ./nix/tests/bcachefs.nix bcachefsArgs;
+          # The same bed with a Clang/KMSAN kernel, so a read of uninitialised
+          # memory is reported as "BUG: KMSAN: uninit-value" rather than being
+          # left to whatever the stack happened to hold. From-source and slow,
+          # so it is its own attribute rather than part of the default check.
+          bcachefs-kmsan =
+            import ./nix/tests/bcachefs.nix (bcachefsArgs // { kmsan = true; });
           bcachefs-gce-network-storage =
             import ./nix/tests/bcachefs.nix (bcachefsArgs // gce);
           # Not a suite: it checks the emulation the suites lean on. It builds
