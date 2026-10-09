@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..57d9ed125
+index 000000000..36dc16530
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1718 @@
+@@ -0,0 +1,1731 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2332,6 +2332,10 @@ index 000000000..57d9ed125
 +/* Provider modules asked for, in the core's counter, mirrored for the tests. */
 +static atomic_t bc_stat_codec_requests = ATOMIC_INIT(0);
 +static atomic_t bc_stat_write_codec = ATOMIC_INIT(0);
++static atomic_t bc_stat_read_decline_encrypted = ATOMIC_INIT(0);
++static atomic_t bc_stat_read_decline_codec = ATOMIC_INIT(0);
++static atomic_t bc_stat_read_decline_range = ATOMIC_INIT(0);
++static atomic_t bc_stat_read_decline_reach = ATOMIC_INIT(0);
 +static atomic_t bc_stat_ds_read_not_encoded = ATOMIC_INIT(0);
 +static atomic_t bc_stat_ds_read_ok = ATOMIC_INIT(0);
 +/* Negative: the failing call's errno. Positive: a decoded length mismatch. */
@@ -3027,6 +3031,7 @@ index 000000000..57d9ed125
 +	 * the live range ends inside the frame, not the live length on its own.
 +	 */
 +	if (desc->plain_offset + desc->unit_len > io->bl->unit_max) {
++		atomic_inc(&bc_stat_read_decline_reach);
 +		goto out_failed;
 +	}
 +
@@ -3818,6 +3823,14 @@ index 000000000..57d9ed125
 +					&bc_stat_codec_requests);
 +		debugfs_create_atomic_t("write_codec", 0444, bc_debugfs_dir,
 +					&bc_stat_write_codec);
++	debugfs_create_atomic_t("ds_read_decline_encrypted", 0444, bc_debugfs_dir,
++				&bc_stat_read_decline_encrypted);
++	debugfs_create_atomic_t("ds_read_decline_codec", 0444, bc_debugfs_dir,
++				&bc_stat_read_decline_codec);
++	debugfs_create_atomic_t("ds_read_decline_range", 0444, bc_debugfs_dir,
++				&bc_stat_read_decline_range);
++	debugfs_create_atomic_t("ds_read_decline_reach", 0444, bc_debugfs_dir,
++				&bc_stat_read_decline_reach);
 +		debugfs_create_atomic_t("ds_read_not_encoded", 0444, bc_debugfs_dir,
 +					&bc_stat_ds_read_not_encoded);
 +		debugfs_create_atomic_t("ds_read_err", 0444, bc_debugfs_dir,
@@ -4269,7 +4282,7 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..db8cf6d8f
+index 000000000..5c6510aaa
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
 @@ -0,0 +1,1090 @@
@@ -5268,7 +5281,7 @@ index 000000000..db8cf6d8f
 +			"refused_none", "refused_reflink", "refused_not_direct",
 +			"refused_no_target", "refused_encrypted",
 +			"refused_csum_invalid", "refused_not_compressed",
-+			"refused_too_large", "refused_offset",
++			"refused_too_large", "refused_offset", "refused_not_regular",
 +		};
 +		unsigned int i;
 +
@@ -5452,10 +5465,10 @@ index db9af7804..c5a3db7c0 100644
  		struct nfsd4_compound_state *cstate, stateid_t *stateid,
 diff --git a/include/linux/encoded_extent.h b/include/linux/encoded_extent.h
 new file mode 100644
-index 000000000..6369f9cb2
+index 000000000..07c7e20a4
 --- /dev/null
 +++ b/include/linux/encoded_extent.h
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,439 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_H
 +#define _LINUX_ENCODED_EXTENT_H
@@ -5519,6 +5532,7 @@ index 000000000..6369f9cb2
 +	ENCODED_REFUSAL_NOT_COMPRESSED,
 +	ENCODED_REFUSAL_TOO_LARGE,	/* the unit does not fit the maximum */
 +	ENCODED_REFUSAL_OFFSET,		/* asked for bytes the unit does not own */
++	ENCODED_REFUSAL_NOT_REGULAR,	/* not a regular file: nothing to store */
 +	ENCODED_REFUSAL_NR,
 +};
 +
