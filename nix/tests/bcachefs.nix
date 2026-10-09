@@ -2410,14 +2410,14 @@ pkgs.testers.nixosTest {
             "sh -c 'for n in $(seq %d); do mmapwrite /mnt/self/hload.$n "
             "67108864 600 >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 &"
             % lanes)
-        server.succeed("sleep 30")
+        server.succeed("sleep 60")
         server.log("under-load %d: %d mmap writers on %d cpus"
                    % (lanes, int(server.succeed(
                        "pgrep -c mmapwrite || true").strip() or 0), nproc))
         server.succeed("touch /mnt/self/rw.bin /mnt/selfb/rw.bin")
-        for seed in (11, 12, 13, 14):
+        for seed in (11, 12):
             rcR, outR = server.execute(
-                "timeout 600 randwr --seed=%d --ops=200 --max-size=4194304 "
+                "timeout 900 randwr --seed=%d --ops=1200 --max-size=4194304 "
                 "--file=/mnt/self/rw.bin --verify-file=/mnt/selfb/rw.bin "
                 "2>&1 | tail -40" % seed)
             server.log("under-load randwr seed=%d rc=%d %s"

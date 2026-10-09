@@ -78,6 +78,17 @@ int main(int argc, char **argv)
 		 */
 		for (off = 0; off < size; off += 4096)
 			p[off] = byte;
+		/*
+		 * Force the round out. Without this the pages are merely dirty
+		 * and the kernel decides when they go, which is a different load
+		 * from one that is actively pushing writeback at the mount - and
+		 * the failures being chased only appear when the write path is
+		 * the one under pressure.
+		 */
+		if (msync(p, size, MS_SYNC) < 0) {
+			perror("msync");
+			return 1;
+		}
 		byte = (byte == 'z') ? 'a' : byte + 1;
 		rounds++;
 	}
