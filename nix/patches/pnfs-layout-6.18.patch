@@ -4269,10 +4269,10 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..307ae681d
+index 000000000..db8cf6d8f
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
-@@ -0,0 +1,1073 @@
+@@ -0,0 +1,1090 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The encoded-extent data service: move a filesystem's compressed, checksummed
@@ -4383,6 +4383,7 @@ index 000000000..307ae681d
 +static u64 ds_read_ns, ds_write_ns;
 +static atomic_t ds_nr_write_file_sync = ATOMIC_INIT(0);
 +static atomic_t ds_nr_not_encoded = ATOMIC_INIT(0);
++static atomic_t ds_refused[ENCODED_REFUSAL_NR];
 +static atomic_t ds_nr_codec_unknown = ATOMIC_INIT(0);
 +static atomic_t ds_nr_errors = ATOMIC_INIT(0);
 +/*
@@ -4908,6 +4909,8 @@ index 000000000..307ae681d
 +		goto out_err;
 +
 +	ret = f.ops->probe(f.file, args->offset, args->len, &reply->desc);
++	if (ret && reply->desc.refusal < ENCODED_REFUSAL_NR)
++		atomic_inc(&ds_refused[reply->desc.refusal]);
 +	if (ret)
 +	encoded_ds_close(&f);
 +	if (ret)
@@ -5260,6 +5263,20 @@ index 000000000..307ae681d
 +				&ds_nr_write_file_sync);
 +	debugfs_create_atomic_t("not_encoded", 0444, encoded_ds_debugfs,
 +				&ds_nr_not_encoded);
++	{
++		static const char * const refused[] = {
++			"refused_none", "refused_reflink", "refused_not_direct",
++			"refused_no_target", "refused_encrypted",
++			"refused_csum_invalid", "refused_not_compressed",
++			"refused_too_large", "refused_offset",
++		};
++		unsigned int i;
++
++		for (i = 0; i < ARRAY_SIZE(refused) && i < ENCODED_REFUSAL_NR; i++)
++			debugfs_create_atomic_t(refused[i], 0444,
++						encoded_ds_debugfs,
++						&ds_refused[i]);
++	}
 +	debugfs_create_atomic_t("codec_unknown", 0444, encoded_ds_debugfs,
 +				&ds_nr_codec_unknown);
 +	debugfs_create_atomic_t("errors", 0444, encoded_ds_debugfs,
@@ -5435,10 +5452,10 @@ index db9af7804..c5a3db7c0 100644
  		struct nfsd4_compound_state *cstate, stateid_t *stateid,
 diff --git a/include/linux/encoded_extent.h b/include/linux/encoded_extent.h
 new file mode 100644
-index 000000000..a36a8bd2a
+index 000000000..6369f9cb2
 --- /dev/null
 +++ b/include/linux/encoded_extent.h
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,438 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_H
 +#define _LINUX_ENCODED_EXTENT_H
@@ -5486,7 +5503,33 @@ index 000000000..a36a8bd2a
 + * and a backend only needs to implement what it can do honestly - anything it
 + * refuses falls back to ordinary I/O, which is always correct.
 + */
++/*
++ * Why a backend would not describe a unit. Reported back to whoever asked, so
++ * that a fallback can be counted by cause instead of only counted: a probe
++ * that refuses everything says nothing about whether the filesystem has no
++ * encoded extents or the caller is asking for the wrong part of one.
++ */
++enum encoded_extent_refusal {
++	ENCODED_REFUSAL_NONE = 0,
++	ENCODED_REFUSAL_REFLINK,
++	ENCODED_REFUSAL_NOT_DIRECT,	/* hole, reservation, inline data */
++	ENCODED_REFUSAL_NO_TARGET,	/* unwritten, or no readable replica */
++	ENCODED_REFUSAL_ENCRYPTED,
++	ENCODED_REFUSAL_CSUM_INVALID,
++	ENCODED_REFUSAL_NOT_COMPRESSED,
++	ENCODED_REFUSAL_TOO_LARGE,	/* the unit does not fit the maximum */
++	ENCODED_REFUSAL_OFFSET,		/* asked for bytes the unit does not own */
++	ENCODED_REFUSAL_NR,
++};
++
 +struct encoded_extent_desc {
++	/*
++	 * Filled in on refusal and never sent: the wire codec names the fields
++	 * it carries, so this one stays on the side that set it. It is here
++	 * rather than in an out-parameter because the backend already returns
++	 * through this structure and a refusal has no other channel.
++	 */
++	u32	refusal;
 +	u64	unit_offset;		/* logical offset of the live range's start */
 +	u64	unit_len;		/* the live range's length */
 +	/*

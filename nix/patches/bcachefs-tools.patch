@@ -501,10 +501,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..c3daa643a
+index 000000000..22f70cc98
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1104 @@
+@@ -0,0 +1,1121 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -599,6 +599,12 @@ index 000000000..c3daa643a
 +struct bch_encoded_unit {
 +	u64				logical_offset;
 +	struct bch_extent_crc_unpacked	crc;
++	/*
++	 * Why a probe refused, when it did. Internal to this file; the probe
++	 * copies it out to the caller's descriptor, which is where a refusal
++	 * can be counted by cause rather than only counted.
++	 */
++	u32				refusal;
 +};
 +
 +static inline u64 bch2_encoded_unit_len(const struct bch_encoded_unit *u)
@@ -676,11 +682,13 @@ index 000000000..c3daa643a
 +	 * indirect pointer itself is refused.
 +	 */
 +	if (k.k->type == KEY_TYPE_reflink_p) {
++		out->refusal = ENCODED_REFUSAL_REFLINK;
 +		return bch_err_throw(c, encoded_reflink);
 +	}
 +
 +	/* Hole, reservation, inline data: no separate payload to move. */
 +	if (!bkey_extent_is_direct_data(k.k)) {
++		out->refusal = ENCODED_REFUSAL_NOT_DIRECT;
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
@@ -693,14 +701,17 @@ index 000000000..c3daa643a
 +	if (ret < 0)
 +		return ret;
 +	if (!ret) {
++		out->refusal = ENCODED_REFUSAL_NO_TARGET;
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
 +	if (bch2_csum_type_is_encryption(pick.crc.csum_type)) {
++		out->refusal = ENCODED_REFUSAL_ENCRYPTED;
 +		return bch_err_throw(c, encoded_encrypted);
 +	}
 +
 +	if (!bch2_checksum_type_valid(c, pick.crc.csum_type)) {
++		out->refusal = ENCODED_REFUSAL_CSUM_INVALID;
 +		return bch_err_throw(c, encoded_metadata_invalid);
 +	}
 +
@@ -711,6 +722,7 @@ index 000000000..c3daa643a
 +	 * cannot use.
 +	 */
 +	if (!crc_is_compressed(pick.crc)) {
++		out->refusal = ENCODED_REFUSAL_NOT_COMPRESSED;
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
@@ -736,8 +748,10 @@ index 000000000..c3daa643a
 +	payload_len	= (u64) pick.crc.compressed_size << 9;
 +
 +	if (plain_offset + unit_len > c->opts.encoded_extent_max ||
-+	    payload_len > c->opts.encoded_extent_max)
++	    payload_len > c->opts.encoded_extent_max) {
++		out->refusal = ENCODED_REFUSAL_TOO_LARGE;
 +		return bch_err_throw(c, encoded_bad_size);
++	}
 +
 +	/*
 +	 * live_size is the key's size by construction, so this cannot fire
@@ -1265,10 +1279,13 @@ index 000000000..c3daa643a
 +	if (ret)
 +		return ret;
 +
++	memset(&unit, 0, sizeof(unit));
 +	ret = bch2_trans_do(c, __bch2_encoded_probe(trans, inode_inum(inode),
 +						    offset, &unit));
-+	if (ret)
++	if (ret) {
++		desc->refusal = unit.refusal;
 +		return bch2_encoded_err(ret);
++	}
 +
 +	desc->unit_offset	= unit.logical_offset;
 +	desc->unit_len		= bch2_encoded_unit_len(&unit);
