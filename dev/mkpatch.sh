@@ -51,6 +51,7 @@ files=(
 	fs/nfs/internal.h
 	fs/nfs/localio.c
 	fs/nfs/pnfs.h
+	fs/nfs/read.c
 	fs/nfs/bcachefs_layout.c
 	fs/nfs/bcachefs_ds.c
 	fs/nfs/bcachefs_ds.h
