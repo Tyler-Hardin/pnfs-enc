@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..7f17658b2
+index 000000000..46fffd5a3
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1771 @@
+@@ -0,0 +1,1810 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2321,6 +2321,7 @@ index 000000000..7f17658b2
 + * therefore never reached the service and went to the MDS instead. */
 +static atomic_t bc_stat_write_declined = ATOMIC_INIT(0);
 +static atomic_t bc_stat_write_declined_align = ATOMIC_INIT(0);
++static atomic_t bc_stat_write_declined_nomem = ATOMIC_INIT(0);
 +static atomic_t bc_stat_lseg_alloc = ATOMIC_INIT(0);
 +static atomic_t bc_stat_lseg_alloc_err = ATOMIC_INIT(0);
 +static atomic_t bc_stat_read_pagelist = ATOMIC_INIT(0);
@@ -3239,7 +3240,7 @@ index 000000000..7f17658b2
 +	struct bc_write_unit *u = ctx;
 +
 +	kvfree(u->pages);
-+	free_pages_exact(u->buf, u->size);
++	kvfree(u->buf);
 +	kfree(u);
 +}
 +
@@ -3253,15 +3254,26 @@ index 000000000..7f17658b2
 +
 +	u->size = size;
 +	/*
-+	 * Zeroed, and not for tidiness: this buffer is the codec's input when
-+	 * the unit is assembled, and its output always. A codec that reads
++	 * kvzalloc, not alloc_pages_exact: the unit is as large as the service
++	 * will take, which is a megabyte by default, and asking for that as a
++	 * run of physically contiguous pages makes an order-8 allocation out of
++	 * every unit. On a fragmented box those fail under load - and failing
++	 * inside the work item is the expensive kind of failure, because it
++	 * arrives as pnfs_error and the MDS hand-back gives the header one
++	 * attempt. vmalloc-backed memory is virtually contiguous, which is all
++	 * the codec and the transport need: bc_ds_buffer_pages() maps it with
++	 * vmalloc_to_page() and nothing here dereferences the buffer as a
++	 * single physical range.
++	 *
++	 * Zeroed, and not for tidiness either: this buffer is the codec's input
++	 * when the unit is assembled, and its output always. A codec that reads
 +	 * scratch it did not write - zstd reads and writes in words and does
 +	 * not confine itself to the bytes it will ultimately emit - would
 +	 * otherwise be handed whatever the allocator last held, and that shows
 +	 * up in the frame it produces and therefore in what is stored and sent.
 +	 * KMSAN caught exactly that on the write path.
 +	 */
-+	u->buf = alloc_pages_exact(size, GFP_NOFS|__GFP_ZERO);
++	u->buf = kvzalloc(size, GFP_NOFS);
 +	if (!u->buf)
 +		goto err;
 +
@@ -3271,7 +3283,7 @@ index 000000000..7f17658b2
 +
 +	return u;
 +err_free:
-+	free_pages_exact(u->buf, u->size);
++	kvfree(u->buf);
 +err:
 +	kfree(u);
 +	return NULL;
@@ -3677,6 +3689,7 @@ index 000000000..7f17658b2
 +	struct bc_layout *bl;
 +	struct bc_layout_hdr *blh;
 +	struct bc_write_io *io;
++	void *buf;
 +
 +	atomic_inc(&bc_stat_write_pagelist);
 +	WRITE_ONCE(bc_stat_ds_last_write_off, hdr->args.offset);
@@ -3729,6 +3742,30 @@ index 000000000..7f17658b2
 +		atomic_inc(&bc_stat_write_declined_align);
 +		return PNFS_NOT_ATTEMPTED;
 +	}
++
++	/*
++	 * The codec's buffer for one unit, taken and released here.
++	 *
++	 * It is kvzalloc'd, so it does not need a run of physically contiguous
++	 * pages and will not fail because the box is fragmented. It can still
++	 * fail, and where it fails decides whether the range survives: inside
++	 * the work item the failure arrives as hdr->pnfs_error, which goes
++	 * through the MDS hand-back, and a layout write that fails twice on one
++	 * header has its range released unwritten and reported nowhere but a
++	 * warning. Failing before anything is committed is an ordinary
++	 * hand-off, so the reservation is taken where that is still possible.
++	 *
++	 * It is released rather than kept: which unit is being written is
++	 * decided per step, and one reservation is enough to know the next one
++	 * will be granted.
++	 */
++	buf = kvzalloc(bl->unit_max, GFP_NOFS);
++	if (!buf) {
++		atomic_inc(&bc_stat_write_declined);
++		atomic_inc(&bc_stat_write_declined_nomem);
++		return PNFS_NOT_ATTEMPTED;
++	}
++	kvfree(buf);
 +
 +	io = kzalloc(sizeof(*io), GFP_NOFS);
 +	if (!io)
@@ -3838,7 +3875,9 @@ index 000000000..7f17658b2
 +					&bc_stat_local_io);
 +		debugfs_create_atomic_t("write_declined", 0444, bc_debugfs_dir,
 +					&bc_stat_write_declined);
-+		debugfs_create_atomic_t("write_declined_align", 0444, bc_debugfs_dir,
++		debugfs_create_atomic_t("write_declined_nomem", 0444, bc_debugfs_dir,
++				&bc_stat_write_declined_nomem);
++	debugfs_create_atomic_t("write_declined_align", 0444, bc_debugfs_dir,
 +					&bc_stat_write_declined_align);
 +		debugfs_create_atomic_t("lseg_alloc", 0444, bc_debugfs_dir,
 +					&bc_stat_lseg_alloc);
