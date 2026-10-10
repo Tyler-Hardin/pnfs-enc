@@ -166,10 +166,18 @@ Three things make the two-client case work anyway:
   coherence hole (the writer's own RPC gets JUKEBOX and retries after the
   recall);
 - `nfsd4_insert_layout()` recalls another client's layout for the same file;
-- a bcachefs encoded write updates the btree inode, the in-memory inode's size
-  and times, and the VFS inode's `i_blocks`, and invalidates the page cache, so
-  nfsd's change attribute (which is the VFS ctime here) moves and the server does
-  not serve stale contents after a write that bypassed the cache.
+- a bcachefs encoded write updates the btree inode's size and times, the
+  in-memory inode, the VFS inode's times and `i_blocks`, and invalidates the
+  page cache, so nfsd's change attribute (which is the VFS ctime here) moves
+  and the server does not serve stale contents after a write that bypassed
+  the cache. The VFS inode's *size* is handled separately from the rest of
+  that update, and more carefully: it is only ever grown, to
+  `max(current, req_offset + req_len)`, the same way a direct write that also
+  bypasses the page cache extends it. Copying the btree's size onto the VFS
+  inode unconditionally - what the rest of the update does - pulls the VFS
+  size back down behind any dirty, not-yet-written-back data a concurrent
+  MDS write left further out, which this filesystem's writeback then
+  silently discards; see `doc/gotchas.md` 32.
 
 Per-unit latest-write-wins is the same semantics the MDS path gives.
 

@@ -286,3 +286,188 @@ position in this list, and `nix/tests/` refers to them by number.
     retakes a lock under contention. The restart-injection kconfig
     (`BCACHEFS_INJECT_TRANSACTION_RESTARTS`) reproduces it deterministically,
     which is the regression arm to add.
+
+32. **An encoded write's size update clobbered the VFS `i_size` back down
+    underneath a dirty, unsynced tail from a different write, and the file
+    came back truncated with no error anywhere.** This is the root cause the
+    "truncated/partial writes" symptom traced back to; everything the
+    descriptor-split and live-range work (the commits leading up to
+    `aafecd9`) fixed was real, but none of it was this.
+    `bch2_encoded_write_times_update()` finished every encoded write with
+    `bch2_inode_update_after_write(trans, inode, &inode_u,
+    ATTR_SIZE|ATTR_MTIME|ATTR_CTIME)`, and `ATTR_SIZE` there means
+    `i_size_write(&inode->v, bi->bi_size)` unconditionally
+    (`bch2_inode_update_after_write()`, `fs/vfs/fs.c`) - it copies the
+    *btree's* idea of the file's size onto the VFS inode, not "extend if
+    bigger". That is correct for truncate/setattr, which hold `i_rwsem` and
+    the pagecache block across the whole call so nothing else can be dirtying
+    the file meanwhile; the encoded write path holds neither.
+
+    The VFS `i_size` legitimately runs *ahead* of the btree's `bi_size`
+    whenever there is dirty, not-yet-written-back data: an ordinary buffered
+    write extends `i_size` the moment it copies into the page cache
+    (`fs/vfs/buffered.c`), long before the btree catches up at writeback.
+    So an MDS write (an NFS WRITE that fell back, a local buffered writer)
+    extends the file and its dirty tail sits in the page cache; a
+    data-service write to a *different*, already-settled, aligned range of
+    the same file completes afterwards (which it routinely does - the MDS
+    write for a declined, unaligned tail is issued immediately, while a
+    data-service write is queued behind a client-side compress first) and
+    its size update pulls the VFS `i_size` back down to what the btree has
+    actually committed so far. The dirty tail folio is now past `i_size`,
+    and this filesystem's writepage zeroes and undirties whatever is past
+    `i_size` on *every* call, because a folio straddling it may be mmapped
+    (`fs/vfs/buffered.c`) - so the tail is not merely reported short, it is
+    discarded the next time writeback visits it.
+
+    The fix drops `ATTR_SIZE` from that call (so
+    `bch2_inode_update_after_write()` never touches the VFS size) and grows
+    it separately, the way `bch2_dio_write_end()` does for a write that also
+    bypasses the page cache: `i_size_write(max(current, req_offset +
+    req_len))` under `i_lock`. `bi_size` in the btree is still grown (never
+    shrunk) through a proper `bch2_write_inode()` set-fn under
+    `ei_update_lock`, which is what the rest of this file's own update
+    machinery expects. `nix/sizeclobber.c`'s `clobber` mode reproduces this
+    deterministically - settle a file with an fsync, extend it further
+    without syncing, then force an ordinary overwrite of an earlier,
+    already-settled unit and close; no race window needed, because the
+    sequence alone is the trigger.
+
+33. **A sub-sector write pads itself from the request's own pages, and those
+    pages are not always uptodate.** A write whose first or last sector is
+    only partly covered by the request needs the rest of that sector filled
+    from the file's own bytes, because the codec's frame is block-sized and
+    the key it produces is sector-granular - `bc_write_step()`
+    (`fs/nfs/bcachefs_layout.c`) reads those bytes straight out of
+    `hdr->args.pages[]`, on the stated assumption that "the request's first
+    page is the file's page cache page for them". That is true of the
+    *mapping* a page belongs to, but not of whether the page actually holds
+    the file's bytes: NFS only read-modify-writes a partial page when the
+    file is open for reading too
+    (`nfs_want_read_modify_write()`), so an `O_WRONLY` writer's folio that
+    was not already cached is left not uptodate outside the bytes it itself
+    wrote, and `nfs_write_end()` only zeroes what lies *past* the write
+    within that folio, never what lies before it. Padding from such a page
+    stores whatever the kernel happened to leave there as the file's own
+    bytes - up to 511 bytes, at either end of the request, silently.
+
+    The fix is `bc_write_padding_uptodate()`: before any unit is sent, check
+    `folio_test_uptodate()` on the specific page(s) the padding would read
+    from (`pages[0]` for the front pad, the page holding the request's last,
+    fractional sector for the tail pad - both computable from the request
+    alone, mirroring exactly what `bc_write_step()` itself would read), and
+    decline to the MDS - whose own read-modify-write goes through the
+    server's page cache and btree instead, and is always correct - rather
+    than guess. `nix/sizeclobber.c`'s `padding` mode reproduces this without
+    any race: open fresh, write a sector-misaligned length, close, and read
+    back through a second mount; there is nothing of the file's own for the
+    writer to have read first, so the page is never uptodate and the bug (if
+    present) always fires.
+
+    `write_declined_notuptodate` (debugfs) counts how often this gate fires;
+    nonzero on a healthy mount is not itself a problem - it is the same
+    "this range costs the recompression the path exists to avoid" trade
+    `write_declined_notcache` already makes for direct writes.
+
+34. **A read whose walk stopped at the client's own cached `i_size` used to
+    report a confident, complete success - even when that cached size was
+    stale.** `bc_read_pagelist()` bounds how far it asks the data service to
+    walk by `min(request end, i_size_read(inode))`, which is right as far as
+    it goes: a read request is page-granular and routinely reaches past the
+    real end of file, and the bytes past it are not the file's. But the
+    completion used to unconditionally set `hdr->res.count = hdr->args.count`
+    and `hdr->res.eof = false`, zero-filling everything from the walk's stop
+    point to the request's end regardless of *why* the walk stopped there. If
+    the client's cached `i_size` was stale low - another client or process
+    had extended the file and this one had not revalidated since the
+    request's pages were chosen - the bytes past it were not holes, they
+    were real data this driver simply never asked for, and reporting them as
+    a zero-filled, complete, successful read gave nothing downstream any
+    reason to doubt it.
+
+    The fix (`bc_read_finish()`) reports a genuinely short read instead:
+    `res.count` is exactly how far the walk actually reached, and `res.eof`
+    says so truthfully. `nfs_readpage_result()` - reached through
+    `pnfs_ld_read_done()` calling `hdr->mds_ops->rpc_call_done()`, which for
+    a read is exactly that function - already knows what to do with a short,
+    non-eof read: `nfs_readpage_retry()` sets `hdr->pnfs_error = -EAGAIN` for
+    a non rpc-based layout driver's task, which `pnfs_ld_handle_read_error()`
+    turns into `pnfs_read_done_resend_to_mds()` - a real, authoritative
+    GETATTR-backed read through the MDS, the identical mechanism every other
+    pnfs read failure in this driver already uses. A genuine EOF, reported
+    truthfully, is handled the same way any ordinary NFS read's last page
+    always is - nothing above this driver treats the two differently, which
+    is the point: this driver no longer has to tell them apart, only report
+    which one it actually saw. `ds_read_ambiguous_eof` (debugfs) counts how
+    often the walk stopped short of the request; nonzero on a healthy,
+    single-reader mount is unremarkable (every real end-of-file is one of
+    these) and the number to watch is whether it moves *far more* than files
+    actually ending there would explain.
+
+35. **Two calls to `bch2_bkey_pick_read_device()` for one encoded read can
+    legitimately disagree, and the descriptor used to be built from the
+    wrong one.** `__bch2_encoded_find()` picks a pointer to validate and
+    describe the unit from; `bch2_read_extent()` (reached through
+    `__bch2_encoded_read()`) picks again, independently, to decide which
+    device the bytes actually come from. For an extent with more than one
+    pointer the two picks are not guaranteed to agree:
+    `bch2_bkey_pick_read_device()` is latency-biased and partly random
+    between equally-good candidates, `narrow_crcs` rewrites one pointer's
+    crc in place, and a promoted or differently-recompressed replica can
+    carry its own compression and checksum type for the same live range. The
+    descriptor handed to the peer was built from the *first* pick while the
+    payload on the wire came from whatever the *second* pick actually read -
+    silently, for any extent with more than one replica.
+
+    The fix factors the validation both picks need
+    (`bch2_encoded_unit_from_crc()`) into one function and runs it twice: once
+    on the lookup's pick, as before, and again on `rbio->pick.crc` - the
+    pointer the read path actually used - once the read completes. A crc
+    either call would have refused is refused identically wherever it turns
+    up, and the descriptor now always describes the bytes that are actually
+    on their way to the peer.
+
+36. **The data service's PROBE procedure leaked the file it opened, on every
+    successful probe.** `encoded_ds_proc_probe()`'s cleanup was `if (ret)
+    encoded_ds_close(&f);` with no corresponding close on the success path -
+    a probe that worked kept the `struct file`, and the inode it pinned,
+    forever. Nothing but `dsprobe(1)` calls PROBE today, so this cost a
+    reference per manual probe rather than per request, but the shape is the
+    same bug class as the bounce-page leak in #30: a success path with no
+    cleanup of its own. Fixed by closing unconditionally, immediately after
+    the backend call, before any of the remaining failure sites - the same
+    shape `encoded_ds_proc_read()` already used.
+
+37. **`bc_ds_clnt_create()` resolved the data service's address in
+    `init_net` while building the RPC client in the mount's own network
+    namespace.** `rpc_pton()` only consults its `net` argument to resolve an
+    IPv6 link-local address's zone id to an interface
+    (`rpc_parse_scope_id()` -> `dev_get_by_name()`), and interface names are
+    scoped to a netns - so a mount whose `cl_net` is not `init_net` (a
+    container, any netns-isolated mount) would have that lookup either fail
+    to find the interface or, worse, resolve a same-named one that means
+    something else in `init_net`, and connect the data service to the wrong
+    link without any error. Fixed by resolving against `clp->cl_net`, which
+    is what the rest of the function already builds the client against.
+    Narrow - it only bites a link-local address on a non-default netns - but
+    silent in both directions it can go wrong.
+
+38. **The move path (rebalance, copygc) stopped reclaiming a trimmed encoded
+    extent's dead space, because of a gate meant only for the data
+    service.** `bch2_write_prep_encoded_data()`'s "write the whole extent as
+    is" gate used to be `uncompressed_size == live_size` - the live range is
+    the *whole* frame, nothing to reclaim by decompressing. Loosening it to
+    `offset + live_size <= uncompressed_size` (a live range that is only a
+    *prefix* of the frame) is right for the encoded-extent serving path,
+    whose key legitimately stops short of the frame it wrote - but the
+    change applied to *every* `BCH_WRITE_data_encoded` caller, including the
+    move path (`fs/data/update.c`), which sets that flag but never
+    `BCH_WRITE_encoded_only`. A trimmed key the move path picked up (an
+    encoded write's own key, trimmed again by a later write into part of
+    it) used to be decompressed and recompressed, reclaiming the dead frame
+    space the trim left behind; with the loosened gate it was copied as-is
+    forever instead. Every unit this workload writes is a partial frame by
+    construction (the front/tail padding described in #33's write path), so
+    this was not a one-off but permanent space amplification. Fixed by
+    gating the loosened condition on `BCH_WRITE_encoded_only` and keeping
+    the original, strict equality for everything else.

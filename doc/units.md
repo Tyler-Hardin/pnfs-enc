@@ -62,13 +62,21 @@ When touching this code, find the quantity below before reasoning about it.
   of blocks and so reaches past the request at either end, but the file owns
   only the request's sectors, so the key stops there and the rest of the frame
   is dead. `bch2_write_prep_encoded_data()` stores a payload as it stands when
-  `crc.offset + crc.live_size <= crc.uncompressed_size`, which is why a frame
-  longer than its key is the normal shape rather than a refusal.
+  `crc.offset + crc.live_size <= crc.uncompressed_size` **and the caller set
+  `BCH_WRITE_encoded_only`** - the encoded-extent serving path, whose key
+  legitimately stops short of the frame it wrote. Every other
+  `BCH_WRITE_data_encoded` caller (chiefly the move path: rebalance, copygc)
+  keeps the stricter `crc.uncompressed_size == crc.live_size` upstream had,
+  because for that path a trimmed key is dead space to reclaim by
+  decompressing, not a shape to preserve - see gotcha 38.
 - So the only bytes the key names that the request did not send are the two
   sub-sector runs at its ends. Those are the file's own bytes, read out of the
   request's pages - which is why a request whose pages are not the file's page
-  cache is declined rather than padded - and everything else in the frame is
-  dead and owed zeros past `i_size`.
+  cache is declined rather than padded, **and why one whose pages are the
+  cache but are not yet uptodate (`bc_write_padding_uptodate()`) is declined
+  the same way: "in the page cache" and "holds the file's actual bytes" are
+  not the same claim, and conflating them is gotcha 33** - and everything else
+  in the frame is dead and owed zeros past `i_size`.
 - A unit is aligned to `block_bytes`, not to `unit_align` as such: the checks
   that matter compare against `block_bytes(c)`, which happens to equal the
   layout's `unit_align` on every filesystem tested, but is not the same claim.
@@ -93,3 +101,13 @@ When touching this code, find the quantity below before reasoning about it.
   `c->opts.encoded_extent_max >> 9` in `bch2_write_prep_encoded_data()` is a
   bytes-to-sectors conversion and correct; the same expression applied to the
   *on-disk* field would not be.
+- `i_size` itself was assumed to have one authoritative source. It does not:
+  the VFS inode's `i_size` and the btree's `bi_size` legitimately disagree
+  whenever there is dirty, not-yet-written-back data, with the VFS value
+  *ahead*. `ATTR_SIZE` through `bch2_inode_update_after_write()` means
+  "`i_size_write(bi_size)`, no comparison" - correct for truncate/setattr,
+  which hold the locks that make the two sides agree first, and wrong for a
+  path (an encoded write) that holds neither and runs concurrently with
+  whatever else is dirtying the file. See gotcha 32: this was the real cause
+  of this feature's truncated-write reports, and every unit/live-range fix
+  that came before it was fixing a different, real bug.

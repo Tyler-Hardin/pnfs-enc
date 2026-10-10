@@ -5,6 +5,21 @@ and the suite runs, but it **breaks the read path** (`twophase`: `not_encoded`
 800->820, every read refused), so it is not landed. This records the design,
 the flaw, and the piece that was missing.
 
+**Not the cause of the truncated-write reports.** This document is about a
+*throughput* gap - a file's unaligned last request is always declined to the
+MDS rather than served (padded) through the data service - and nothing here
+ever touches the inode's size. The actual cause of the truncated/partial
+write reports was found later and is unrelated to this: see `doc/gotchas.md`
+32 (an encoded write's completion clobbering the VFS `i_size` back down under
+a dirty, unsynced tail from a different write - nothing to do with alignment
+at all) and 33 (a sub-sector write padding itself from a page that was never
+read in, so not uptodate - the same *symptom class*, "a file's tail goes
+missing or wrong", but a different bug, in a different function, found
+independently). This design is still live as a throughput idea and the flaw
+described below (live-range vs. frame confusion on a later write) is real and
+would still need the fix described - it is just not what was silently
+truncating files.
+
 ## The problem it addresses
 
 `bc_write_pagelist()` declines any request whose `count` is not a multiple of
