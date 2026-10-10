@@ -1245,10 +1245,10 @@ index 9fb2f2cac..f58d3f05b 100644
 +nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
 diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
 new file mode 100644
-index 000000000..260ba4096
+index 000000000..55938ba27
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.c
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,786 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The client side of the encoded-extent data service.
@@ -1671,7 +1671,19 @@ index 000000000..260ba4096
 +	};
 +	int salen;
 +
-+	salen = rpc_pton(&init_net, bl->addr, bl->addr_len,
++	/*
++	 * The mount's own network namespace, not init_net: an IPv6 link-local
++	 * address carries a zone id that can name an interface
++	 * (rpc_parse_scope_id() -> dev_get_by_name()), and interface names are
++	 * scoped to a netns. Resolving against init_net on a mount whose
++	 * cl_net is something else - a container, or any netns-isolated
++	 * mount - either fails to find the interface at all or, worse, finds
++	 * a same-named one that means something different in init_net, and
++	 * connects the data service to the wrong link silently. nfs_create()
++	 * and the rest of this function already use clp->cl_net for the same
++	 * reason; this parse has to as well.
++	 */
++	salen = rpc_pton(clp->cl_net, bl->addr, bl->addr_len,
 +			 (struct sockaddr *)&ss, sizeof(ss));
 +	if (!salen)
 +		return ERR_PTR(-EINVAL);
@@ -2258,10 +2270,10 @@ index 000000000..e393a1bd9
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..0ec2a8f64
+index 000000000..b7aea81a6
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,2000 @@
+@@ -0,0 +1,2193 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2415,6 +2427,12 @@ index 000000000..0ec2a8f64
 +/* Requests whose pages are not this file's page cache, so the bytes a unit has
 + * to be padded with could not be read from them: a direct write, mostly. */
 +static atomic_t bc_stat_write_declined_notcache = ATOMIC_INIT(0);
++/*
++ * Requests whose pages *are* this file's page cache, but the specific page a
++ * unit would pad from is not yet uptodate: the bytes the driver would read
++ * back are not the file's. See bc_write_padding_is_uptodate().
++ */
++static atomic_t bc_stat_write_declined_notuptodate = ATOMIC_INIT(0);
 +/* Frames the client built that its own codec would not accept. Should be zero;
 + * if it is not, the encoder is producing something only this driver would
 + * ever have stored. */
@@ -2438,6 +2456,17 @@ index 000000000..0ec2a8f64
 +static atomic_t bc_stat_read_decline_reach = ATOMIC_INIT(0);
 +static atomic_t bc_stat_ds_read_not_encoded = ATOMIC_INIT(0);
 +static atomic_t bc_stat_ds_read_ok = ATOMIC_INIT(0);
++/*
++ * A read whose walk stopped at this driver's own cached i_size before
++ * reaching the request's own end - reported as a short, honest read rather
++ * than a confident zero-filled success, so NFS decides whether it was a real
++ * EOF or a stale cache. See bc_read_finish(). Nonzero on a healthy mount with
++ * one reader: every real EOF is one of these. What it is here for is telling
++ * apart a mount with no coherence trouble from one where this fires far more
++ * than files-at-EOF would explain, which is the write-visible-late case this
++ * replaces a silent data loss with.
++ */
++static atomic_t bc_stat_ds_read_ambiguous_eof = ATOMIC_INIT(0);
 +/* Negative: the failing call's errno. Positive: a decoded length mismatch. */
 +static atomic_t bc_stat_ds_last_read_err = ATOMIC_INIT(0);
 +static atomic_t bc_stat_ds_last_unit_len = ATOMIC_INIT(0);
@@ -2993,30 +3022,6 @@ index 000000000..0ec2a8f64
 +	}
 +}
 +
-+/*
-+ * Zero a range of a request's pages, for the bytes past the end of the file.
-+ *
-+ * A read request is page-granular, so it reaches past i_size; the file owes
-+ * zeros there and no extent covers them, so the driver produces them itself
-+ * rather than asking for them.
-+ */
-+static void
-+bc_zero_pages(struct nfs_pgio_header *hdr, size_t skip, size_t len)
-+{
-+	unsigned int pgindex = (hdr->args.pgbase + skip) >> PAGE_SHIFT;
-+	unsigned int pgoff = (hdr->args.pgbase + skip) & (PAGE_SIZE - 1);
-+
-+	while (len && pgindex < hdr->page_array.npages) {
-+		struct page *page = hdr->args.pages[pgindex];
-+		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
-+
-+		zero_user_segment(page, pgoff, pgoff + n);
-+		len -= n;
-+		pgoff = 0;
-+		pgindex++;
-+	}
-+}
-+
 +/* The reverse: the request's bytes, in order, into a linear buffer. */
 +static size_t
 +bc_copy_from_pages(struct nfs_pgio_header *hdr, size_t skip, void *dst,
@@ -3085,11 +3090,17 @@ index 000000000..0ec2a8f64
 +	u64			end;
 +};
 +
++/*
++ * @eof: whether the walk stopped at i_size rather than at the request's own
++ * end - see the call site in bc_read_done() for what that does and does not
++ * prove.
++ */
 +static void
-+bc_read_finish(struct bc_read_io *io, int status)
++bc_read_finish(struct bc_read_io *io, int status, bool eof)
 +{
 +	struct nfs_pgio_header *hdr = io->hdr;
 +	struct bc_layout_hdr *blh = io->blh;
++	u64 end = io->end;
 +
 +	kvfree(io->plain_pages);
 +	kvfree(io->payload_pages);
@@ -3115,8 +3126,36 @@ index 000000000..0ec2a8f64
 +	}
 +
 +	atomic_inc(&bc_stat_ds_read_ok);
-+	hdr->res.count = hdr->args.count;
-+	hdr->res.eof = false;
++	/*
++	 * @eof means the walk stopped at this driver's own cached i_size, not
++	 * at the request's end - and that cache is not authoritative. If it
++	 * is stale low (another client or process extended the file and this
++	 * one has not revalidated since this request's pages were chosen),
++	 * the bytes beyond @end are not holes - the backend has them, this
++	 * driver only never asked for them - and reporting a confident
++	 * eof=false, count=args.count here used to zero-fill real data and
++	 * call it a complete, successful read: nothing downstream had any
++	 * reason to doubt it, because nothing downstream was told anything
++	 * was left unread.
++	 *
++	 * The honest report is a short read ending at @end, with @eof exactly
++	 * mirroring what caused it: the real file's own end (a plain, correct
++	 * EOF, no different from any other NFS read's last page) or this
++	 * driver's refusal to manufacture bytes it could not confirm (not an
++	 * EOF; NFS must come back for the rest). Either way,
++	 * nfs_readpage_result() - reached through pnfs_ld_read_done() calling
++	 * hdr->mds_ops->rpc_call_done(), which for a read is exactly that
++	 * function - already knows what to do with a short, non-eof read: it
++	 * retries the remainder (nfs_readpage_retry()), which for a non
++	 * rpc-based layout driver's task re-enters through the MDS, whose
++	 * GETATTR-backed size is authoritative. A real EOF, reported
++	 * truthfully, is handled the identical way an ordinary NFS read's
++	 * last page always is.
++	 */
++	if (eof)
++		atomic_inc(&bc_stat_ds_read_ambiguous_eof);
++	hdr->res.count = end - hdr->args.offset;
++	hdr->res.eof = eof;
 +	hdr->pnfs_error = 0;
 +	hdr->task.tk_status = 0;
 +	pnfs_ld_read_done(hdr);
@@ -3252,25 +3291,29 @@ index 000000000..0ec2a8f64
 +	}
 +
 +	/*
-+	 * The walk stopped at i_size; whatever the request asked for beyond it
-+	 * is owed zeros, including the part of the last unit's page the unit
-+	 * itself did not cover.
++	 * The walk stopped at i_size, short of the request's own end: whatever
++	 * is between them is either the real file's end - a read request is
++	 * page-granular and routinely reaches past it - or bytes a stale
++	 * cached i_size only looks like it owns. This driver cannot tell the
++	 * difference and must not guess at the bytes themselves either way:
++	 * unlike the old behaviour, nothing is zero-filled here. @res.count
++	 * and @eof instead report exactly what was confirmed - see
++	 * bc_read_finish() - and nfs_readpage_result() owns the rest: a real
++	 * eof trims good_bytes and zero-fills the remainder of the page the
++	 * same way any other NFS read's last page does, and a short,
++	 * non-eof read is retried for the part this driver would otherwise
++	 * have had to guess at.
 +	 */
-+	if (io->hdr->args.offset + io->hdr->args.count > io->end)
-+		bc_zero_pages(io->hdr, io->end - io->hdr->args.offset,
-+			      io->hdr->args.offset + io->hdr->args.count -
-+			      io->end);
-+
-+	bc_read_finish(io, 0);
++	bc_read_finish(io, 0, io->end < io->hdr->args.offset + io->hdr->args.count);
 +	return;
 +
 +out_failed:
 +	status = -EIO;
 +out_status:
-+	bc_read_finish(io, status);
++	bc_read_finish(io, status, false);
 +	return;
 +out_not_encoded:
-+	bc_read_finish(io, -ENODATA);
++	bc_read_finish(io, -ENODATA, false);
 +}
 +
 +static enum pnfs_try_status
@@ -3320,7 +3363,14 @@ index 000000000..0ec2a8f64
 +	 * refuse the range, and hand the whole request to the MDS. That is
 +	 * correct and it is never served, which is the failure this bound
 +	 * exists to prevent: every file whose size is not page-aligned would
-+	 * pay a fallback for its last page. bc_read_done() zeroes the tail.
++	 * pay a fallback for its last page.
++	 *
++	 * i_size_read() here is this driver's own belief, not the file's: if
++	 * it is stale low, @io->end stops the walk short of bytes the backend
++	 * actually has. bc_read_done() does not zero anything past @io->end on
++	 * the strength of this value alone - it reports a short read and lets
++	 * NFS decide whether that was a real EOF or a cache it needs to
++	 * recheck. See bc_read_finish().
 +	 */
 +	io->end = min_t(u64, hdr->args.offset + hdr->args.count,
 +			i_size_read(hdr->inode));
@@ -3913,6 +3963,137 @@ index 000000000..0ec2a8f64
 +}
 +
 +/*
++ * Whether a byte range of the request's own pages is one bc_write_step() may
++ * read back as "the file's bytes" when padding a unit.
++ *
++ * NFS does not read-modify-write a partial page unless the file is open for
++ * reading too (nfs_want_read_modify_write()): an O_WRONLY writer's folio that
++ * is not already cached is left not uptodate outside the bytes it actually
++ * wrote, and nfs_write_end() only zeroes what lies *past* the write within
++ * that folio - never what lies before it. So a folio in the mapping is not
++ * enough; bc_write_step()'s "the request's first page is the file's page
++ * cache page for them" is only true where the folio says it has real data.
++ *
++ * Checked without the folio lock: a racing writeback cannot clear uptodate,
++ * only dirty, so a true answer here does not need to be re-checked once the
++ * work item actually reads the bytes. A racing write to the *same* bytes is
++ * already excluded by the request's own page lock (PG_private_2/lock_page()
++ * in the generic pgio path) for as long as this request exists.
++ */
++static bool bc_write_padding_is_uptodate(struct page *page)
++{
++	return page && folio_test_uptodate(page_folio(page));
++}
++
++/*
++ * Whether this request's own pages can honestly supply every file byte
++ * bc_write_step() would pad a unit with.
++ *
++ * Only two pages are ever read from for padding, and only when the
++ * corresponding padding is non-empty and inside i_size (bc_write_step() zeroes
++ * anything past i_size rather than reading it, which is always safe):
++ *
++ *   - the front pad, pages[0] at [unencoded_offset, pgbase) - only for the
++ *     first unit, i.e. only when @pgbase itself is not sector-aligned;
++ *   - the tail pad, at [done + unit, unit_len - front) of the *last* unit -
++ *     the gap between where the request's own bytes end and the frame's
++ *     block boundary, which bc_write_step() fills from real file bytes
++ *     whenever i_size reaches that far (its own comment: "a backend that
++ *     names the whole frame - btrfs does - does read it, so the bytes have
++ *     to be the file's there too" - bcachefs's own key stops sooner, at the
++ *     request's last sector, but this driver serves both backends through
++ *     one code path and fills the whole gap regardless of which backend
++ *     will actually read it back). Only the *last* unit of a request can
++ *     have this gap - bc_write_pagelist() requires every interior unit to be
++ *     exactly unit_align-sized - so it is always the request's own last
++ *     page.
++ *
++ * This runs once, before any unit is sent, rather than being threaded through
++ * bc_write_step()'s per-unit walk: both pages are knowable from the request
++ * alone, and declining a request that will need an un-cached byte is exactly
++ * as correct before the first unit is sent as it is encountered unit by unit -
++ * simpler to reason about, and it costs nothing on the common, already-cached
++ * path this exists to leave alone.
++ */
++static bool bc_write_padding_uptodate(const struct nfs_pgio_header *hdr,
++				      const struct bc_layout *bl)
++{
++	u64 align = bl->unit_align;
++	u64 pgbase = hdr->args.pgbase;
++	u64 count = hdr->args.count;
++	u64 offset = hdr->args.offset;
++	u64 eof = i_size_read(hdr->inode);
++	u64 unencoded_offset = pgbase & ~(u64)(ENCODED_EXTENT_SECTOR_SIZE - 1);
++	u64 span, gap;
++
++	/* Front pad: pages[0], [unencoded_offset, pgbase). */
++	if (pgbase > unencoded_offset) {
++		u64 start = offset - (pgbase - unencoded_offset);
++
++		if (eof > start &&
++		    !bc_write_padding_is_uptodate(hdr->args.pages[0]))
++			return false;
++	}
++
++	/*
++	 * Tail pad: bc_write_step()'s own trigger is "unit_len > span" where
++	 * @span is the last unit's front-plus-own-bytes and @unit_len is @span
++	 * rounded up to @align - a block, not a sector, which is why checking
++	 * @count's own sector alignment alone is not enough: @span can be
++	 * sector-aligned and still short of the block boundary bc_write_step()
++	 * pads out to. @span for the *request as a whole* is (pgbase + count):
++	 * on a single-unit request that *is* the last unit's span directly:
++	 * front = pgbase, span = front + count. On a multi-unit request the
++	 * last unit's own front is 0 (only the first unit carries @pgbase), so
++	 * its span is just its own share of @count - but that share is a
++	 * whole number of @align past (pgbase + count) only when @align
++	 * divides the per-unit size every interior unit uses, which
++	 * bc_write_step()'s own cap (rounded down to @align) guarantees: the
++	 * last unit's span and (pgbase + count) agree modulo @align either
++	 * way, so working from the request's own totals is exact without
++	 * replaying the per-unit walk.
++	 */
++	span = pgbase + count;
++	gap = align && (span & (align - 1)) ? align - (span & (align - 1)) : 0;
++	if (gap) {
++		u64 end = offset + count;
++
++		if (eof > end) {
++			/*
++			 * The gap starts at the request's own end and is
++			 * shorter than @align <= PAGE_SIZE (the layout
++			 * driver's own gate refuses a layout otherwise), and
++			 * @align divides PAGE_SIZE (block_size is
++			 * OPT_MUST_BE_POW_2 and capped well under PAGE_SIZE),
++			 * so it cannot cross a second page boundary: one page
++			 * is always enough to check.
++			 *
++			 * nfs_generic_pgio() sizes page_array to
++			 * ceil((pgbase + wb_bytes) / PAGE_SIZE)
++			 * (nfs_page_array_len()) for the *whole* mirror's
++			 * write-back size, which bc_pg_init_write() passes as
++			 * i_size - offset when the file is shorter than the
++			 * request - so @idx can land one past the pages a
++			 * *short* request actually populated. That is exactly
++			 * the "past i_size" case this function already treats
++			 * as owed zeros rather than real bytes (the @eof > end
++			 * check above), so it is never reached with an
++			 * out-of-range index for a page this check needed to
++			 * read; the array-bounds comparison is a backstop, not
++			 * the thing doing the real work.
++			 */
++			unsigned int idx = span >> PAGE_SHIFT;
++
++			if (idx >= hdr->page_array.npages ||
++			    !bc_write_padding_is_uptodate(hdr->args.pages[idx]))
++				return false;
++		}
++	}
++
++	return true;
++}
++
++/*
 + * The encoded write: whole, aligned units only, compressed here, stored by the
 + * data service. Anything else - an unaligned or partial request, a unit the
 + * service will not take - is handed back to the MDS, so ordinary NFS writes are
@@ -4013,6 +4194,24 @@ index 000000000..0ec2a8f64
 +	    !bc_request_is_pagecache(hdr)) {
 +		atomic_inc(&bc_stat_write_declined);
 +		atomic_inc(&bc_stat_write_declined_notcache);
++		return PNFS_NOT_ATTEMPTED;
++	}
++
++	/*
++	 * Being the file's page cache is necessary but not sufficient: a page
++	 * can be in the mapping and still hold no real data outside what this
++	 * write itself puts there, if nothing has ever read it in. Padding from
++	 * such a page would store whatever memory it happened to contain as the
++	 * file's own bytes - see bc_write_padding_uptodate(). Declining here,
++	 * before any unit is sent, hands the whole request to the MDS, whose
++	 * own read-modify-write goes through the server's page cache and btree
++	 * instead and is always correct; it just forgoes the offload for this
++	 * request, the same trade bc_request_is_pagecache() already makes.
++	 */
++	if ((hdr->args.pgbase || hdr->args.count % bl->unit_align) &&
++	    !bc_write_padding_uptodate(hdr, bl)) {
++		atomic_inc(&bc_stat_write_declined);
++		atomic_inc(&bc_stat_write_declined_notuptodate);
 +		return PNFS_NOT_ATTEMPTED;
 +	}
 +
@@ -4153,6 +4352,9 @@ index 000000000..0ec2a8f64
 +		debugfs_create_atomic_t("write_declined_notcache", 0444,
 +					bc_debugfs_dir,
 +					&bc_stat_write_declined_notcache);
++		debugfs_create_atomic_t("write_declined_notuptodate", 0444,
++					bc_debugfs_dir,
++					&bc_stat_write_declined_notuptodate);
 +		debugfs_create_atomic_t("write_bad_frame", 0444, bc_debugfs_dir,
 +					&bc_stat_write_bad_frame);
 +	debugfs_create_atomic_t("write_declined_align", 0444, bc_debugfs_dir,
@@ -4196,6 +4398,9 @@ index 000000000..0ec2a8f64
 +					&bc_stat_ds_read_err);
 +		debugfs_create_atomic_t("ds_read_ok", 0444, bc_debugfs_dir,
 +					&bc_stat_ds_read_ok);
++		debugfs_create_atomic_t("ds_read_ambiguous_eof", 0444,
++					bc_debugfs_dir,
++					&bc_stat_ds_read_ambiguous_eof);
 +		debugfs_create_u64("ds_read_bytes", 0444, bc_debugfs_dir,
 +				   &bc_ds_read_bytes);
 +		debugfs_create_u64("ds_read_wasted", 0444, bc_debugfs_dir,
@@ -4641,10 +4846,10 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..55439e84e
+index 000000000..ffb01796f
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
-@@ -0,0 +1,1125 @@
+@@ -0,0 +1,1135 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The encoded-extent data service: move a filesystem's compressed, checksummed
@@ -5288,7 +5493,17 @@ index 000000000..55439e84e
 +	ret = f.ops->probe(f.file, args->offset, args->len, &reply->desc);
 +	if (ret && reply->desc.refusal < ENCODED_REFUSAL_NR)
 +		atomic_inc(&ds_refused[reply->desc.refusal]);
-+	if (ret)
++	/*
++	 * Close unconditionally, before any of the remaining failure sites -
++	 * not only on the error path. A probe that succeeds still has nothing
++	 * further to do with the open file (unlike READ, which keeps it open
++	 * across the actual device I/O): encoded_ds_encode_codec() below only
++	 * needs f.ops, which outlives the close. Closing on the error branch
++	 * alone, as an earlier version of this function did, leaked the struct
++	 * file - and the inode it pinned - on every successful probe; nothing
++	 * but dsprobe(1) calls PROBE today, but a leaked reference per probe
++	 * would still wedge unmount.
++	 */
 +	encoded_ds_close(&f);
 +	if (ret)
 +		goto out_err;

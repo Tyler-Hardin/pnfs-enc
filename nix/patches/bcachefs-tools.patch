@@ -410,7 +410,7 @@ index 6f079d191..a756100a7 100644
  	for_each_set_bit(i, devs.d, BCH_SB_MEMBERS_MAX) {
  		if (bch2_dev_list_has_dev(*devs_have, i))
 diff --git a/fs/data/write.c b/fs/data/write.c
-index 2b221c573..1a5f13e28 100644
+index 2b221c573..9d971355c 100644
 --- a/fs/data/write.c
 +++ b/fs/data/write.c
 @@ -1573,11 +1573,19 @@ static void init_append_extent(struct bch_write_op *op,
@@ -435,23 +435,48 @@ index 2b221c573..1a5f13e28 100644
  	e->k.bversion	= version;
  
  	if (crc.csum_type ||
-@@ -1762,8 +1770,13 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
+@@ -1762,8 +1770,38 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
  
  	BUG_ON(bio_sectors(bio) != op->crc.compressed_size);
  
 -	/* Can we just write the entire extent as is? */
 -	if (op->crc.uncompressed_size == op->crc.live_size &&
 +	/*
-+	 * Can we just write the entire extent as is? The live range has to fit
-+	 * inside the frame - it may be shorter, when the frame carries dead
-+	 * bytes ahead of it, but it may not run past it.
++	 * Can we just write the entire extent as is?
++	 *
++	 * BCH_WRITE_encoded_only - the encoded-extent serving path - may say
++	 * yes when the live range is only a *prefix* of the frame: an
++	 * encoded write's key stops where the request's data stopped, which
++	 * can be short of the frame's own length (see
++	 * encoded_extent_unit_geometry()), and copying that trimmed key
++	 * as-is rather than decompressing is the entire point of
++	 * BCH_WRITE_encoded_only - decompressing here would be the server
++	 * doing the codec work this path exists to avoid.
++	 *
++	 * Every other caller - chiefly the move path (rebalance, copygc,
++	 * backpointer fsck repair; fs/data/update.c), which also sets
++	 * BCH_WRITE_data_encoded but never BCH_WRITE_encoded_only - keeps the
++	 * original, stricter requirement that the live range be the *whole*
++	 * frame. A key can already be shorter than its frame by the time the
++	 * move path reads it (an encoded write's key, trimmed again by a
++	 * later write into part of it), and for that path the dead space is
++	 * not something to perpetuate: falling through below decompresses
++	 * and recompresses it, which is what reclaims the space a trimmed
++	 * frame wastes. Loosening this gate for every data_encoded caller
++	 * once meant no trimmed encoded extent was ever recompacted by
++	 * rebalance or copygc again - every unit this workload writes is a
++	 * partial frame by construction (the padding described above), so
++	 * that quietly turned into permanent space amplification rather than
++	 * a one-off.
 +	 */
 +	if (op->crc.live_size &&
-+	    op->crc.offset + op->crc.live_size <= op->crc.uncompressed_size &&
++	    ((op->flags & BCH_WRITE_encoded_only)
++	     ? op->crc.offset + op->crc.live_size <= op->crc.uncompressed_size
++	     : op->crc.live_size == op->crc.uncompressed_size) &&
  	    op->crc.uncompressed_size <= c->opts.encoded_extent_max >> 9 &&
  	    op->crc.compressed_size <= wp->sectors_free &&
  	    (bch2_csum_type_is_encryption(op->crc.csum_type) ==
-@@ -1814,6 +1827,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
+@@ -1814,6 +1852,20 @@ static noinline int bch2_write_prep_encoded_data(struct bch_write_op *op, struct
  		return bch_err_throw(c, write_encoded_as_is);
  	}
  
@@ -472,7 +497,7 @@ index 2b221c573..1a5f13e28 100644
  	/*
  	 * If the data is compressed and we couldn't write the entire extent as
  	 * is, we have to decompress it:
-@@ -2546,8 +2573,18 @@ again:
+@@ -2546,8 +2598,18 @@ again:
  						  op->watermark,
  						  op->flags,
  						  !io_in_flight ? &op->cl : NULL);
@@ -492,7 +517,7 @@ index 2b221c573..1a5f13e28 100644
  			int ret2 = PTR_ERR_OR_ZERO(req) ?:
  			bch2_alloc_sectors_req(trans, req, op->write_point, &wp);
  
-@@ -2773,7 +2810,16 @@ CLOSURE_CALLBACK(bch2_write)
+@@ -2773,7 +2835,16 @@ CLOSURE_CALLBACK(bch2_write)
  	data_len = min_t(u64, bio->bi_iter.bi_size,
  			 op->new_i_size - (op->pos.offset << 9));
  
@@ -539,10 +564,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..ac43a82f6
+index 000000000..e7a38d45a
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1175 @@
+@@ -0,0 +1,1286 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -671,6 +696,100 @@ index 000000000..ac43a82f6
 +/* ------------------------------------------------------------- the lookup -- */
 +
 +/*
++ * Validate one pointer's crc against what this path requires, and fill in the
++ * parts of @out that describe it: not the reflink/hole/direct-data checks,
++ * which are about the *key*, the same for every pointer it has, but everything
++ * that is a property of the pointer bch2_bkey_pick_read_device() actually
++ * picked - compression, checksum, encryption, size.
++ *
++ * Shared between __bch2_encoded_find(), which calls this once to validate the
++ * pointer it will ask the read path to use, and bch2_encoded_read_unit(),
++ * which calls it again after the read completes: bch2_read_extent() picks its
++ * own pointer internally and may not agree with the first pick when an extent
++ * has more than one - narrow_crcs rewrites one pointer's crc in place, and a
++ * promoted or rebalanced replica can carry different compression or checksum
++ * types for the same live range. A descriptor built from the lookup's pick but
++ * a payload read via a different one would describe bytes that are not the
++ * ones the peer is about to receive, silently: not a wrong checksum (the
++ * payload is genuinely valid for *its own* crc), but the wrong codec, or the
++ * wrong frame length, for what is actually on the wire. Validating again
++ * against the pointer that was actually read is what catches that - and
++ * because it is the same code both times, a crc neither call would have
++ * accepted is refused identically wherever it turns up.
++ */
++static int bch2_encoded_unit_from_crc(struct bch_fs *c,
++				      struct bch_extent_crc_unpacked crc,
++				      u64 key_size, struct bch_encoded_unit *out)
++{
++	u64 unit_len, plain_offset, payload_len;
++
++	if (bch2_csum_type_is_encryption(crc.csum_type)) {
++		out->refusal = ENCODED_REFUSAL_ENCRYPTED;
++		return bch_err_throw(c, encoded_encrypted);
++	}
++
++	if (!bch2_checksum_type_valid(c, crc.csum_type)) {
++		out->refusal = ENCODED_REFUSAL_CSUM_INVALID;
++		return bch_err_throw(c, encoded_metadata_invalid);
++	}
++
++	/*
++	 * An extent stored without a codec has no codec work to offload: the
++	 * peer would be decoding plaintext. This is the same answer read gives,
++	 * and it is why a probe never sends a caller looking for a codec it
++	 * cannot use.
++	 */
++	if (!crc_is_compressed(crc)) {
++		out->refusal = ENCODED_REFUSAL_NOT_COMPRESSED;
++		return bch_err_throw(c, encoded_no_extent);
++	}
++
++	/*
++	 * A unit is described by its live range, not by its frame.
++	 *
++	 * The frame was written for a range of some length and the key is what
++	 * says how much of it still belongs to the file: a later write over the
++	 * extent trims or splits the key and cannot change the frame, so
++	 * uncompressed_size - the frame's plaintext length - keeps describing
++	 * bytes the key no longer owns, and crc.offset says how far into that
++	 * plaintext the live part begins. live_size is the key's size (see
++	 * bch2_extent_crc_unpack), so it is what can be handed out. The two
++	 * answer different questions - where the live range starts inside the
++	 * frame, and how long it is - and a description that gets either wrong
++	 * hands a peer bytes that are not the file's.
++	 *
++	 * A peer decodes from the frame's start, so how far it has to decode to
++	 * reach the live end is what has to fit the wire's ceiling.
++	 */
++	unit_len	= (u64) crc.live_size << 9;
++	plain_offset	= (u64) crc.offset << 9;
++	payload_len	= (u64) crc.compressed_size << 9;
++
++	if (plain_offset + unit_len > c->opts.encoded_extent_max ||
++	    payload_len > c->opts.encoded_extent_max) {
++		out->refusal = ENCODED_REFUSAL_TOO_LARGE;
++		return bch_err_throw(c, encoded_bad_size);
++	}
++
++	/*
++	 * live_size is the key's size by construction, so this cannot fire
++	 * today; it is here because everything else follows from it, and a
++	 * change that broke it would otherwise hand out a length the key does
++	 * not back.
++	 */
++	if (unit_len != key_size << 9)
++		return bch_err_throw(c, encoded_bad_size);
++
++	out->crc = crc;
++	/*
++	 * The unit's length is the live one, so the accessor everything
++	 * downstream uses reports that and not the frame's.
++	 */
++	out->crc.uncompressed_size = unit_len >> 9;
++	return 0;
++}
++
++/*
 + * Find the encoded extent covering @offset and describe it. @sk is filled with
 + * a reassembled copy of the key and @k_out points into it, because the caller's
 + * read needs a key that outlives the iterator.
@@ -688,7 +807,6 @@ index 000000000..ac43a82f6
 +	struct bch_fs *c = trans->c;
 +	struct extent_ptr_decoded pick;
 +	struct bkey_s_c k;
-+	u64 unit_len, plain_offset, payload_len;
 +	u32 snapshot;
 +	int ret;
 +
@@ -743,71 +861,12 @@ index 000000000..ac43a82f6
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
-+	if (bch2_csum_type_is_encryption(pick.crc.csum_type)) {
-+		out->refusal = ENCODED_REFUSAL_ENCRYPTED;
-+		return bch_err_throw(c, encoded_encrypted);
-+	}
-+
-+	if (!bch2_checksum_type_valid(c, pick.crc.csum_type)) {
-+		out->refusal = ENCODED_REFUSAL_CSUM_INVALID;
-+		return bch_err_throw(c, encoded_metadata_invalid);
-+	}
-+
-+	/*
-+	 * An extent stored without a codec has no codec work to offload: the
-+	 * peer would be decoding plaintext. This is the same answer read gives,
-+	 * and it is why a probe never sends a caller looking for a codec it
-+	 * cannot use.
-+	 */
-+	if (!crc_is_compressed(pick.crc)) {
-+		out->refusal = ENCODED_REFUSAL_NOT_COMPRESSED;
-+		return bch_err_throw(c, encoded_no_extent);
-+	}
-+
-+	/*
-+	 * A unit is described by its live range, not by its frame.
-+	 *
-+	 * The frame was written for a range of some length and the key is what
-+	 * says how much of it still belongs to the file: a later write over the
-+	 * extent trims or splits the key and cannot change the frame, so
-+	 * uncompressed_size - the frame's plaintext length - keeps describing
-+	 * bytes the key no longer owns, and crc.offset says how far into that
-+	 * plaintext the live part begins. live_size is the key's size (see
-+	 * bch2_extent_crc_unpack), so it is what can be handed out. The two
-+	 * answer different questions - where the live range starts inside the
-+	 * frame, and how long it is - and a description that gets either wrong
-+	 * hands a peer bytes that are not the file's.
-+	 *
-+	 * A peer decodes from the frame's start, so how far it has to decode to
-+	 * reach the live end is what has to fit the wire's ceiling.
-+	 */
-+	unit_len	= (u64) pick.crc.live_size << 9;
-+	plain_offset	= (u64) pick.crc.offset << 9;
-+	payload_len	= (u64) pick.crc.compressed_size << 9;
-+
-+	if (plain_offset + unit_len > c->opts.encoded_extent_max ||
-+	    payload_len > c->opts.encoded_extent_max) {
-+		out->refusal = ENCODED_REFUSAL_TOO_LARGE;
-+		return bch_err_throw(c, encoded_bad_size);
-+	}
-+
-+	/*
-+	 * live_size is the key's size by construction, so this cannot fire
-+	 * today; it is here because everything else follows from it, and a
-+	 * change that broke it would otherwise hand out a length the key does
-+	 * not back.
-+	 */
-+	if (unit_len != (u64) k.k->size << 9)
-+		return bch_err_throw(c, encoded_bad_size);
++	ret = bch2_encoded_unit_from_crc(c, pick.crc, k.k->size, out);
++	if (ret)
++		return ret;
 +
 +	*offset_into_extent	= iter.pos.offset - bkey_start_offset(k.k);
 +	out->logical_offset	= bkey_start_offset(k.k) << 9;
-+	out->crc		= pick.crc;
-+	/*
-+	 * The unit's length is the live one, so the accessor everything
-+	 * downstream uses reports that and not the frame's.
-+	 */
-+	out->crc.uncompressed_size = unit_len >> 9;
 +	*k_out			= k;
 +	return 0;
 +}
@@ -931,6 +990,29 @@ index 000000000..ac43a82f6
 +	}
 +
 +	/*
++	 * __bch2_encoded_find() validated the pointer it picked and filled
++	 * @out from it, but bch2_read_extent() (inside __bch2_encoded_read())
++	 * picks again, independently, and an extent with more than one pointer
++	 * can have the two disagree: narrow_crcs rewrites a single pointer's
++	 * crc in place, and a promoted or differently-recompressed replica can
++	 * carry its own compression and checksum type for the same live range.
++	 * rbio->pick is what bch2_read_extent() actually used - the device the
++	 * bytes in @bio came from - so the descriptor has to describe *that*
++	 * pick, re-validated the same way the first one was: a crc the lookup
++	 * would have refused must be refused here too, not handed to a peer
++	 * because an earlier, different pointer happened to pass.
++	 *
++	 * out->crc.uncompressed_size already carries the key's live size
++	 * (bch2_encoded_unit_from_crc() set it from k.k->size, which is a
++	 * property of the key and the same for every pointer it has), so it is
++	 * what this second validation checks the actual pick against.
++	 */
++	ret = bch2_encoded_unit_from_crc(c, rbio->pick.crc,
++					 out->crc.uncompressed_size, out);
++	if (ret)
++		goto err;
++
++	/*
 +	 * The read path sized the bio to the payload, so it holds exactly
 +	 * crc.compressed_size sectors - nothing to trim.
 +	 */
@@ -978,48 +1060,102 @@ index 000000000..ac43a82f6
 +}
 +
 +/*
-+ * A POSIX write updates mtime and ctime; the local path gets that from
-+ * file_modified(), and a serving path that never goes through the VFS has to
-+ * do it here.
++ * bch2_write_inode()'s set-fn for an encoded write: bump mtime/ctime, and grow
++ * bi_size in the btree if the request reached past it. @p is the request's own
++ * end offset (req_offset + req_len), not the frame's: see the caller.
++ */
++static int bch2_encoded_write_set_fn(struct btree_trans *trans,
++				     struct bch_inode_info *inode,
++				     struct bch_inode_unpacked *bi,
++				     void *p)
++{
++	struct bch_fs *c = trans->c;
++	u64 req_end = *(u64 *)p;
++	u64 now = bch2_current_time(c);
++
++	bi->bi_mtime = now;
++	bi->bi_ctime = now;
++	if (req_end > bi->bi_size)
++		bi->bi_size = req_end;
++
++	return 0;
++}
++
++/*
++ * A POSIX write updates mtime, ctime and - when it extends the file - i_size;
++ * the local path gets that from file_modified() plus the buffered/direct
++ * write's own i_size_write(), and a serving path that never goes through the
++ * VFS write path has to do it here.
 + *
-+ * This is not cosmetic, and what it is for is worth being precise about: this
-+ * filesystem publishes no change cookie (it has no fetch_iversion and sets no
-+ * SB_I_VERSION), so nfsd's change_attribute is derived from the *ctime of the
-+ * VFS inode* - and a write that only touches the btree never moves it. Without
-+ * this the file does not look written to anyone who asks: a second client's
-+ * close-to-open check sees the same attributes and keeps serving what it had
-+ * cached, and so does a local reader. Bumping the times writes the inode key,
-+ * which also advances bi_journal_seq - the sequence an fsync checks.
++ * The times are not cosmetic, and what they are for is worth being precise
++ * about: this filesystem publishes no change cookie (it has no fetch_iversion
++ * and sets no SB_I_VERSION), so nfsd's change_attribute is derived from the
++ * *ctime of the VFS inode* - and a write that only touches the btree never
++ * moves it. Without this the file does not look written to anyone who asks: a
++ * second client's close-to-open check sees the same attributes and keeps
++ * serving what it had cached, and so does a local reader. Bumping the times
++ * writes the inode key, which also advances bi_journal_seq - the sequence an
++ * fsync checks.
 + *
-+ * bch2_inode_write() only updates the btree, so the in-memory inode is carried
-+ * along afterwards the same way bch2_write_inode() does it: one mechanism, and
-+ * it keeps ei_inode from going stale, which would let a later inode write put
-+ * the old size and times back.
++ * The size is handled separately from, and more carefully than, the rest of
++ * what bch2_inode_update_after_write() carries back to the VFS inode.
++ * bch2_write_inode() calls update_after_write() with the same @fields this
++ * passes to bch2_write_inode() itself, and VFS ATTR_SIZE there means
++ * "i_size_write(bi_size)" unconditionally (bch2_inode_update_after_write(),
++ * fs/vfs/fs.c) - correct for truncate/setattr, which hold i_rwsem and the
++ * pagecache block across the whole call, but not here.
++ *
++ * This path takes neither lock: it only holds bch2_pagecache_block(), which
++ * keeps a *buffered writer* from re-dirtying the unit's own range underneath
++ * the invalidation, but does nothing about a buffered write to a *different*
++ * range of the same file completing concurrently. bcachefs's own buffered
++ * write extends the VFS i_size the moment it copies into the page cache
++ * (fs/vfs/buffered.c, well before the btree catches up at writeback), so the
++ * VFS i_size legitimately runs ahead of bi_size whenever there is dirty data
++ * past what the btree has committed. Passing ATTR_SIZE through here would
++ * call i_size_write(bi_size) and pull the VFS size back down to this write's
++ * own range - behind an MDS write that has already extended it, and ahead of
++ * that MDS write's own dirty pages being written back.
++ *
++ * That clobber is not merely cosmetic either: bcachefs's writepage zeroes and
++ * undirties whatever is past i_size on every single writepage call, because a
++ * folio straddling i_size may be mmapped (fs/vfs/buffered.c). So the VFS size
++ * briefly reading low is not the bug by itself - a GETATTR racing the clobber
++ * would see a short size and nothing more - the bug is that it is also wrong
++ * at the moment writeback visits the dirty tail folio, which then discards
++ * exactly the bytes an MDS write had just placed there. A client whose writes
++ * interleave an MDS fallback (the file's unaligned tail, declined up front)
++ * with data-service writes for earlier, aligned ranges - which is the common
++ * shape, not a rare one, since the MDS write is issued immediately and the
++ * data-service write is queued behind a client-side compress - sees its own
++ * tail silently truncated back to the last encoded unit.
++ *
++ * So: never pass ATTR_SIZE to update_after_write from here. Grow bi_size in
++ * the btree (never shrink: a write in the middle of a file must not truncate
++ * it), and separately grow the VFS i_size under i_lock exactly the way
++ * bch2_dio_write_end() does for a write that also bypasses the page cache -
++ * max(current, request's end), which cannot regress a VFS size an MDS write
++ * already pushed further out, and costs nothing when this write is not the
++ * one extending the file.
 + */
 +static int bch2_encoded_write_times_update(struct bch_fs *c,
-+					   struct bch_inode_info *inode)
++					   struct bch_inode_info *inode,
++					   u64 req_offset, u64 req_len)
 +{
-+	subvol_inum inum = inode_inum(inode);
-+	CLASS(btree_trans, trans)(c);
++	u64 req_end = req_offset + req_len;
++	int ret;
 +
-+	return commit_do(trans, NULL, NULL, 0, ({
-+		struct bch_inode_unpacked inode_u;
-+		CLASS(btree_iter, iter)(trans, BTREE_ID_inodes,
-+					POS(0, inum.inum), BTREE_ITER_intent);
-+		u64 now = bch2_current_time(c);
-+		int ret = bch2_inode_peek(trans, &iter, &inode_u, inum,
-+					  BTREE_ITER_intent);
++	guard(mutex)(&inode->ei_update_lock);
++	ret = bch2_write_inode(c, inode, bch2_encoded_write_set_fn, &req_end,
++			       ATTR_MTIME|ATTR_CTIME);
++	if (ret)
++		return ret;
 +
-+		if (!ret) {
-+			inode_u.bi_mtime = now;
-+			inode_u.bi_ctime = now;
-+			ret = bch2_inode_write(trans, &iter, &inode_u);
-+		}
-+		if (!ret)
-+			bch2_inode_update_after_write(trans, inode, &inode_u,
-+					ATTR_SIZE|ATTR_MTIME|ATTR_CTIME);
-+		ret;
-+	}));
++	guard(spinlock)(&inode->v.i_lock);
++	if (req_end > inode->v.i_size)
++		i_size_write(&inode->v, req_end);
++
++	return 0;
 +}
 +
 +/*
@@ -1285,7 +1421,7 @@ index 000000000..ac43a82f6
 +		ret = bch2_err_class(op->error);
 +
 +	if (!ret)
-+		ret = bch2_encoded_write_times_update(c, inode);
++		ret = bch2_encoded_write_times_update(c, inode, req_offset, req_len);
 +err:
 +	bch2_disk_reservation_put(c, &op->res);
 +	bch2_bio_free_pages_pool(c, bio);

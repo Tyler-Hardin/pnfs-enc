@@ -174,6 +174,24 @@ let
     '';
   };
 
+  # Two deterministic regressions (see sizeclobber.c): an encoded write's size
+  # update clobbering the VFS i_size back down underneath a dirty, unsynced
+  # tail from an earlier write (`clobber`), and a sub-sector write padding
+  # itself from a page that was never read in and so is not uptodate
+  # (`padding`). Both are single-process sequences with no race window to
+  # lose, unlike the interleaved-writer shape closeopen.c's chunked/twophase
+  # arms need to catch the same class of bug statistically.
+  sizeclobber = pkgs.stdenv.mkDerivation {
+    name = "sizeclobber";
+    dontUnpack = true;
+    buildPhase = ''
+      $CC -O2 -Wall -o sizeclobber ${../sizeclobber.c}
+    '';
+    installPhase = ''
+      install -Dm755 sizeclobber $out/bin/sizeclobber
+    '';
+  };
+
   common = { pkgs, ... }: {
     imports = [ ./emulation.nix ./corpus.nix ./client.nix ];
 
@@ -191,7 +209,7 @@ let
     # it needs the module only as a codec provider, and loading it on demand
     # when a layout names "bcachefs-zstd" is itself being tested.
     boot.extraModulePackages = [ bcachefsModule ];
-    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen randwr mmapwrite pkgs.nftables pkgs.fio
+    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen randwr mmapwrite sizeclobber pkgs.nftables pkgs.fio
       # fsx is not in the xfstests package's bin/, and it is the whole reason
       # for having it: random reads, writes, overwrites and truncates with
       # every read verified, and -f dropping the cache after each operation so
@@ -2207,6 +2225,47 @@ pkgs.testers.nixosTest {
             "timeout 300 closeopen /mnt/self/c.bin 152135 20 chunked:152073 "
             "/mnt/selfb/c.bin 2>&1")
         server.log("same-host chunked idle: rc=%d %s" % (rcC, outC.strip()))
+
+        # The two regressions sizeclobber.c reproduces without any race (see
+        # that file's own comment): an encoded write's size update clobbering
+        # a dirty, unsynced tail back down to the last settled size, and a
+        # sub-sector write padding itself from a page it never read in. Each
+        # is a single deterministic sequence, unlike chunked/twophase above,
+        # which lean on a flusher's timing to hit the same class of bug
+        # statistically - these are the targeted regression tests for the
+        # shapes those found.
+        #
+        # unit=262144 is this export's encoded_extent_max (the default), so
+        # the settled body and the overwrite are both whole encoded units -
+        # eligible for the data-service write path, which is the only path
+        # with a size update to clobber anything with.
+        wokC0 = dcnt("ds_write_ok")
+        rcSC, outSC = server.execute(
+            "timeout 60 sizeclobber clobber /mnt/self/sc.bin 262144 2 4096 2>&1")
+        wokC1 = dcnt("ds_write_ok")
+        server.log("same-host sizeclobber clobber: rc=%d ds_write_ok %d->%d: %s" %
+                   (rcSC, wokC0, wokC1, outSC.strip()))
+        assert rcSC == 0, \
+            "sizeclobber clobber failed: %s" % outSC.strip()
+        assert wokC1 > wokC0, \
+            "sizeclobber clobber: no encoded write was served (ds_write_ok %d->%d)" % (
+                wokC0, wokC1)
+
+        # 155655 = 152135 + 7520: an arbitrary length that is not a multiple
+        # of 512 (the guard inside sizeclobber.c insists on this), read back
+        # through the second mount so a client-cache-served read cannot hide
+        # a server-side padding bug the way it hid the clobber above (which
+        # reads back through the same mount on purpose: the clobbered size is
+        # wrong everywhere, including locally, which is the point).
+        rcSP, outSP = server.execute(
+            "timeout 60 sizeclobber padding /mnt/self/sp.bin 155655 "
+            "/mnt/selfb/sp.bin 2>&1")
+        server.log("same-host sizeclobber padding: rc=%d %s" %
+                   (rcSP, outSP.strip()))
+        assert rcSP == 0, (
+            "sizeclobber padding failed (sub-sector write read back wrong - "
+            "see bc_write_padding_uptodate()): %s" % outSP.strip())
+
         # The deployment's failing shape, at the deployment's size: an ~81MB
         # file written the way the application writes it - kilobyte chunks with
         # time between them, so the flusher runs throughout - then renamed and
