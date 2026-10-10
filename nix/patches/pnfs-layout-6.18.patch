@@ -2168,10 +2168,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..46fffd5a3
+index 000000000..ed5000acb
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1810 @@
+@@ -0,0 +1,1866 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2895,14 +2895,22 @@ index 000000000..46fffd5a3
 +}
 +
 +/* The reverse: the request's bytes, in order, into a linear buffer. */
-+static void
++static size_t
 +bc_copy_from_pages(struct nfs_pgio_header *hdr, size_t skip, void *dst,
 +		   size_t len)
 +{
 +	unsigned int pgindex = (hdr->args.pgbase + skip) >> PAGE_SHIFT;
 +	unsigned int pgoff = (hdr->args.pgbase + skip) & (PAGE_SIZE - 1);
 +
-+	while (len) {
++	/*
++	 * The request's pages cover the request and stop there. A caller that
++	 * asks for more than that is asking for bytes this write does not own
++	 * and has no page for, and walking past the end of the array reads
++	 * whatever follows it - so the loop stops at the array's end and
++	 * reports how much it actually filled. Callers that need the whole
++	 * length check it.
++	 */
++	while (len && pgindex < hdr->page_array.npages) {
 +		struct page *page = hdr->args.pages[pgindex];
 +		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
 +
@@ -2912,6 +2920,54 @@ index 000000000..46fffd5a3
 +		pgoff = 0;
 +		pgindex++;
 +	}
++	return len;
++}
++
++/*
++ * Fill a range of a unit that the request does not cover with the bytes the
++ * file actually has there.
++ *
++ * A unit is block-aligned at both ends, so the last one reaches past the write
++ * that produced it and picks up whatever the file already held beyond it. That
++ * part is inside the key - it has to be, because the payload is padded out to
++ * the block and a key shorter than the payload it describes is not a legal
++ * extent - so it cannot be left as whatever was lying around: anything but the
++ * file's own bytes is written over the file's own bytes.
++ *
++ * The request's pages stop at the request, so past that the file has to be
++ * read from the page cache this write is against. Those pages hold what the
++ * file has, they are usually already resident because this is a writeback, and
++ * past the end of the file there is nothing to read and a gap is owed zeros.
++ */
++static int
++bc_fill_from_inode(struct nfs_pgio_header *hdr, u64 off, void *dst, size_t len)
++{
++	struct address_space *mapping = hdr->inode->i_mapping;
++	u64 eof = i_size_read(hdr->inode);
++
++	while (len) {
++		pgoff_t index = off >> PAGE_SHIFT;
++		size_t pgoff = off & (PAGE_SIZE - 1);
++		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
++		struct folio *folio;
++
++		if (off >= eof) {
++			memset(dst, 0, n);
++			goto next;
++		}
++
++		folio = read_mapping_folio(mapping, index, NULL);
++		if (IS_ERR(folio))
++			return PTR_ERR(folio);
++
++		memcpy_from_folio(dst, folio, offset_in_folio(folio, off), n);
++		folio_put(folio);
++next:
++		dst += n;
++		off += n;
++		len -= n;
++	}
++	return 0;
 +}
 +
 +/* ------------------------------------------------------------ the read -- */
@@ -3602,15 +3658,15 @@ index 000000000..46fffd5a3
 +			u64 eof = i_size_read(io->hdr->inode);
 +			size_t n = unit_len - span;
 +
-+			if (unit_off + span < eof) {
-+				size_t have = min_t(size_t, n,
-+						    eof - (unit_off + span));
++			int err = bc_fill_from_inode(io->hdr,
++						     unit_off + span,
++						     pad->buf + span, n);
 +
-+				bc_copy_from_pages(io->hdr, done + io->unit,
-+						   pad->buf + span, have);
-+				memset(pad->buf + span + have, 0, n - have);
-+			} else {
-+				memset(pad->buf + span, 0, n);
++			if (err) {
++				bc_write_unit_free(u);
++				bc_write_unit_free(pad);
++				bc_write_finish(io, err);
++				return;
 +			}
 +		}
 +		src = (struct encoded_extent_pages) {
