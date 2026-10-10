@@ -20,7 +20,14 @@
 #include <rpc/rpc.h>
 
 #define ENCODED_DS_PROGRAM	0x2000BC01u
-#define ENCODED_DS_VERSION	2
+/*
+ * Must track ENCODED_DS_VERSION in include/linux/encoded_extent_ds.h. It is
+ * copied rather than included because that header is a kernel header - it wants
+ * linux/types.h and sunrpc's XDR_QUADLEN - and this is a plain userspace
+ * program. A version mismatch is not silent: the service refuses the version
+ * and this fails, which is what it is for.
+ */
+#define ENCODED_DS_VERSION	3
 #define ENCODED_DS_NULL		0
 
 static void usage(void)

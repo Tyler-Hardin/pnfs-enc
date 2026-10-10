@@ -539,10 +539,10 @@ index b0dc9839e..9e16cda0b 100644
  
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..a393d072d
+index 000000000..ac43a82f6
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,1140 @@
+@@ -0,0 +1,1175 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded-extent serving for bcachefs.
@@ -880,7 +880,7 @@ index 000000000..a393d072d
 +	DECLARE_COMPLETION_ONSTACK(done);
 +	int ret;
 +
-+	if (offset & (512 - 1))
++	if (offset & (ENCODED_EXTENT_SECTOR_SIZE - 1))
 +		return bch_err_throw(c, encoded_bad_size);
 +
 +	/*
@@ -909,7 +909,7 @@ index 000000000..a393d072d
 +	rbio->bio.bi_private		= &done;
 +	rbio->bio.bi_iter.bi_sector	= offset >> 9;
 +
-+	bch2_bio_alloc_pages_pool(c, &rbio->bio, 512, bytes,
++	bch2_bio_alloc_pages_pool(c, &rbio->bio, ENCODED_EXTENT_SECTOR_SIZE, bytes,
 +				  GFP_NOIO|__GFP_SKIP_ZERO);
 +
 +	/*
@@ -1030,8 +1030,9 @@ index 000000000..a393d072d
 + */
 +static int bch2_encoded_write_unit(struct bch_fs *c,
 +				   struct bch_inode_info *inode,
-+				   u64 offset, const void *data, size_t len,
-+				   const struct encoded_extent_desc *desc)
++				   u64 req_offset, u64 req_len,
++				   const void *data, size_t len,
++				   const struct encoded_extent_write_desc *desc)
 +{
 +	subvol_inum inum = inode_inum(inode);
 +	struct bch_inode_unpacked inode_u;
@@ -1045,38 +1046,35 @@ index 000000000..a393d072d
 +	u8 want_csum;
 +	unsigned nr_vecs;
 +	size_t padded_len;
++	u64 unencoded_offset, valid_len;
 +	int ret;
 +
 +	/*
-+	 * A whole, block-aligned unit only, and the descriptor has to describe
-+	 * the range being written: a payload packed against a different offset
-+	 * or unit length would be indexed as something it is not. Refusing
-+	 * rather than clamping keeps the two ends agreeing about what happened.
++	 * What is being stored is a whole, block-aligned frame, and the request
++	 * range it is for has to be inside it.
 +	 *
-+	 * unencoded_offset is where the file's data starts inside the unit. It
-+	 * is not necessarily zero: a unit begins on a block, and a request that
-+	 * begins part way into one is padded at the front, but the key covers
-+	 * only what the write owns, so it starts at the request's sector with
-+	 * everything before that dead. It has to be sector-aligned to be sayable
-+	 * in a key and to leave a live range the length of a whole number of
-+	 * sectors.
-+	 *
-+	 * The payload length itself is the codec's business, not a fixed length:
-+	 * a peer's frame carries its own exact length inside it, so it is padded
-+	 * to the filesystem's block size below, exactly as the local encoder
-+	 * does (data/compress.c). The padding is invisible to the decoder and
-+	 * the checksum covers the padded unit on both sides.
++	 * The frame is a whole number of blocks - that is the granule a key's
++	 * lengths are in - so it reaches past the request at either end. Which
++	 * of those bytes are the file's is what @req_offset/@req_len say, and
++	 * they are the only place that says it: the geometry the key needs is
++	 * derived from the two halves of the call together
++	 * (encoded_extent_unit_geometry()), so there is one computation of it
++	 * rather than two that have to be kept in step. A key that names bytes
++	 * the peer never sent is invisible everywhere else, and the write
++	 * succeeds with the wrong bytes being the file's.
 +	 */
-+	if (!len || (offset & (block_bytes(c) - 1)) ||
++	if (!encoded_extent_range_valid(req_offset, req_len, desc) ||
++	    !len || !req_len ||
++	    (desc->unit_offset & (block_bytes(c) - 1)) ||
 +	    (desc->unit_len & (block_bytes(c) - 1)) ||
-+	    (desc->unencoded_offset & (512 - 1)) ||
-+	    desc->unencoded_offset >= desc->unit_len ||
-+	    desc->plain_offset ||
-+	    offset != desc->unit_offset ||
 +	    desc->unit_len > c->opts.encoded_extent_max ||
-+	    desc->valid_len > desc->unit_len) {
++	    req_offset > MAX_LFS_FILESIZE ||
++	    req_len > MAX_LFS_FILESIZE - req_offset) {
 +		return bch_err_throw(c, encoded_bad_size);
 +	}
++
++	encoded_extent_unit_geometry(req_offset, req_len, desc,
++				     &unencoded_offset, &valid_len);
 +
 +	/*
 +	 * A codec that did not shrink the unit has nothing to offload, and a
@@ -1107,9 +1105,6 @@ index 000000000..a393d072d
 +		return bch_err_throw(c, encoded_no_extent);
 +	}
 +
-+	if (offset > MAX_LFS_FILESIZE || desc->unit_len > MAX_LFS_FILESIZE - offset)
-+		return bch_err_throw(c, encoded_bad_size);
-+
 +	bch2_inode_opts_get_inode(c, &inode_u, &io_opts);
 +
 +	/*
@@ -1135,16 +1130,32 @@ index 000000000..a393d072d
 +	crc.compression_type	= desc->compression;
 +	crc.compressed_size	= padded_len >> 9;
 +	/*
-+	 * The key is the frame, including any padding: bch2_write_prep_
-+	 * encoded_data() will only store the payload as it stands when
-+	 * uncompressed_size and live_size agree, and a payload that is
-+	 * recompressed as though it were plaintext is stored as itself. What
-+	 * keeps the padding from being the file's data is the inode's size,
-+	 * which the write op takes from valid_len rather than from here.
++	 * The frame is the whole unit; the key is only the sectors the request
++	 * owns.
++	 *
++	 * The frame has to be desc->unit_len bytes of plaintext: that is what
++	 * the codec produced and what uncompressed_size has to say for any
++	 * reader, local or peer, to decode it. Nothing says the *key* has to
++	 * cover all of it. The request's data ends at valid_len, so the key
++	 * ends at the request's last sector: crc.offset is where the file's
++	 * bytes begin inside the frame and live_size is how many the file
++	 * owns. Ending the key with the data is what stops a write from
++	 * reaching into pages it was never given - whatever the client put in
++	 * the frame past that point (and it has to put something there) is
++	 * dead, and a later write to those bytes trims or replaces a key that
++	 * stops where the data does rather than one that reaches over it.
++	 *
++	 * live_size rounds up to a sector because a key's lengths are in
++	 * sectors: at most 511 bytes of the request's last sector are named
++	 * that the request did not itself carry, and filling exactly those
++	 * from the file is what the client is told to do. It can never exceed
++	 * uncompressed_size - unit_len is block aligned (checked above), so a
++	 * valid_len at or below it rounds up to at most unit_len.
 +	 */
 +	crc.uncompressed_size	= desc->unit_len >> 9;
-+	crc.live_size		= (desc->unit_len - desc->unencoded_offset) >> 9;
-+	crc.offset		= desc->unencoded_offset >> 9;
++	crc.live_size		= (round_up(valid_len, ENCODED_EXTENT_SECTOR_SIZE) -
++				   unencoded_offset) >> 9;
++	crc.offset		= unencoded_offset >> 9;
 +	crc.nonce		= 0;
 +	crc.csum_type		= want_csum;
 +
@@ -1175,7 +1186,7 @@ index 000000000..a393d072d
 +	bio->bi_iter.bi_size = len;
 +	memcpy_to_bio(bio, bio->bi_iter, data);
 +	bio->bi_iter.bi_size = padded_len;
-+	bio->bi_iter.bi_sector = offset >> 9;
++	bio->bi_iter.bi_sector = desc->unit_offset >> 9;
 +
 +	/* The checksum covers the padded unit, exactly as the reader verifies it. */
 +	nonce = extent_nonce(ZERO_VERSION, crc);
@@ -1216,7 +1227,8 @@ index 000000000..a393d072d
 +	 */
 +	op->write_point		= writepoint_hashed((unsigned long) inode);
 +	op->subvol		= inum.subvol;
-+	op->pos			= POS(inum.inum, (offset + desc->unencoded_offset) >> 9);
++	op->pos			= POS(inum.inum, (desc->unit_offset +
++					       unencoded_offset) >> 9);
 +	/*
 +	 * Never shrink: a write in the middle of a file must not truncate it,
 +	 * and a write past the end must extend it. The unit is block-aligned by
@@ -1224,16 +1236,13 @@ index 000000000..a393d072d
 +	 * path - the payload is packed data, not plaintext.
 +	 */
 +	/*
-+	 * The file's size is the end of the unit's *data*, which is the unit's
-+	 * length only when it was not padded to reach this path's granularity.
-+	 * A unit is described in sectors, so a request whose last byte is not on
-+	 * a block boundary is written padded up and reports how much of it is
-+	 * the file's - taking the padded length here would leave every such file
-+	 * longer than it was written.
++	 * The file's size is where the peer's data ends, which is the frame's
++	 * length only when the request filled a whole block. Taking the frame's
++	 * length here would leave every file written by a partial unit longer
++	 * than it was written.
 +	 */
 +	op->new_i_size		= max_t(u64, inode_u.bi_size,
-+					 offset + (desc->valid_len ?:
-+						   desc->unit_len));
++					 req_offset + req_len);
 +	op->end_io		= bch2_encoded_write_end_io;
 +
 +	ret = bch2_disk_reservation_get(c, &op->res, padded_len >> 9,
@@ -1315,7 +1324,7 @@ index 000000000..a393d072d
 +}
 +
 +static int bch2_encoded_extent_probe(struct file *file, u64 offset, size_t len,
-+				     struct encoded_extent_desc *desc)
++				     struct encoded_extent_read_desc *desc)
 +{
 +	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
 +	struct bch_inode_info *inode = to_bch_ei(file_inode(file));
@@ -1337,7 +1346,6 @@ index 000000000..a393d072d
 +	desc->unit_offset	= unit.logical_offset;
 +	desc->unit_len		= bch2_encoded_unit_len(&unit);
 +	desc->plain_offset	= (u64) unit.crc.offset << 9;
-+	desc->unencoded_offset	= offset - unit.logical_offset;
 +	desc->compression	= unit.crc.compression_type;
 +	desc->encrypted		= false;
 +	return 0;
@@ -1345,7 +1353,7 @@ index 000000000..a393d072d
 +
 +static int bch2_encoded_extent_read(struct file *file, u64 offset, size_t len,
 +				    void *dst, size_t *dst_len,
-+				    struct encoded_extent_desc *desc)
++				    struct encoded_extent_read_desc *desc)
 +{
 +	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
 +	struct bch_inode_info *inode = to_bch_ei(file_inode(file));
@@ -1375,7 +1383,6 @@ index 000000000..a393d072d
 +	desc->unit_offset	= unit.logical_offset;
 +	desc->unit_len		= bch2_encoded_unit_len(&unit);
 +	desc->plain_offset	= (u64) unit.crc.offset << 9;
-+	desc->unencoded_offset	= offset - unit.logical_offset;
 +	desc->compression	= unit.crc.compression_type;
 +	desc->encrypted		= false;
 +	*dst_len = payload_len;
@@ -1387,18 +1394,16 @@ index 000000000..a393d072d
 + * journal, not the disk, which is what the sync that follows settles: see
 + * encoded_extent_sync().
 + */
-+static int bch2_encoded_extent_write(struct file *file, u64 offset,
++static int bch2_encoded_extent_write(struct file *file, u64 req_offset,
++				     u64 req_len,
 +				     const void *src, size_t len,
-+				     const struct encoded_extent_desc *desc,
++				     const struct encoded_extent_write_desc *desc,
 +				     enum encoded_extent_stable how,
 +				     enum encoded_extent_stable *committed)
 +{
 +	struct bch_fs *c = file_inode(file)->i_sb->s_fs_info;
 +	struct bch_inode_info *inode = to_bch_ei(file_inode(file));
 +	int ret;
-+
-+	if (desc->encrypted)
-+		return -ENODATA;
 +
 +	/*
 +	 * The unit is written into the btree, not through the page cache, so
@@ -1412,13 +1417,15 @@ index 000000000..a393d072d
 +	guard(bch2_pagecache_block)(inode);
 +	if (unlikely(inode->v.i_mapping->nrpages)) {
 +		ret = bch2_write_invalidate_inode_pages_range(inode->v.i_mapping,
-+					offset, offset + desc->unit_len - 1);
++					desc->unit_offset,
++					desc->unit_offset + desc->unit_len - 1);
 +		if (ret)
 +			return ret;
 +	}
 +
 +	ret = bch2_encoded_err(
-+		bch2_encoded_write_unit(c, inode, offset, src, len, desc));
++		bch2_encoded_write_unit(c, inode, req_offset, req_len, src, len,
++					desc));
 +	if (ret)
 +		return ret;
 +
@@ -1630,12 +1637,40 @@ index 000000000..a393d072d
 +	return 0;
 +}
 +
++/*
++ * The frame is bcachefs's own framing - a little-endian u32 exact length, then
++ * one zstd frame - so a whole unit can be checked against the length the
++ * descriptor claims without decoding it. See the note on ->validate in
++ * linux/encoded_extent.h for why that check is worth having at all.
++ */
++static int bch2_encoded_zstd_validate(const void *payload, size_t len,
++				      size_t plain_len)
++{
++	__le32 prefix;
++	size_t framed_len, got;
++
++	if (len < sizeof(prefix))
++		return -EIO;
++
++	memcpy(&prefix, payload, sizeof(prefix));
++	framed_len = le32_to_cpu(prefix);
++	if (!framed_len || framed_len > len - sizeof(prefix))
++		return -EIO;
++
++	if (encoded_extent_zstd_frame_size(payload + sizeof(prefix), framed_len,
++					   &got))
++		return -EIO;
++
++	return got == plain_len ? 0 : -EIO;
++}
++
 +static const struct encoded_extent_codec bch2_encoded_zstd_codec = {
 +	.owner		= THIS_MODULE,
 +	.compression	= BCH_COMPRESSION_TYPE_zstd,
 +	.name		= "bcachefs-zstd",
 +	.decode		= bch2_encoded_zstd_decode,
 +	.encode		= bch2_encoded_zstd_encode,
++	.validate	= bch2_encoded_zstd_validate,
 +};
 +
 +static const struct encoded_extent_codec * const bch2_encoded_codecs[] = {

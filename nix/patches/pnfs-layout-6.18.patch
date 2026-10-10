@@ -91,10 +91,10 @@ index 062ebd9c2..dcf768d72 100644
  struct compressed_bio {
 diff --git a/fs/btrfs/encoded_extent.c b/fs/btrfs/encoded_extent.c
 new file mode 100644
-index 000000000..7d9c9e7c4
+index 000000000..0d4cec96b
 --- /dev/null
 +++ b/fs/btrfs/encoded_extent.c
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,408 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded extent I/O for btrfs, as an encoded_extent_ops backend.
@@ -230,7 +230,7 @@ index 000000000..7d9c9e7c4
 +
 +static int btrfs_encoded_extent_read(struct file *file, u64 offset, size_t len,
 +				     void *dst, size_t *dst_len,
-+				     struct encoded_extent_desc *desc)
++				     struct encoded_extent_read_desc *desc)
 +{
 +	struct btrfs_ioctl_encoded_io_args args = {
 +		.offset		= offset,
@@ -260,9 +260,13 @@ index 000000000..7d9c9e7c4
 +	if (args.compression == BTRFS_ENCODED_IO_COMPRESSION_NONE)
 +		return -ENODATA;
 +
++	/*
++	 * btrfs's read answers with the blob it decoded out of, whose start is
++	 * @unit_offset: the live range begins at the blob's start rather than
++	 * somewhere inside it, which is why plain_offset stays zero.
++	 */
 +	desc->unit_offset	= offset - args.unencoded_offset;
 +	desc->unit_len		= args.unencoded_len;
-+	desc->unencoded_offset	= args.unencoded_offset;
 +	desc->compression	= args.compression;
 +	desc->encrypted		= false;
 +
@@ -274,29 +278,46 @@ index 000000000..7d9c9e7c4
 + * Store the encoded unit. A successful write has reached the page cache, not
 + * the disk, which is what the sync that follows settles: see
 + * encoded_extent_sync().
++ *
++ * btrfs's own encoded write takes the frame and the offset inside its plaintext;
++ * it has no use for the unit's request range, because that is what the frame's
++ * own geometry already says for a filesystem whose extents are described the
++ * same way. The parameters are the interface's, not this backend's.
 + */
-+static int btrfs_encoded_extent_write(struct file *file, u64 offset,
++static int btrfs_encoded_extent_write(struct file *file, u64 req_offset,
++				      u64 req_len,
 +				      const void *src, size_t len,
-+				      const struct encoded_extent_desc *desc,
++				      const struct encoded_extent_write_desc *desc,
 +				      enum encoded_extent_stable how,
 +				      enum encoded_extent_stable *committed)
 +{
-+	struct btrfs_ioctl_encoded_io_args args = {
-+		.offset			= offset,
-+		.len			= desc->unit_len,
-+		.unencoded_len		= desc->unit_len,
-+		.unencoded_offset	= desc->unencoded_offset,
-+		.compression		= desc->compression,
-+		.encryption		= BTRFS_ENCODED_IO_ENCRYPTION_NONE,
-+	};
++	u64 unencoded_offset;
++	struct btrfs_ioctl_encoded_io_args args;
 +	struct kvec kvec = { .iov_base = (void *) src, .iov_len = len };
 +	struct iov_iter iter;
 +	int ret;
 +
-+	if (desc->encrypted)
++	if (!encoded_extent_range_valid(req_offset, req_len, desc))
 +		return -ENODATA;
 +	if (len > BTRFS_MAX_COMPRESSED)
 +		return -E2BIG;
++
++	/*
++	 * Where the request ends is btrfs's business, not this call's: its
++	 * encoded write takes the blob and the offset inside it, and works the
++	 * file range out from the blob's own length.
++	 */
++	encoded_extent_unit_geometry(req_offset, req_len, desc,
++				     &unencoded_offset, NULL);
++
++	args = (struct btrfs_ioctl_encoded_io_args) {
++		.offset			= desc->unit_offset,
++		.len			= desc->unit_len,
++		.unencoded_len		= desc->unit_len,
++		.unencoded_offset	= unencoded_offset,
++		.compression		= desc->compression,
++		.encryption		= BTRFS_ENCODED_IO_ENCRYPTION_NONE,
++	};
 +
 +	iov_iter_kvec(&iter, ITER_SOURCE, &kvec, 1, len);
 +
@@ -309,7 +330,7 @@ index 000000000..7d9c9e7c4
 +}
 +
 +static int btrfs_encoded_extent_probe(struct file *file, u64 offset, size_t len,
-+				      struct encoded_extent_desc *desc)
++				      struct encoded_extent_read_desc *desc)
 +{
 +	struct btrfs_inode *inode = BTRFS_I(file_inode(file));
 +	struct btrfs_fs_info *fs_info = inode->root->fs_info;
@@ -349,7 +370,6 @@ index 000000000..7d9c9e7c4
 +
 +	desc->unit_offset	= em->start - em->offset;
 +	desc->unit_len		= em->ram_bytes;
-+	desc->unencoded_offset	= offset - desc->unit_offset;
 +	desc->compression	= ret;
 +	desc->encrypted		= false;
 +	ret = 0;
@@ -411,12 +431,28 @@ index 000000000..7d9c9e7c4
 +					  ZSTD_BTRFS_MAX_WINDOWLOG, dst_len);
 +}
 +
++/*
++ * btrfs stores a bare zstd frame, so the unit's length is the length the frame
++ * header declares. See the note on ->validate in linux/encoded_extent.h.
++ */
++static int btrfs_encoded_zstd_validate(const void *payload, size_t len,
++				       size_t plain_len)
++{
++	size_t got;
++
++	if (encoded_extent_zstd_frame_size(payload, len, &got))
++		return -EIO;
++
++	return got == plain_len ? 0 : -EIO;
++}
++
 +static const struct encoded_extent_codec btrfs_encoded_zstd_codec = {
 +	.owner		= THIS_MODULE,
 +	.compression	= BTRFS_ENCODED_IO_COMPRESSION_ZSTD,
 +	.name		= "zstd",
 +	.decode		= btrfs_encoded_zstd_decode,
 +	.encode		= btrfs_encoded_zstd_encode,
++	.validate	= btrfs_encoded_zstd_validate,
 +};
 +
 +static const struct encoded_extent_codec * const btrfs_encoded_extent_codecs[] = {
@@ -618,10 +654,10 @@ index c9cddcfa3..27cbed31a 100644
  #define ZSTD_BTRFS_MAX_LEVEL 15
 diff --git a/fs/encoded_extent.c b/fs/encoded_extent.c
 new file mode 100644
-index 000000000..769615edc
+index 000000000..d99b7c85d
 --- /dev/null
 +++ b/fs/encoded_extent.c
-@@ -0,0 +1,515 @@
+@@ -0,0 +1,550 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Encoded extent codecs: the table that connects the filesystem which stores an
@@ -1137,6 +1173,41 @@ index 000000000..769615edc
 +	return err;
 +}
 +EXPORT_SYMBOL_GPL(encoded_extent_zstd_decode);
++
++/*
++ * What a zstd frame says it will decode to, without decoding it.
++ *
++ * The frame header carries the plaintext length, so a complete frame can be
++ * checked against the unit a descriptor claims it is, at the cost of reading a
++ * few bytes. That is what a codec's ->validate() uses, and the point of it is
++ * where the answer arrives: on the write path, before the payload is stored,
++ * while the machine that built the frame still has the plaintext to re-send. A
++ * frame that is only discovered to be wrong when something reads it is data
++ * that is already gone.
++ *
++ * A frame whose length is not in the header at all is refused rather than
++ * accepted unchecked - a decoder that cannot say what it will produce is not
++ * one this interface can describe.
++ */
++int encoded_extent_zstd_frame_size(const void *frame, size_t len,
++				   size_t *plain_len)
++{
++	zstd_frame_header hdr;
++	size_t ret = zstd_get_frame_header(&hdr, frame, len);
++
++	/* Non-zero means truncated, or an error; either way not a whole frame. */
++	if (ret)
++		return -EIO;
++	if (hdr.frameType != ZSTD_frame)
++		return -EIO;
++	if (hdr.frameContentSize == ZSTD_CONTENTSIZE_UNKNOWN ||
++	    hdr.frameContentSize == ZSTD_CONTENTSIZE_ERROR)
++		return -EIO;
++
++	*plain_len = hdr.frameContentSize;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(encoded_extent_zstd_frame_size);
 diff --git a/fs/nfs/Kconfig b/fs/nfs/Kconfig
 index 07932ce92..31bd0b59a 100644
 --- a/fs/nfs/Kconfig
@@ -1174,10 +1245,10 @@ index 9fb2f2cac..f58d3f05b 100644
 +nfsv4-$(CONFIG_PNFS_BCACHEFS_LAYOUT) += bcachefs_ds.o
 diff --git a/fs/nfs/bcachefs_ds.c b/fs/nfs/bcachefs_ds.c
 new file mode 100644
-index 000000000..436a708d7
+index 000000000..260ba4096
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.c
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,774 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The client side of the encoded-extent data service.
@@ -1219,8 +1290,10 @@ index 000000000..436a708d7
 +
 +struct bc_ds_write_args {
 +	const struct bc_layout	*bl;
-+	u64			offset;
-+	struct encoded_extent_desc desc;
++	/* The unit's half of the request: which bytes of the file this is. */
++	u64			req_offset;
++	u64			req_len;
++	struct encoded_extent_write_desc desc;
 +	/* Position of the codec in the layout's list, what the wire carries. */
 +	u32			codec;
 +	/* How durable this unit has to be; NFS's levels, see the wire header. */
@@ -1238,7 +1311,7 @@ index 000000000..436a708d7
 +
 +struct bc_ds_read_reply {
 +	s32			status;
-+	struct encoded_extent_desc desc;
++	struct encoded_extent_read_desc desc;
 +	u32			codec;
 +	/*
 +	 * Where the encoded payload lands - the caller's buffer, which the
@@ -1263,7 +1336,16 @@ index 000000000..436a708d7
 + * here that did not would land the payload at an offset nothing reports.
 + */
 +#define BC_DS_ADDR_WORDS	(1 + XDR_QUADLEN(ENCODED_DS_MAX_FH))
-+#define BC_DS_READ_HEAD_WORDS	(1 + ENCODED_DS_DESC_WORDS + 1)
++#define BC_DS_READ_HEAD_WORDS	(1 + ENCODED_DS_READ_DESC_WORDS + 1)
++/*
++ * The WRITE argument head, derived from what bc_ds_enc_write() actually emits:
++ * the address opaque, the offset, the descriptor, the stability level and the
++ * payload's length word. It has to be the whole head or the last encodes fail
++ * with the stream full - and the encodes for the descriptor do not check their
++ * return values, so the request would go out malformed instead of failing.
++ */
++#define BC_DS_WRITE_ARG_WORDS	(BC_DS_ADDR_WORDS + 2 + 2 + \
++				 ENCODED_DS_WRITE_DESC_WORDS + 1 + 1)
 +
 +static void
 +bc_ds_encode_addr(struct xdr_stream *xdr, const struct bc_layout *bl)
@@ -1272,39 +1354,43 @@ index 000000000..436a708d7
 +}
 +
 +static void
-+bc_ds_encode_desc(struct xdr_stream *xdr, const struct encoded_extent_desc *desc,
-+		  u32 codec)
++bc_ds_encode_write_desc(struct xdr_stream *xdr,
++			const struct encoded_extent_write_desc *desc, u32 codec)
 +{
-+	xdr_stream_encode_u64(xdr, desc->unit_offset);
-+	xdr_stream_encode_u64(xdr, desc->unit_len);
-+	xdr_stream_encode_u64(xdr, desc->plain_offset);
-+	xdr_stream_encode_u64(xdr, desc->valid_len);
-+	xdr_stream_encode_u64(xdr, desc->unencoded_offset);
-+	xdr_stream_encode_u32(xdr, codec);
-+	xdr_stream_encode_u32(xdr, desc->encrypted ? 1 : 0);
++	const struct encoded_ds_write_desc wire = {
++		.unit_offset	= desc->unit_offset,
++		.unit_len	= desc->unit_len,
++		.codec		= codec,
++	};
++
++	xdr_stream_encode_u64(xdr, wire.unit_offset);
++	xdr_stream_encode_u64(xdr, wire.unit_len);
++	xdr_stream_encode_u32(xdr, wire.codec);
 +}
 +
 +static int
-+bc_ds_decode_desc(struct xdr_stream *xdr, struct encoded_extent_desc *desc,
-+		  u32 *codec)
++bc_ds_decode_read_desc(struct xdr_stream *xdr,
++		       struct encoded_extent_read_desc *desc, u32 *codec)
 +{
-+	u32 encrypted;
++	struct encoded_ds_read_desc wire;
 +
-+	if (xdr_stream_decode_u64(xdr, &desc->unit_offset) < 0)
++	if (xdr_stream_decode_u64(xdr, &wire.unit_offset) < 0)
 +		return -EIO;
-+	if (xdr_stream_decode_u64(xdr, &desc->unit_len) < 0)
++	if (xdr_stream_decode_u64(xdr, &wire.unit_len) < 0)
 +		return -EIO;
-+	if (xdr_stream_decode_u64(xdr, &desc->plain_offset) < 0)
++	if (xdr_stream_decode_u64(xdr, &wire.plain_offset) < 0)
 +		return -EIO;
-+	if (xdr_stream_decode_u64(xdr, &desc->valid_len) < 0)
++	if (xdr_stream_decode_u32(xdr, &wire.codec) < 0)
 +		return -EIO;
-+	if (xdr_stream_decode_u64(xdr, &desc->unencoded_offset) < 0)
++	if (xdr_stream_decode_u32(xdr, &wire.encrypted) < 0)
 +		return -EIO;
-+	if (xdr_stream_decode_u32(xdr, codec) < 0)
-+		return -EIO;
-+	if (xdr_stream_decode_u32(xdr, &encrypted) < 0)
-+		return -EIO;
-+	desc->encrypted = encrypted != 0;
++
++	desc->unit_offset	= wire.unit_offset;
++	desc->unit_len		= wire.unit_len;
++	desc->plain_offset	= wire.plain_offset;
++	desc->encrypted		= wire.encrypted != 0;
++	*codec			= wire.codec;
++
 +	return 0;
 +}
 +
@@ -1314,8 +1400,9 @@ index 000000000..436a708d7
 +	const struct bc_ds_write_args *args = data;
 +
 +	bc_ds_encode_addr(xdr, args->bl);
-+	xdr_stream_encode_u64(xdr, args->offset);
-+	bc_ds_encode_desc(xdr, &args->desc, args->codec);
++	xdr_stream_encode_u64(xdr, args->req_offset);
++	xdr_stream_encode_u64(xdr, args->req_len);
++	bc_ds_encode_write_desc(xdr, &args->desc, args->codec);
 +	xdr_stream_encode_u32(xdr, args->stable);
 +	/*
 +	 * The payload is a whole encoded unit, which does not fit in the
@@ -1372,7 +1459,7 @@ index 000000000..436a708d7
 +
 +	if (xdr_stream_decode_u32(xdr, &status) < 0)
 +		return -EIO;
-+	if (bc_ds_decode_desc(xdr, &reply->desc, &reply->codec) < 0)
++	if (bc_ds_decode_read_desc(xdr, &reply->desc, &reply->codec) < 0)
 +		return -EIO;
 +	reply->status = (s32)status;
 +
@@ -1403,7 +1490,7 @@ index 000000000..436a708d7
 +		.p_proc		= ENCODED_DS_WRITE,
 +		.p_encode	= bc_ds_enc_write,
 +		.p_decode	= bc_ds_dec_write,
-+		.p_arglen	= BC_DS_ADDR_WORDS + 13,
++		.p_arglen	= BC_DS_WRITE_ARG_WORDS,
 +		.p_replen	= 2 + ENCODED_DS_WRITEVERF / XDR_UNIT,
 +		.p_statidx	= ENCODED_DS_WRITE,
 +		.p_name		= "WRITE",
@@ -1876,8 +1963,9 @@ index 000000000..436a708d7
 +int
 +bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
 +		  const struct cred *cred,
-+		  u64 offset, const struct bc_ds_payload *payload,
-+		  const struct encoded_extent_desc *desc, u32 codec,
++		  u64 req_offset, u64 req_len,
++		  const struct bc_ds_payload *payload,
++		  const struct encoded_extent_write_desc *desc, u32 codec,
 +		  u32 stable,
 +		  void (*done)(void *ctx, int status, u32 committed,
 +			       const u8 *verf),
@@ -1914,7 +2002,8 @@ index 000000000..436a708d7
 +	 * hands them back once the transport is done with them.
 +	 */
 +	call->args.bl		= bl;
-+	call->args.offset	= offset;
++	call->args.req_offset	= req_offset;
++	call->args.req_len	= req_len;
 +	call->args.desc		= *desc;
 +	call->args.codec	= codec;
 +	call->args.stable	= stable;
@@ -1936,10 +2025,10 @@ index 000000000..436a708d7
 +}
 diff --git a/fs/nfs/bcachefs_ds.h b/fs/nfs/bcachefs_ds.h
 new file mode 100644
-index 000000000..80755c79a
+index 000000000..e393a1bd9
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.h
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,227 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Shared state for the pNFS encoded-extent client: the layout driver
@@ -2045,7 +2134,7 @@ index 000000000..80755c79a
 +};
 +
 +typedef void (*bc_ds_done_fn)(void *ctx, int status, u32 codec,
-+			      const struct encoded_extent_desc *desc,
++			      const struct encoded_extent_read_desc *desc,
 +			      void *payload, size_t payload_len);
 +
 +/*
@@ -2158,8 +2247,9 @@ index 000000000..80755c79a
 + */
 +int bc_ds_write_async(struct bc_layout_hdr *blh, const struct bc_layout *bl,
 +		      const struct cred *cred,
-+		      u64 offset, const struct bc_ds_payload *payload,
-+		      const struct encoded_extent_desc *desc, u32 codec,
++		      u64 req_offset, u64 req_len,
++		      const struct bc_ds_payload *payload,
++		      const struct encoded_extent_write_desc *desc, u32 codec,
 +		      u32 stable,
 +		      void (*done)(void *ctx, int status, u32 committed,
 +				   const u8 *verf),
@@ -2168,10 +2258,10 @@ index 000000000..80755c79a
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..ed5000acb
+index 000000000..0ec2a8f64
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,1866 @@
+@@ -0,0 +1,2000 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2322,9 +2412,18 @@ index 000000000..ed5000acb
 +static atomic_t bc_stat_write_declined = ATOMIC_INIT(0);
 +static atomic_t bc_stat_write_declined_align = ATOMIC_INIT(0);
 +static atomic_t bc_stat_write_declined_nomem = ATOMIC_INIT(0);
++/* Requests whose pages are not this file's page cache, so the bytes a unit has
++ * to be padded with could not be read from them: a direct write, mostly. */
++static atomic_t bc_stat_write_declined_notcache = ATOMIC_INIT(0);
++/* Frames the client built that its own codec would not accept. Should be zero;
++ * if it is not, the encoder is producing something only this driver would
++ * ever have stored. */
++static atomic_t bc_stat_write_bad_frame = ATOMIC_INIT(0);
 +static atomic_t bc_stat_lseg_alloc = ATOMIC_INIT(0);
 +static atomic_t bc_stat_lseg_alloc_err = ATOMIC_INIT(0);
 +static atomic_t bc_stat_read_pagelist = ATOMIC_INIT(0);
++/* Requests the read side declined itself, before asking the service. */
++static atomic_t bc_stat_read_declined = ATOMIC_INIT(0);
 +static atomic_t bc_stat_write_pagelist = ATOMIC_INIT(0);
 +static atomic_t bc_stat_unit_max = ATOMIC_INIT(0);
 +static atomic_t bc_stat_unit_align = ATOMIC_INIT(0);
@@ -2894,6 +2993,30 @@ index 000000000..ed5000acb
 +	}
 +}
 +
++/*
++ * Zero a range of a request's pages, for the bytes past the end of the file.
++ *
++ * A read request is page-granular, so it reaches past i_size; the file owes
++ * zeros there and no extent covers them, so the driver produces them itself
++ * rather than asking for them.
++ */
++static void
++bc_zero_pages(struct nfs_pgio_header *hdr, size_t skip, size_t len)
++{
++	unsigned int pgindex = (hdr->args.pgbase + skip) >> PAGE_SHIFT;
++	unsigned int pgoff = (hdr->args.pgbase + skip) & (PAGE_SIZE - 1);
++
++	while (len && pgindex < hdr->page_array.npages) {
++		struct page *page = hdr->args.pages[pgindex];
++		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
++
++		zero_user_segment(page, pgoff, pgoff + n);
++		len -= n;
++		pgoff = 0;
++		pgindex++;
++	}
++}
++
 +/* The reverse: the request's bytes, in order, into a linear buffer. */
 +static size_t
 +bc_copy_from_pages(struct nfs_pgio_header *hdr, size_t skip, void *dst,
@@ -2921,53 +3044,6 @@ index 000000000..ed5000acb
 +		pgindex++;
 +	}
 +	return len;
-+}
-+
-+/*
-+ * Fill a range of a unit that the request does not cover with the bytes the
-+ * file actually has there.
-+ *
-+ * A unit is block-aligned at both ends, so the last one reaches past the write
-+ * that produced it and picks up whatever the file already held beyond it. That
-+ * part is inside the key - it has to be, because the payload is padded out to
-+ * the block and a key shorter than the payload it describes is not a legal
-+ * extent - so it cannot be left as whatever was lying around: anything but the
-+ * file's own bytes is written over the file's own bytes.
-+ *
-+ * The request's pages stop at the request, so past that the file has to be
-+ * read from the page cache this write is against. Those pages hold what the
-+ * file has, they are usually already resident because this is a writeback, and
-+ * past the end of the file there is nothing to read and a gap is owed zeros.
-+ */
-+static int
-+bc_fill_from_inode(struct nfs_pgio_header *hdr, u64 off, void *dst, size_t len)
-+{
-+	struct address_space *mapping = hdr->inode->i_mapping;
-+	u64 eof = i_size_read(hdr->inode);
-+
-+	while (len) {
-+		pgoff_t index = off >> PAGE_SHIFT;
-+		size_t pgoff = off & (PAGE_SIZE - 1);
-+		size_t n = min_t(size_t, len, PAGE_SIZE - pgoff);
-+		struct folio *folio;
-+
-+		if (off >= eof) {
-+			memset(dst, 0, n);
-+			goto next;
-+		}
-+
-+		folio = read_mapping_folio(mapping, index, NULL);
-+		if (IS_ERR(folio))
-+			return PTR_ERR(folio);
-+
-+		memcpy_from_folio(dst, folio, offset_in_folio(folio, off), n);
-+		folio_put(folio);
-+next:
-+		dst += n;
-+		off += n;
-+		len -= n;
-+	}
-+	return 0;
 +}
 +
 +/* ------------------------------------------------------------ the read -- */
@@ -3048,7 +3124,7 @@ index 000000000..ed5000acb
 +
 +static void
 +bc_read_done(void *ctx, int status, u32 codec,
-+	     const struct encoded_extent_desc *desc,
++	     const struct encoded_extent_read_desc *desc,
 +	     void *payload, size_t payload_len)
 +{
 +	const struct encoded_extent_codec *c;
@@ -3062,6 +3138,7 @@ index 000000000..ed5000acb
 +		goto out_status;
 +
 +	if (desc->encrypted) {
++		atomic_inc(&bc_stat_read_decline_encrypted);
 +		goto out_not_encoded;
 +	}
 +
@@ -3073,12 +3150,14 @@ index 000000000..ed5000acb
 +	 */
 +	if (codec >= io->bl->nr_codecs || !io->bl->codec[codec] ||
 +	    !io->bl->codec[codec]->decode) {
++		atomic_inc(&bc_stat_read_decline_codec);
 +		goto out_not_encoded;
 +	}
 +	c = io->bl->codec[codec];
 +
 +	unit_end = desc->unit_offset + desc->unit_len;
 +	if (io->offset < desc->unit_offset || io->offset >= unit_end) {
++		atomic_inc(&bc_stat_read_decline_range);
 +		goto out_not_encoded;
 +	}
 +
@@ -3172,6 +3251,16 @@ index 000000000..ed5000acb
 +		goto out_status;
 +	}
 +
++	/*
++	 * The walk stopped at i_size; whatever the request asked for beyond it
++	 * is owed zeros, including the part of the last unit's page the unit
++	 * itself did not cover.
++	 */
++	if (io->hdr->args.offset + io->hdr->args.count > io->end)
++		bc_zero_pages(io->hdr, io->end - io->hdr->args.offset,
++			      io->hdr->args.offset + io->hdr->args.count -
++			      io->end);
++
 +	bc_read_finish(io, 0);
 +	return;
 +
@@ -3196,7 +3285,7 @@ index 000000000..ed5000acb
 +	atomic_inc(&bc_stat_read_pagelist);
 +
 +	if (!hdr->lseg) {
-+		atomic_inc(&bc_stat_write_declined);
++		atomic_inc(&bc_stat_read_declined);
 +		return PNFS_NOT_ATTEMPTED;
 +	}
 +
@@ -3221,7 +3310,26 @@ index 000000000..ed5000acb
 +	io->bl = bl;
 +	io->blh = blh;
 +	io->offset = hdr->args.offset;
-+	io->end = hdr->args.offset + hdr->args.count;
++	/*
++	 * The walk stops at the end of the file, not at the end of the request.
++	 *
++	 * A read request is page-granular: the page holding the last bytes is
++	 * read whole, so the request reaches past i_size. Those bytes are not
++	 * the file's and no key covers them - a key stops where the write's
++	 * data stopped - so a walk that asked for them would land in a hole,
++	 * refuse the range, and hand the whole request to the MDS. That is
++	 * correct and it is never served, which is the failure this bound
++	 * exists to prevent: every file whose size is not page-aligned would
++	 * pay a fallback for its last page. bc_read_done() zeroes the tail.
++	 */
++	io->end = min_t(u64, hdr->args.offset + hdr->args.count,
++			i_size_read(hdr->inode));
++	if (io->end <= io->offset) {
++		/* Entirely past the end of the file: the MDS owes the zeros. */
++		kfree(io);
++		atomic_inc(&bc_stat_read_declined);
++		return PNFS_NOT_ATTEMPTED;
++	}
 +	/*
 +	 * The plaintext buffer holds a whole unit, which is the most the service
 +	 * may decode one into; the encoded payload is bounded by bc_ds_payload_max().
@@ -3513,11 +3621,11 @@ index 000000000..ed5000acb
 +{
 +	const struct encoded_extent_codec *c = io->bl->codec[io->bl->write_codec];
 +	struct encoded_extent_pages src, dst;
-+	struct encoded_extent_desc desc;
++	struct encoded_extent_write_desc desc;
 +	struct bc_ds_payload payload;
 +	struct bc_write_unit *u, *pad;
 +	size_t done, complen, unit_len, front, span;
-+	u64 unit_off;
++	u64 unit_off, unencoded_offset;
 +	int ret;
 +
 +	if (!io->left) {
@@ -3550,17 +3658,18 @@ index 000000000..ed5000acb
 +	 * happened to hold over data the file already had.
 +	 *
 +	 * So the padding is not read back. The key begins at the sector the
-+	 * request starts in - desc.unencoded_offset says where that is inside
-+	 * the unit - and everything from the block boundary to it is dead: the
-+	 * extent's position accounts for the offset, and nothing ever reads the
-+	 * rest. That is what lets the padding be arbitrary.
++	 * request starts in - which is what the backend works out from the
++	 * request range and the frame's start - and everything from the block
++	 * boundary to it is dead: the extent's position accounts for the
++	 * offset, and nothing ever reads the rest. That is what lets the
++	 * padding be arbitrary.
 +	 *
 +	 * The padding that survives is at most 511 bytes, inside the request's
-+	 * own first sector, and that part is the file's by construction: a write
-+	 * to part of a sector cannot proceed without reading the rest of that
-+	 * sector in first, so those bytes are the file's whatever the cache held
-+	 * before. Past the end of the file there is nothing to read back and a
-+	 * gap is owed zeros, so only that part is zeroed.
++	 * own first sector, and those bytes are the file's because the request's
++	 * first page is the file's page cache page for them - which is exactly
++	 * what bc_write_pagelist() checks before letting a request get here.
++	 * Past the end of the file there is nothing to read back and a gap is
++	 * owed zeros, so only that part is zeroed.
 +	 *
 +	 * The cap leaves room for the front padding, so that rounding the span
 +	 * up to the block cannot carry the unit past unit_max.
@@ -3575,10 +3684,22 @@ index 000000000..ed5000acb
 +		io->unit = min_t(size_t, io->left, cap);
 +	}
 +
++	/*
++	 * A zero-length unit would never consume io->left and the run would
++	 * spin; bc_write_pagelist() rejects the geometries that could produce
++	 * one, so this is a guard rather than a case.
++	 */
++	if (!io->unit) {
++		bc_write_finish(io, -EIO);
++		return;
++	}
++
 +	front		= done ? 0 : io->hdr->args.pgbase;
 +	span		= front + io->unit;
 +	unit_off	= io->offset - front;
 +	unit_len	= round_up(span, io->bl->unit_align);
++	/* The live run's start inside the frame: the request's first sector. */
++	unencoded_offset = front & ~(u64)(ENCODED_EXTENT_SECTOR_SIZE - 1);
 +
 +	u = bc_write_unit_alloc(io->bl->unit_max);
 +	if (!u) {
@@ -3586,34 +3707,24 @@ index 000000000..ed5000acb
 +		return;
 +	}
 +
++	/*
++	 * The descriptor is the frame; the request range it is for travels
++	 * beside it as its own arguments, and the service derives the rest of
++	 * the geometry from the two together. Where the file's own data begins
++	 * inside the frame is not sent, because it is not a separate fact: a
++	 * frame begins on a block and the request begins @front into it, so the
++	 * live run starts at the request's sector - which is exactly what the
++	 * backend computes.
++	 *
++	 * Only the tail of that front padding can be the file's: a write to
++	 * part of a sector has the rest of that sector in its page, but the
++	 * bytes between the block boundary and the request's sector belong to a
++	 * page cache this write never touched, and are dead either way.
++	 */
 +	memset(&desc, 0, sizeof(desc));
 +	desc.unit_offset = unit_off;
 +	desc.unit_len = unit_len;
-+	desc.valid_len = span;
-+	/*
-+	 * Where the file's own data begins inside the unit.
-+	 *
-+	 * The unit has to begin on the filesystem's block, so a request whose
-+	 * first byte is not on one is padded at the front with a block's worth
-+	 * of what precedes it. Only the tail of that padding, from the sector
-+	 * the request starts in, is the file's by construction: a write to part
-+	 * of a sector cannot proceed without reading the rest of that sector
-+	 * in. Everything from the block boundary to that sector is clean page
-+	 * cache this write has no reason to have populated, and it is not the
-+	 * file's data on this write.
-+	 *
-+	 * So the key begins at the request's sector and the unit's leading
-+	 * bytes are dead: crc.offset says where the live range starts inside
-+	 * the frame, and nothing ever reads the rest.
-+	 */
-+	desc.unencoded_offset = done ? 0 : (front & ~(u64)(512 - 1));
 +
-+	/*
-+	 * The dirty pages are the codec's input and this unit's buffer is its
-+	 * output, so the bytes move straight out of the page cache into the
-+	 * encoder and straight out of it into the transport - no flattening
-+	 * buffer and no second pass over the unit anywhere.
-+	 */
 +	/*
 +	 * An aligned unit needs nothing copied: it is already the page cache's
 +	 * bytes, in order, at the length asked for. Anything else is assembled,
@@ -3629,46 +3740,76 @@ index 000000000..ed5000acb
 +			.len		= io->unit,
 +		};
 +	} else {
++		/*
++		 * The frame has to be the whole unit: that is what the codec is
++		 * given and what the filesystem stores, whichever backend it is.
++		 * What the request does not carry has to come from the file, and
++		 * the request's own pages are where the file's bytes are - they
++		 * are its page cache, which bc_write_pagelist() checked before
++		 * letting the request get here.
++		 *
++		 * Both edges are under a sector. Ahead of the request only the
++		 * run from its first sector can be the file's: the bytes from the
++		 * block boundary to that sector belong to a page cache this write
++		 * never touched, and the key does not name them either. Behind it,
++		 * the whole rest of the frame is filled: bcachefs stops its key at
++		 * the request's last sector and never reads past it, but a backend
++		 * that names the whole frame - btrfs does - does read it, so the
++		 * bytes have to be the file's there too.
++		 *
++		 * Past the end of the file there is nothing to read and a gap is
++		 * owed zeros, so those bytes are zeroed rather than taken from
++		 * whatever the page happened to hold beyond i_size.
++		 */
++		u64 eof = i_size_read(io->hdr->inode);
++
 +		pad = bc_write_unit_alloc(unit_len);
 +		if (!pad) {
 +			bc_write_unit_free(u);
 +			bc_write_finish(io, -ENOMEM);
 +			return;
 +		}
-+		/* The file's own bytes ahead of the request in that page ... */
-+		if (front)
-+			memcpy_from_page(pad->buf, io->hdr->args.pages[0], 0,
-+					 front);
++
++		if (front > unencoded_offset) {
++			size_t n = front - unencoded_offset;
++			u64 start = unit_off + unencoded_offset;
++			size_t keep = eof > start ?
++				min_t(u64, n, eof - start) : 0;
++
++			if (keep)
++				memcpy_from_page(pad->buf + unencoded_offset,
++						 io->hdr->args.pages[0],
++						 unencoded_offset, keep);
++		}
++
 +		/*
-+		 * The skip is an offset into the request; bc_copy_from_pages()
-+		 * adds the request's page offset to it itself. Passing that
-+		 * offset again read from twice as far into the page and wrote
-+		 * whatever was there into the file - so any request whose dirty
-+		 * range did not start on a page boundary lost its own bytes.
++		 * The request's own bytes. A short copy here means the request's
++		 * page array does not cover the range it described, which is a
++		 * bug above this driver - and not one to store as zeros.
 +		 */
-+		bc_copy_from_pages(io->hdr, done, pad->buf + front, io->unit);
-+		/*
-+		 * ... then the rest of the unit. Those bytes are the file's and
-+		 * the request carried them in its pages, so they are read back
-+		 * out and written unchanged: writing anything else there loses
-+		 * whatever the file already held. Past the end of the file there
-+		 * is nothing to read back, and a gap is owed zeros.
-+		 */
++		if (bc_copy_from_pages(io->hdr, done, pad->buf + front,
++				       io->unit)) {
++			bc_write_unit_free(u);
++			bc_write_unit_free(pad);
++			bc_write_finish(io, -EIO);
++			return;
++		}
++
 +		if (unit_len > span) {
-+			u64 eof = i_size_read(io->hdr->inode);
-+			size_t n = unit_len - span;
++			u64 start = unit_off + span;
++			size_t keep = eof > start ?
++				min_t(u64, unit_len - span, eof - start) : 0;
 +
-+			int err = bc_fill_from_inode(io->hdr,
-+						     unit_off + span,
-+						     pad->buf + span, n);
-+
-+			if (err) {
++			if (keep &&
++			    bc_copy_from_pages(io->hdr, done + io->unit,
++					       pad->buf + span, keep)) {
 +				bc_write_unit_free(u);
 +				bc_write_unit_free(pad);
-+				bc_write_finish(io, err);
++				bc_write_finish(io, -EIO);
 +				return;
 +			}
 +		}
++
 +		src = (struct encoded_extent_pages) {
 +			.pages		= pad->pages,
 +			.nr_pages	= pad->nr_pages,
@@ -3698,6 +3839,21 @@ index 000000000..ed5000acb
 +		return;
 +	}
 +
++	/*
++	 * The frame we just built has to be one we would accept from a peer. If
++	 * the codec cannot even say what length it decodes to, the unit is not
++	 * something to store: this is the last point at which the client still
++	 * has the plaintext, so the hand-back through the MDS re-sends it rather
++	 * than losing it. The same check runs on the service, on every peer's
++	 * frame; this side is the one that can still do something about it.
++	 */
++	if (c->validate && c->validate(u->buf, complen, unit_len)) {
++		atomic_inc(&bc_stat_write_bad_frame);
++		bc_write_unit_free(u);
++		bc_write_finish(io, -EIO);
++		return;
++	}
++
 +	payload = (struct bc_ds_payload) {
 +		.pages		= u->pages,
 +		.nr_pages	= u->nr_pages,
@@ -3709,11 +3865,14 @@ index 000000000..ed5000acb
 +
 +	/* On failure the call has already run ->release, as its contract says. */
 +	/*
-+	 * The unit's offset, not the request's: the service requires the write's
-+	 * offset to be the descriptor's and to be on a block boundary, and a
-+	 * unit padded at the front begins before the request does.
++	 * The unit's own range, and the frame separately in the descriptor: the
++	 * service checks the two against each other, which is the only place
++	 * that can catch a unit whose key ends up naming bytes this request
++	 * never sent. io->offset is where this unit's bytes start in the
++	 * request, and the frame begins @front before that.
 +	 */
-+	ret = bc_ds_write_async(io->blh, io->bl, io->hdr->cred, unit_off,
++	ret = bc_ds_write_async(io->blh, io->bl, io->hdr->cred,
++				io->offset, io->unit,
 +				&payload, &desc, io->bl->write_codec,
 +				(u32)io->hdr->args.stable, bc_write_done, io);
 +	if (ret)
@@ -3731,6 +3890,26 @@ index 000000000..ed5000acb
 +	struct bc_write_io *io = container_of(work, struct bc_write_io, work);
 +
 +	bc_write_step(io);
++}
++
++/*
++ * Whether the request's pages are this file's page cache.
++ *
++ * bc_write_step() has to put the file's own bytes in the parts of a unit the
++ * request does not cover, and it reads them out of the request's pages. That is
++ * only the file's bytes while those pages are the file's cache: a direct write
++ * contributes the caller's pages instead, and a page the cache has dropped is
++ * not the request's page at all.
++ *
++ * The page is looked at through its folio because the request's first page is
++ * the page *containing* its first byte, which is a tail page when the file is
++ * cached in large folios - and a tail page's ->mapping is NULL.
++ */
++static bool bc_request_is_pagecache(const struct nfs_pgio_header *hdr)
++{
++	struct page *page = hdr->args.pages[0];
++
++	return page && page_folio(page)->mapping == hdr->inode->i_mapping;
 +}
 +
 +/*
@@ -3754,6 +3933,14 @@ index 000000000..ed5000acb
 +	 * A header that has already been through the MDS write-through is one
 +	 * this driver should not be seeing; if it does, the request has two
 +	 * writers and the second one's error is the one that would release it.
++	 *
++	 * It is counted and then written anyway, and that is deliberate: both
++	 * ways out of the core are closed once NFS_IOHDR_REDO is set.
++	 * pnfs_write_through_mds() skips the splice that would re-issue the
++	 * pages, and pnfs_ld_handle_write_error() only resends the first time,
++	 * so declining here would drop the range while trying to write it can
++	 * still save it. Nothing should set REDO before the driver runs; if this
++	 * counter moves, that assumption is what to look at.
 +	 */
 +	if (test_bit(NFS_IOHDR_REDO, &hdr->flags))
 +		atomic_inc(&bc_stat_write_redo_entry);
@@ -3796,6 +3983,36 @@ index 000000000..ed5000acb
 +	      hdr->args.pgbase % bl->unit_align))) {
 +		atomic_inc(&bc_stat_write_declined);
 +		atomic_inc(&bc_stat_write_declined_align);
++		return PNFS_NOT_ATTEMPTED;
++	}
++
++	/*
++	 * Assembling a unit is a read-modify-write whose read is the file's own
++	 * bytes around the request, and for a buffered writeback that read is
++	 * the client's page cache - which is where the file's bytes are, and
++	 * the reason doing this on the client rather than the server is the
++	 * point of the whole path. The read half is only the file's bytes while
++	 * the request's pages *are* that cache: a direct write contributes the
++	 * caller's pages instead, where the bytes outside the iovec are
++	 * somebody else's memory, and a page the cache has dropped is not the
++	 * request's page at all.
++	 *
++	 * A request that needs no reading is served either way, because its
++	 * units are entirely its own bytes. So only the assembling case is
++	 * gated, and the gate is on the pages rather than on the mount's I/O
++	 * mode because those pages are the property that actually matters.
++	 *
++	 * Declining here is not a workaround: the MDS's own write path is the
++	 * same read-modify-write with the server's page cache and the btree as
++	 * its source, so the range is written correctly - it just costs the
++	 * server the recompression this path exists to avoid. An unaligned
++	 * direct write could instead do its read from the service and keep the
++	 * offload; that is a feature, not a bug fix, and it wants its own test.
++	 */
++	if ((hdr->args.pgbase || hdr->args.count % bl->unit_align) &&
++	    !bc_request_is_pagecache(hdr)) {
++		atomic_inc(&bc_stat_write_declined);
++		atomic_inc(&bc_stat_write_declined_notcache);
 +		return PNFS_NOT_ATTEMPTED;
 +	}
 +
@@ -3933,6 +4150,11 @@ index 000000000..ed5000acb
 +					&bc_stat_write_declined);
 +		debugfs_create_atomic_t("write_declined_nomem", 0444, bc_debugfs_dir,
 +				&bc_stat_write_declined_nomem);
++		debugfs_create_atomic_t("write_declined_notcache", 0444,
++					bc_debugfs_dir,
++					&bc_stat_write_declined_notcache);
++		debugfs_create_atomic_t("write_bad_frame", 0444, bc_debugfs_dir,
++					&bc_stat_write_bad_frame);
 +	debugfs_create_atomic_t("write_declined_align", 0444, bc_debugfs_dir,
 +					&bc_stat_write_declined_align);
 +		debugfs_create_atomic_t("lseg_alloc", 0444, bc_debugfs_dir,
@@ -3941,6 +4163,8 @@ index 000000000..ed5000acb
 +					&bc_stat_lseg_alloc_err);
 +		debugfs_create_atomic_t("read_pagelist", 0444, bc_debugfs_dir,
 +					&bc_stat_read_pagelist);
++		debugfs_create_atomic_t("read_declined", 0444, bc_debugfs_dir,
++					&bc_stat_read_declined);
 +		debugfs_create_atomic_t("write_pagelist", 0444, bc_debugfs_dir,
 +					&bc_stat_write_pagelist);
 +		debugfs_create_atomic_t("unit_max", 0444, bc_debugfs_dir,
@@ -4417,10 +4641,10 @@ index 000000000..9590fb386
 +};
 diff --git a/fs/nfsd/encoded_ds.c b/fs/nfsd/encoded_ds.c
 new file mode 100644
-index 000000000..519210495
+index 000000000..55439e84e
 --- /dev/null
 +++ b/fs/nfsd/encoded_ds.c
-@@ -0,0 +1,1092 @@
+@@ -0,0 +1,1125 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The encoded-extent data service: move a filesystem's compressed, checksummed
@@ -4495,7 +4719,8 @@ index 000000000..519210495
 +#define ENCODED_DS_BUFSIZE	(ENCODED_DS_MAX_PAYLOAD + 2 * PAGE_SIZE)
 +
 +/* status, descriptor, opaque header, payload, in XDR words. */
-+#define ENCODED_DS_READ_WORDS	(1 + 8 + 1 + ENCODED_DS_MAX_PAYLOAD / XDR_UNIT)
++#define ENCODED_DS_READ_WORDS	(1 + ENCODED_DS_READ_DESC_WORDS + 1 + \
++				 ENCODED_DS_MAX_PAYLOAD / XDR_UNIT)
 +
 +static unsigned short encoded_ds_port = 2050;
 +module_param(encoded_ds_port, ushort, 0444);
@@ -4533,6 +4758,12 @@ index 000000000..519210495
 +static atomic_t ds_nr_not_encoded = ATOMIC_INIT(0);
 +static atomic_t ds_refused[ENCODED_REFUSAL_NR];
 +static atomic_t ds_nr_codec_unknown = ATOMIC_INIT(0);
++/* The offset of the last range this service refused, so a caller can tell
++ * "the hole is where I think it is" from "the hole is somewhere else". */
++static u64 ds_last_refused_off;
++/* Frames a peer sent that their own codec would not accept: refused rather
++ * than stored, so the peer re-sends the range through the MDS. */
++static atomic_t ds_nr_frame_invalid = ATOMIC_INIT(0);
 +static atomic_t ds_nr_errors = ATOMIC_INIT(0);
 +/*
 + * How many calls the service had inside the backend at once, and the high-water
@@ -4587,8 +4818,10 @@ index 000000000..519210495
 +
 +struct encoded_ds_writeargs {
 +	struct encoded_ds_addr addr;
-+	u64		offset;
-+	struct encoded_extent_desc desc;
++	/* The request range the frame is for, in file coordinates. */
++	u64		req_offset;
++	u64		req_len;
++	struct encoded_extent_write_desc desc;
 +	u32		codec;		/* wire position, before translation */
 +	u32		stable;		/* NFS's levels, see the wire header */
 +	void		*payload;	/* kvmalloc'd, freed by pc_release */
@@ -4598,7 +4831,7 @@ index 000000000..519210495
 +struct encoded_ds_reply {
 +	s32		status;
 +	/* PROBE and READ only: what the range was answered with. */
-+	struct encoded_extent_desc desc;
++	struct encoded_extent_read_desc desc;
 +	u32		codec;		/* wire position, translated from desc */
 +	/* WRITE only: what the backend reached, and the netns write verifier. */
 +	enum encoded_extent_stable committed;
@@ -4671,9 +4904,9 @@ index 000000000..519210495
 + * numbering on its own side. A position that names no registered codec, or an
 + * extent whose codec the filesystem has not registered, is not served encoded.
 + */
-+static bool
++static const struct encoded_extent_codec *
 +encoded_ds_translate_codec(const struct encoded_extent_ops *ops, u32 codec,
-+			   struct encoded_extent_desc *desc)
++			   u32 *compression)
 +{
 +	const struct encoded_extent_codec *c;
 +
@@ -4685,55 +4918,45 @@ index 000000000..519210495
 +	 */
 +	c = encoded_extent_codec_by_position(ops, codec);
 +	if (!c)
-+		return false;
-+	desc->compression = c->compression;
-+	return true;
++		return NULL;
++	*compression = c->compression;
++	return c;
 +}
 +
 +static bool
 +encoded_ds_encode_codec(const struct encoded_extent_ops *ops,
-+			struct encoded_extent_desc *desc, u32 *codec)
++			u32 compression, u32 *codec)
 +{
 +	/*
 +	 * A layout's list is capped, so a filesystem with more codecs than that
 +	 * would produce positions the peer cannot see. Those extents are not
 +	 * served encoded rather than numbered ambiguously.
 +	 */
-+	return encoded_extent_codec_by_compression(ops, desc->compression,
-+						   codec) &&
++	return encoded_extent_codec_by_compression(ops, compression, codec) &&
 +	       *codec < ENCODED_DS_MAX_CODECS;
 +}
 +
++/*
++ * The frame a WRITE is storing. The request range it is for is decoded beside
++ * it and travels as its own arguments; see the wire header for why the two are
++ * not one structure.
++ */
 +static bool
-+encoded_ds_decode_desc(struct xdr_stream *xdr, struct encoded_extent_desc *desc,
-+		       u32 *codec)
++encoded_ds_decode_write_desc(struct xdr_stream *xdr,
++			     struct encoded_extent_write_desc *desc, u32 *codec)
 +{
-+	struct encoded_ds_desc wire;
-+	u32 encrypted;
++	struct encoded_ds_write_desc wire;
 +
 +	if (xdr_stream_decode_u64(xdr, &wire.unit_offset) < 0)
 +		return false;
 +	if (xdr_stream_decode_u64(xdr, &wire.unit_len) < 0)
 +		return false;
-+	if (xdr_stream_decode_u64(xdr, &wire.plain_offset) < 0)
-+		return false;
-+	if (xdr_stream_decode_u64(xdr, &wire.valid_len) < 0)
-+		return false;
-+	if (xdr_stream_decode_u64(xdr, &wire.unencoded_offset) < 0)
-+		return false;
 +	if (xdr_stream_decode_u32(xdr, &wire.codec) < 0)
 +		return false;
-+	if (xdr_stream_decode_u32(xdr, &encrypted) < 0)
-+		return false;
-+	wire.encrypted = encrypted != 0;
 +
 +	desc->unit_offset	= wire.unit_offset;
 +	desc->unit_len		= wire.unit_len;
-+	desc->plain_offset	= wire.plain_offset;
-+	desc->valid_len		= wire.valid_len;
-+	desc->unencoded_offset	= wire.unencoded_offset;
-+	desc->encrypted		= wire.encrypted;
-+	desc->compression	= 0;
++	desc->compression	= 0;	/* the service translates the codec */
 +	*codec			= wire.codec;
 +
 +	return true;
@@ -4748,9 +4971,11 @@ index 000000000..519210495
 +
 +	if (!encoded_ds_decode_addr(xdr, &args->addr))
 +		return false;
-+	if (xdr_stream_decode_u64(xdr, &args->offset) < 0)
++	if (xdr_stream_decode_u64(xdr, &args->req_offset) < 0)
 +		return false;
-+	if (!encoded_ds_decode_desc(xdr, &args->desc, &args->codec))
++	if (xdr_stream_decode_u64(xdr, &args->req_len) < 0)
++		return false;
++	if (!encoded_ds_decode_write_desc(xdr, &args->desc, &args->codec))
 +		return false;
 +	if (xdr_stream_decode_u32(xdr, &args->stable) < 0)
 +		return false;
@@ -4837,21 +5062,25 @@ index 000000000..519210495
 +encoded_ds_encode_reply_head(struct xdr_stream *xdr,
 +			     const struct encoded_ds_reply *reply)
 +{
++	const struct encoded_ds_read_desc wire = {
++		.unit_offset	= reply->desc.unit_offset,
++		.unit_len	= reply->desc.unit_len,
++		.plain_offset	= reply->desc.plain_offset,
++		.codec		= reply->codec,
++		.encrypted	= reply->desc.encrypted ? 1 : 0,
++	};
++
 +	if (xdr_stream_encode_u32(xdr, (u32)reply->status) < 0)
 +		return false;
-+	if (xdr_stream_encode_u64(xdr, reply->desc.unit_offset) < 0)
++	if (xdr_stream_encode_u64(xdr, wire.unit_offset) < 0)
 +		return false;
-+	if (xdr_stream_encode_u64(xdr, reply->desc.unit_len) < 0)
++	if (xdr_stream_encode_u64(xdr, wire.unit_len) < 0)
 +		return false;
-+	if (xdr_stream_encode_u64(xdr, reply->desc.plain_offset) < 0)
++	if (xdr_stream_encode_u64(xdr, wire.plain_offset) < 0)
 +		return false;
-+	if (xdr_stream_encode_u64(xdr, reply->desc.valid_len) < 0)
++	if (xdr_stream_encode_u32(xdr, wire.codec) < 0)
 +		return false;
-+	if (xdr_stream_encode_u64(xdr, reply->desc.unencoded_offset) < 0)
-+		return false;
-+	if (xdr_stream_encode_u32(xdr, reply->codec) < 0)
-+		return false;
-+	if (xdr_stream_encode_u32(xdr, reply->desc.encrypted ? 1 : 0) < 0)
++	if (xdr_stream_encode_u32(xdr, wire.encrypted) < 0)
 +		return false;
 +	return true;
 +}
@@ -5063,7 +5292,8 @@ index 000000000..519210495
 +	encoded_ds_close(&f);
 +	if (ret)
 +		goto out_err;
-+	if (!encoded_ds_encode_codec(f.ops, &reply->desc, &reply->codec)) {
++	if (!encoded_ds_encode_codec(f.ops, reply->desc.compression,
++				     &reply->codec)) {
 +		atomic_inc(&ds_nr_codec_unknown);
 +		ret = -ENODATA;
 +		goto out_err;
@@ -5122,8 +5352,10 @@ index 000000000..519210495
 +	ds_inflight_leave();
 +	encoded_ds_close(&f);
 +	if (ret) {
-+		if (ret == -ENODATA && reply->desc.refusal < ENCODED_REFUSAL_NR)
++		if (ret == -ENODATA && reply->desc.refusal < ENCODED_REFUSAL_NR) {
 +			atomic_inc(&ds_refused[reply->desc.refusal]);
++			WRITE_ONCE(ds_last_refused_off, args->offset);
++		}
 +		kvfree(buf);
 +		goto out_err;
 +	}
@@ -5134,7 +5366,8 @@ index 000000000..519210495
 +	 * filesystem stores but has not registered is one this service cannot
 +	 * hand out, so the range is not served encoded.
 +	 */
-+	if (!encoded_ds_encode_codec(f.ops, &reply->desc, &reply->codec)) {
++	if (!encoded_ds_encode_codec(f.ops, reply->desc.compression,
++				     &reply->codec)) {
 +		atomic_inc(&ds_nr_codec_unknown);
 +		kvfree(buf);
 +		ret = -ENODATA;
@@ -5156,6 +5389,7 @@ index 000000000..519210495
 +{
 +	struct encoded_ds_writeargs *args = rqstp->rq_argp;
 +	struct encoded_ds_reply *reply = rqstp->rq_resp;
++	const struct encoded_extent_codec *codec;
 +	struct encoded_ds_file f;
 +	u64 start;
 +	int ret;
@@ -5175,8 +5409,27 @@ index 000000000..519210495
 +	 * The peer named the codec by position in the layout's list and this
 +	 * filesystem's own numbering is what its backend is written against.
 +	 */
-+	if (!encoded_ds_translate_codec(f.ops, args->codec, &args->desc)) {
++	codec = encoded_ds_translate_codec(f.ops, args->codec,
++					   &args->desc.compression);
++	if (!codec) {
 +		atomic_inc(&ds_nr_codec_unknown);
++		encoded_ds_close(&f);
++		ret = -ENODATA;
++		goto out_err;
++	}
++
++	/*
++	 * A frame whose own header does not describe the unit the descriptor
++	 * describes is refused here, not stored. -ENODATA is the right answer
++	 * for it: the range is one this service will not keep, so the peer
++	 * writes it through the MDS instead - and the peer still has the
++	 * plaintext at this point, where a stored frame that cannot be decoded
++	 * would only be discovered by whoever reads it next.
++	 */
++	if (codec->validate &&
++	    codec->validate(args->payload, args->payload_len,
++			    args->desc.unit_len)) {
++		atomic_inc(&ds_nr_frame_invalid);
 +		encoded_ds_close(&f);
 +		ret = -ENODATA;
 +		goto out_err;
@@ -5184,8 +5437,8 @@ index 000000000..519210495
 +
 +	start = ktime_get_ns();
 +	ds_inflight_enter();
-+	ret = f.ops->write(f.file, args->offset, args->payload,
-+			   args->payload_len, &args->desc,
++	ret = f.ops->write(f.file, args->req_offset, args->req_len,
++			   args->payload, args->payload_len, &args->desc,
 +			   (enum encoded_extent_stable)args->stable,
 +			   &reply->committed);
 +	spin_lock(&ds_ns_lock);
@@ -5429,6 +5682,10 @@ index 000000000..519210495
 +	}
 +	debugfs_create_atomic_t("codec_unknown", 0444, encoded_ds_debugfs,
 +				&ds_nr_codec_unknown);
++	debugfs_create_u64("last_refused_off", 0444, encoded_ds_debugfs,
++			   &ds_last_refused_off);
++	debugfs_create_atomic_t("frame_invalid", 0444, encoded_ds_debugfs,
++				&ds_nr_frame_invalid);
 +	debugfs_create_atomic_t("errors", 0444, encoded_ds_debugfs,
 +				&ds_nr_errors);
 +}
@@ -5602,10 +5859,10 @@ index db9af7804..c5a3db7c0 100644
  		struct nfsd4_compound_state *cstate, stateid_t *stateid,
 diff --git a/include/linux/encoded_extent.h b/include/linux/encoded_extent.h
 new file mode 100644
-index 000000000..07c7e20a4
+index 000000000..1b477faa4
 --- /dev/null
 +++ b/include/linux/encoded_extent.h
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,532 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_H
 +#define _LINUX_ENCODED_EXTENT_H
@@ -5673,7 +5930,23 @@ index 000000000..07c7e20a4
 +	ENCODED_REFUSAL_NR,
 +};
 +
-+struct encoded_extent_desc {
++/*
++ * The granule an encoded extent's offsets and lengths are described in.
++ *
++ * A filesystem stores a compressed frame as a run of sectors: the offset of
++ * the live range inside the frame and the length of the live range are both
++ * counts of these, which is why a request that does not fill a whole one has
++ * its frame padded and its key rounded.
++ */
++#define ENCODED_EXTENT_SECTOR_SIZE	512
++
++/*
++ * What a backend found for a range a caller asked about, from ->probe() and
++ * ->read(). It describes where the file's data is and where inside the frame a
++ * peer has to look for it; it says nothing about storing anything, which is
++ * what encoded_extent_write_desc is for.
++ */
++struct encoded_extent_read_desc {
 +	/*
 +	 * Filled in on refusal and never sent: the wire codec names the fields
 +	 * it carries, so this one stays on the side that set it. It is here
@@ -5696,24 +5969,71 @@ index 000000000..07c7e20a4
 +	 * starts, the other how long it is.
 +	 */
 +	u64	plain_offset;
-+	/*
-+	 * The exact byte length of the unit's data, when the frame had to be
-+	 * padded to reach the path's granularity.
-+	 *
-+	 * An encoded extent is described in sectors - crc.uncompressed_size is a
-+	 * sector count and the backend refuses a unit whose length is not block
-+	 * aligned - so a request whose last byte is not on a block boundary
-+	 * cannot be written as itself. It is written padded up, and this says how
-+	 * much of it is the file's: the inode's size is set from this and not
-+	 * from the padded length, or a file written this way comes back longer
-+	 * than it was written. Zero means the whole unit, which is what every
-+	 * aligned write sends.
-+	 */
-+	u64	valid_len;
-+	u64	unencoded_offset;	/* start of the requested range in it */
 +	u32	compression;		/* backend's codec numbering */
 +	bool	encrypted;
 +};
++
++/*
++ * What a caller is asking a backend to store, from ->write(): the frame a peer
++ * produced, as the peer compressed it.
++ *
++ * The unit's *own* range is deliberately not in here. It travels beside this
++ * as ->write()'s own req_offset/req_len arguments, because it is the one fact
++ * about the write that this structure cannot be worked out from, and a copy of
++ * a fact is a second chance to disagree about it. A backend derives the
++ * request's first sector and the key's end from the two together - see
++ * encoded_extent_unit_geometry() - so there is one computation of the geometry
++ * rather than two that have to be kept in step.
++ */
++struct encoded_extent_write_desc {
++	u64	unit_offset;		/* where the frame's plaintext begins */
++	u64	unit_len;		/* the frame's plaintext length */
++	u32	compression;		/* backend's codec numbering */
++};
++
++/*
++ * Whether a request range is inside the frame a write descriptor describes.
++ *
++ * The ordering is load-bearing: the first two conditions are what make the
++ * third's subtractions safe, so this cannot be reordered or split without an
++ * underflow to think about.
++ */
++static inline bool
++encoded_extent_range_valid(u64 req_offset, u64 req_len,
++			   const struct encoded_extent_write_desc *desc)
++{
++	return req_offset >= desc->unit_offset && req_len <= desc->unit_len &&
++	       req_offset - desc->unit_offset <= desc->unit_len - req_len;
++}
++
++/*
++ * The geometry a write's two halves imply: where the dead run before the
++ * request's first sector ends inside the frame, and where the request's data
++ * ends in it.
++ *
++ * A frame is a whole number of blocks and a key's lengths are in sectors, so a
++ * request that begins or ends off those boundaries leaves a run that belongs to
++ * nobody: everything from the frame's block boundary up to the request's first
++ * sector is dead, and the file's live range starts at that sector. The key
++ * ends at the request's last sector for the same reason at the other end.
++ *
++ * The caller must have checked the range is inside the frame
++ * (encoded_extent_range_valid()). Either output may be NULL, for a backend that
++ * derives an extent from the frame alone.
++ */
++static inline void
++encoded_extent_unit_geometry(u64 req_offset, u64 req_len,
++			     const struct encoded_extent_write_desc *desc,
++			     u64 *unencoded_offset, u64 *valid_len)
++{
++	u64 frame = req_offset - desc->unit_offset;
++
++	if (unencoded_offset)
++		*unencoded_offset = frame &
++			~(u64)(ENCODED_EXTENT_SECTOR_SIZE - 1);
++	if (valid_len)
++		*valid_len = frame + req_len;
++}
 +
 +/*
 + * How durable a write has to be, and how durable it turned out.
@@ -5772,7 +6092,7 @@ index 000000000..07c7e20a4
 + *
 + * The two halves of a codec have different owners, which is why this exists
 + * rather than a bare number on the wire. The exporting filesystem owns the
-+ * numbering: @compression is the number its own encoded_extent_desc carries, and
++ * numbering: @compression is the number its own descriptors carry, and
 + * only it knows which of its codecs a given extent used. The peer owns the
 + * implementation, because the peer is the one decoding and encoding - which also
 + * means it must have the codec, and that a codec it does not have is a range it
@@ -5894,6 +6214,20 @@ index 000000000..07c7e20a4
 +	int		(*encode)(const struct encoded_extent_pages *src,
 +				  const struct encoded_extent_pages *dst,
 +				  size_t *dst_len);
++	/*
++	 * Check that @payload is a whole frame that will decode to @plain_len
++	 * bytes, without decoding it. Optional: a codec that leaves this NULL
++	 * is stored unchecked.
++	 *
++	 * This is the cheap half of a write's verification, and the half that
++	 * runs while the frame can still be replaced. A frame that is truncated,
++	 * mis-sized or built for another unit is otherwise only discovered when
++	 * something reads it, by which time the plaintext is gone and all that
++	 * is left is an extent that fails forever. It says nothing about the
++	 * bytes inside the frame - a reader's checksum is what covers those.
++	 */
++	int		(*validate)(const void *payload, size_t len,
++				    size_t plain_len);
 +};
 +
 +/*
@@ -5929,6 +6263,14 @@ index 000000000..07c7e20a4
 +int encoded_extent_zstd_decode(const struct encoded_extent_pages *src,
 +			       const struct encoded_extent_pages *dst,
 +			       size_t max_window_size, size_t *dst_len);
++
++/*
++ * The plaintext length a whole zstd frame declares in its own header, or
++ * -EIO if @frame is not one. A codec's validate() is a thin wrapper over
++ * this plus whatever framing it puts around the frame.
++ */
++int encoded_extent_zstd_frame_size(const void *frame, size_t len,
++				   size_t *plain_len);
 +
 +/*
 + * Resolve a name to a codec: if it does not resolve, ask for the module that
@@ -5976,16 +6318,24 @@ index 000000000..07c7e20a4
 +	 */
 +	int (*read)(struct file *file, u64 offset, size_t len,
 +		    void *dst, size_t *dst_len,
-+		    struct encoded_extent_desc *desc);
++		    struct encoded_extent_read_desc *desc);
 +
 +	/*
-+	 * Insert @len bytes of encoded payload as the unit covering
-+	 * [offset, offset + @desc->unit_len), with the inode's and the
-+	 * filesystem's normal allocation policy. Returns -ENODATA if the
-+	 * backend will not store encoded data here (an encrypted or nocow
-+	 * inode, a codec mismatch, a payload that is not a whole unit) and the
-+	 * caller must fall back to ordinary writes; -EINVAL only for a
-+	 * malformed request.
++	 * Insert @len bytes of encoded payload as the frame covering
++	 * [desc->unit_offset, desc->unit_offset + desc->unit_len), with the
++	 * inode's and the filesystem's normal allocation policy. Returns
++	 * -ENODATA if the backend will not store encoded data here (an
++	 * encrypted or nocow inode, a codec mismatch, a payload that is not a
++	 * whole unit, a range outside the frame) and the caller must fall back
++	 * to ordinary writes; -EINVAL only for a malformed request.
++	 *
++	 * @req_offset and @req_len are the request range this frame is for, in
++	 * file coordinates, and they are what the key is made from: the frame
++	 * is a whole number of blocks and so reaches past the request at either
++	 * end, and the request is the only part of the call that says which of
++	 * those bytes are the file's. The geometry follows from the two
++	 * together - see encoded_extent_unit_geometry() - so there is nothing
++	 * for the caller and the backend to disagree about.
 +	 *
 +	 * @how is what the caller needs to survive, and *@committed is what the
 +	 * backend actually reached: @how when it honoured the request, a lower
@@ -5996,9 +6346,9 @@ index 000000000..07c7e20a4
 +	 * (write-through to stable storage) may report more than it was asked
 +	 * for.
 +	 */
-+	int (*write)(struct file *file, u64 offset,
++	int (*write)(struct file *file, u64 req_offset, u64 req_len,
 +		     const void *src, size_t len,
-+		     const struct encoded_extent_desc *desc,
++		     const struct encoded_extent_write_desc *desc,
 +		     enum encoded_extent_stable how,
 +		     enum encoded_extent_stable *committed);
 +
@@ -6008,7 +6358,7 @@ index 000000000..07c7e20a4
 +	 * the encoded path and the fallback. -ENODATA as above.
 +	 */
 +	int (*probe)(struct file *file, u64 offset, size_t len,
-+		     struct encoded_extent_desc *desc);
++		     struct encoded_extent_read_desc *desc);
 +};
 +
 +/*
@@ -6047,10 +6397,10 @@ index 000000000..07c7e20a4
 +#endif /* _LINUX_ENCODED_EXTENT_H */
 diff --git a/include/linux/encoded_extent_ds.h b/include/linux/encoded_extent_ds.h
 new file mode 100644
-index 000000000..a0bc0e25c
+index 000000000..8be9aa843
 --- /dev/null
 +++ b/include/linux/encoded_extent_ds.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,182 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_ENCODED_EXTENT_DS_H
 +#define _LINUX_ENCODED_EXTENT_DS_H
@@ -6094,14 +6444,27 @@ index 000000000..a0bc0e25c
 + *   NULL   ()
 + *   PROBE  (addr, offset u64, len u64)              -> probe reply
 + *   READ   (addr, offset u64, buf_size u32)         -> read reply, payload
-+ *   WRITE  (addr, offset u64, desc, stable u32, data opaque) -> write reply
++ *   WRITE  (addr, req_offset u64, req_len u64, write desc, stable u32,
++ *           data opaque)                            -> write reply
 + *
 + *   addr   = fh opaque
-+ *   desc   = unit_offset u64, unit_len u64, unencoded_offset u64,
-+ *            codec u32, encrypted u32
-+ *   probe reply = status s32, desc
-+ *   read reply  = status s32, desc, payload (absent unless status is 0)
++ *   write desc  = struct encoded_ds_write_desc
++ *   read desc   = struct encoded_ds_read_desc
++ *   probe reply = status s32, read desc
++ *   read reply  = status s32, read desc, payload (absent unless status is 0)
 + *   write reply = status s32, committed u32, writeverf[8]
++ *
++ * @req_offset and @req_len are the request range the frame is for, in file
++ * coordinates, and the write descriptor is the frame the peer compressed. The
++ * two are separate on purpose: the frame is a whole number of blocks and so
++ * reaches past the request at either end, and the request range is the only
++ * thing on the call that says which of those bytes the peer actually sent. The
++ * backend derives the geometry the key needs from the two together, so there is
++ * one computation of it rather than two that have to agree.
++ *
++ * A read descriptor is a different shape, not the same one with different
++ * numbers in it: its @unit_offset is the live range's start where a write's is
++ * the frame's, and @plain_offset has no write-side meaning at all.
 + *
 + * @stable is how durable the writer needs this unit to be, as NFS's three
 + * levels (0 unstable, 1 data sync, 2 file sync), and @committed is what the
@@ -6125,7 +6488,18 @@ index 000000000..a0bc0e25c
 + */
 +
 +#define ENCODED_DS_PROGRAM	0x2000BC01
-+#define ENCODED_DS_VERSION	2
++/*
++ * Version 3: a WRITE carries the request range it is for (req_offset, req_len)
++ * beside a write descriptor that describes only the frame, and the read
++ * descriptor is a separate struct from the write one. Version 2 had one
++ * descriptor doing both jobs, with @unit_offset meaning the frame's start in a
++ * write and the live range's start in a reply.
++ *
++ * The layout names the version it expects, so a service and a peer built from
++ * different versions do not talk to each other at all rather than disagreeing
++ * about what a field means.
++ */
++#define ENCODED_DS_VERSION	3
 +
 +enum encoded_ds_proc {
 +	ENCODED_DS_NULL		= 0,
@@ -6150,25 +6524,45 @@ index 000000000..a0bc0e25c
 +#define ENCODED_DS_WRITEVERF	8	/* bytes; NFS's write verifier size */
 +
 +/*
-+ * What a reader needs to decode the payload. @codec indexes the layout's codec
-+ * list. The checksum is deliberately absent: the backend verifies it on read and
-+ * computes it on write, so a peer never reproduces the filesystem's checksum
-+ * code.
++ * What a WRITE is storing: the frame a peer compressed, as the peer made it.
++ *
++ * The unit's own range - which bytes of the file this frame is for - travels
++ * beside this as the request's req_offset/req_len, and the backend derives the
++ * rest of the geometry from the two together. That is deliberate: the frame is
++ * a whole number of blocks and so reaches past the request at either end, and
++ * two independent descriptions of where the file's bytes sit inside it is a
++ * second chance to disagree about it. It was, twice.
 + */
-+struct encoded_ds_desc {
++struct encoded_ds_write_desc {
++	/* Where the frame's plaintext begins in the file. */
 +	__u64	unit_offset;
++	/* The frame's plaintext length. */
++	__u64	unit_len;
++	__u32	codec;		/* position in the layout's codec list */
++};
++
++/*
++ * What a PROBE or READ reply says about the range it was asked for: where the
++ * file's data is, and where inside the frame the peer has to look for it.
++ *
++ * This is not a write descriptor with different values in it - @unit_offset is
++ * the *live range's* start here, where a write's is the frame's, and
++ * @plain_offset has no write-side meaning at all. Two shapes, because they
++ * describe two different things.
++ */
++struct encoded_ds_read_desc {
++	/* Logical offset of the live range's start. */
++	__u64	unit_offset;
++	/* The live range's length. */
 +	__u64	unit_len;
 +	/* Where the live range begins inside the frame's plaintext. */
 +	__u64	plain_offset;
-+	/* Exact length of the unit's data; zero means the whole of it. */
-+	__u64	valid_len;
-+	__u64	unencoded_offset;
-+	__u32	codec;
++	__u32	codec;		/* position in the layout's codec list */
 +	__u32	encrypted;
 +};
 +
 +/*
-+ * The descriptor's size in XDR words, kept next to the struct because a READ
++ * The descriptors' sizes in XDR words, kept next to the structs because a READ
 + * reply's payload does not go through the reply buffer: the receive is told how
 + * many bytes precede the payload's pages, and that number is this (plus the
 + * reply's status and its payload length). Adding a field here without moving
@@ -6176,7 +6570,8 @@ index 000000000..a0bc0e25c
 + * the peer fails to decode it, which reads as a data path bug rather than as a
 + * protocol one.
 + */
-+#define ENCODED_DS_DESC_WORDS	(5 * XDR_QUADLEN(sizeof(__u64)) + 2)
++#define ENCODED_DS_WRITE_DESC_WORDS	(2 * XDR_QUADLEN(sizeof(__u64)) + 1)
++#define ENCODED_DS_READ_DESC_WORDS	(3 * XDR_QUADLEN(sizeof(__u64)) + 2)
 +
 +/*
 + * Server side (fs/nfsd/encoded_ds.c). The service is started and stopped with

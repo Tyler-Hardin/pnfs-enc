@@ -41,7 +41,13 @@
 #include <rpc/auth_unix.h>
 
 #define ENCODED_DS_PROGRAM	0x2000BC01u
-#define ENCODED_DS_VERSION	2
+/*
+ * Must track ENCODED_DS_VERSION and the descriptor shapes in
+ * include/linux/encoded_extent_ds.h, which cannot be included here: it is a
+ * kernel header, and this is a plain userspace program. The two descriptor
+ * structs below are that header's, transcribed.
+ */
+#define ENCODED_DS_VERSION	3
 #define ENCODED_DS_PROBE	1
 #define ENCODED_DS_READ		2
 #define ENCODED_DS_WRITE	3
@@ -62,11 +68,12 @@ struct ds_probe_args {
 	uint64_t	len;
 };
 
+/* A PROBE or READ reply: where the file's data is, and where in the frame. */
 struct ds_reply {
 	int32_t		status;
-	uint64_t	unit_offset;
-	uint64_t	unit_len;
-	uint64_t	unencoded_offset;
+	uint64_t	unit_offset;	/* the live range's start */
+	uint64_t	unit_len;	/* the live range's length */
+	uint64_t	plain_offset;	/* where the live range starts in the frame */
 	uint32_t	codec;
 	uint32_t	encrypted;
 };
@@ -91,19 +98,23 @@ struct ds_read_reply {
 };
 
 /*
- * WRITE carries a descriptor and a payload. The service opens the file before
- * it looks at either, so a WRITE with any payload is enough to test whether the
- * open is allowed (a read-only export refuses there).
+ * WRITE carries the request range the frame is for, the frame itself, and a
+ * payload. The service opens the file before it looks at any of them, so a
+ * WRITE with any payload is enough to test whether the open is allowed (a
+ * read-only export refuses there).
+ *
+ * req_offset/req_len and the frame are separate on purpose: the frame is a whole
+ * number of blocks and reaches past the request at either end, and the service
+ * derives the key's geometry from the two together. See the wire header.
  */
 struct ds_write_args {
 	struct ds_addr	addr;
-	uint64_t	offset;
+	uint64_t	req_offset;	/* the request range this frame is for */
+	uint64_t	req_len;
 	struct {
-		uint64_t unit_offset;
-		uint64_t unit_len;
-		uint64_t unencoded_offset;
+		uint64_t unit_offset;	/* where the frame's plaintext begins */
+		uint64_t unit_len;	/* the frame's plaintext length */
 		uint32_t codec;
-		uint32_t encrypted;
 	} desc;
 	uint32_t	stable;		/* NFS's write levels: 0 unstable, 2 file sync */
 	uint32_t	payload_len;
@@ -139,7 +150,7 @@ static bool_t xdr_ds_reply(XDR *xdrs, struct ds_reply *r)
 	return xdr_int(xdrs, &r->status) &&
 	       xdr_u64(xdrs, &r->unit_offset) &&
 	       xdr_u64(xdrs, &r->unit_len) &&
-	       xdr_u64(xdrs, &r->unencoded_offset) &&
+	       xdr_u64(xdrs, &r->plain_offset) &&
 	       xdr_u_int(xdrs, &r->codec) &&
 	       xdr_u_int(xdrs, &r->encrypted);
 }
@@ -173,12 +184,11 @@ static bool_t xdr_ds_write_reply(XDR *xdrs, struct ds_write_reply *r)
 static bool_t xdr_ds_write_args(XDR *xdrs, struct ds_write_args *a)
 {
 	return xdr_ds_addr(xdrs, &a->addr) &&
-	       xdr_u64(xdrs, &a->offset) &&
+	       xdr_u64(xdrs, &a->req_offset) &&
+	       xdr_u64(xdrs, &a->req_len) &&
 	       xdr_u64(xdrs, &a->desc.unit_offset) &&
 	       xdr_u64(xdrs, &a->desc.unit_len) &&
-	       xdr_u64(xdrs, &a->desc.unencoded_offset) &&
 	       xdr_u_int(xdrs, &a->desc.codec) &&
-	       xdr_u_int(xdrs, &a->desc.encrypted) &&
 	       xdr_u_int(xdrs, &a->stable) &&
 	       xdr_bytes(xdrs, &a->payload, &a->payload_len, MAX_PAYLOAD);
 }
@@ -407,10 +417,10 @@ int main(int argc, char **argv)
 			clnt_destroy(clnt);
 			return 1;
 		}
-		printf("status=%d unit_offset=%llu unit_len=%llu unencoded_offset=%llu codec=%u encrypted=%u\n",
+		printf("status=%d unit_offset=%llu unit_len=%llu plain_offset=%llu codec=%u encrypted=%u\n",
 		       reply.status, (unsigned long long)reply.unit_offset,
 		       (unsigned long long)reply.unit_len,
-		       (unsigned long long)reply.unencoded_offset,
+		       (unsigned long long)reply.plain_offset,
 		       reply.codec, reply.encrypted);
 	} else if (!strcmp(op, "read")) {
 		struct ds_read_args args = { .addr = addr, .offset = offset,
@@ -439,7 +449,8 @@ int main(int argc, char **argv)
 		 */
 		struct ds_write_args args = {
 			.addr = addr,
-			.offset = offset,
+			.req_offset = offset,
+			.req_len = len,
 			.desc = { .unit_offset = offset, .unit_len = len },
 			.stable = stable,
 			.payload_len = 512,

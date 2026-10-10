@@ -771,6 +771,13 @@ pkgs.testers.nixosTest {
     def ds_counter(name):
         return int(server.succeed("cat /sys/kernel/debug/encoded_ds/%s" % name))
 
+    # The layout driver's counters, as seen on the machine running the mount they
+    # are about. The same-host arms mount on the server, so their reads are
+    # counted there and not on the client.
+    def dcnt(name):
+        return int(server.succeed(
+            "cat /sys/kernel/debug/pnfs_bcachefs/%s" % name))
+
     start_all()
     client.wait_until_succeeds("ping -c1 -w1 server", timeout=120)
 
@@ -2118,9 +2125,23 @@ pkgs.testers.nixosTest {
             ("align-4096", "closeopen /mnt/self/q.bin 4096 150 plain /mnt/selfb/q.bin"),
             ("align-152135-same", "closeopen /mnt/self/q.bin 152135 200"),
         ):
+            okA0 = dcnt("ds_read_ok")
             rcA, outA = server.execute("timeout 300 sh -c '%s'" % cmd)
+            okA1 = dcnt("ds_read_ok")
             server.log("same-host %-19s rc=%d: %s" %
                        (tag, rcA, outA.strip()[:220]))
+            # Reading back through the second mount has to be *served*, not just
+            # correct. The request is page-granular, so a file ending inside its
+            # last page is asked for past i_size - bytes no key covers - and a
+            # walk that asked the service for them would find a hole and hand
+            # the whole request to the MDS. The MDS answers it correctly, so
+            # only the counter can tell that the last page of every unaligned
+            # file is being served the slow way. (The -same arm reads through
+            # the writer's own mount, whose cache answers it.)
+            if "/mnt/selfb" in cmd:
+                assert okA1 > okA0, \
+                    "same-host %s: read-back was not served (ds_read_ok %d->%d)" % (
+                        tag, okA0, okA1)
         for tag, cmd in (
             ("split-152K", "closeopen /mnt/self/q.bin 155648 150 plain /mnt/selfb/q.bin"),
             ("split-152K-unlink", "closeopen /mnt/self/q.bin 155648 150 unlink /mnt/selfb/q.bin"),
@@ -2143,9 +2164,6 @@ pkgs.testers.nixosTest {
         # old unit covers the tail and fills it from the frame's padding:
         # zeros over data that is on the device. Read through the second mount
         # so the client's own cache cannot answer.
-        def dcnt(f):
-            return int(server.succeed(
-                "cat /sys/kernel/debug/pnfs_bcachefs/" + f).strip())
         server.log("twophase before: write_ok=%s write_not_enc=%s declined=%s "
                    "last_off=%s last_len=%s" % (
                        dcnt("ds_write_ok"), dcnt("ds_write_not_encoded"),
@@ -2159,6 +2177,23 @@ pkgs.testers.nixosTest {
         ne1, ok1 = dcnt("ds_read_not_encoded"), dcnt("ds_read_ok")
         server.log("same-host twophase: served by the service: not_encoded "
                    "%d->%d, ds_read_ok %d->%d" % (ne0, ne1, ok0, ok1))
+        # Which side gave up on the range, and why. The client counts the
+        # descriptors it declined to use; the service counts the backend's own
+        # reason for refusing. A read can be correct - the MDS answers it - and
+        # still be a regression here, so the causes have to be in the log.
+        server.log("same-host twophase: client declines %s" % " ".join(
+            "%s=%s" % (n, dcnt(n)) for n in (
+                "read_declined", "ds_read_decline_range",
+                "ds_read_decline_encrypted", "ds_read_decline_codec",
+                "ds_read_decline_reach", "ds_read_err")))
+        server.log("same-host twophase: service refusals %s last_refused_off=%s" % (
+            " ".join("%s=%s" % (n, ds_counter(n)) for n in (
+                "refused_none", "refused_not_direct", "refused_not_compressed",
+                "refused_too_large", "refused_offset", "refused_no_target",
+                "refused_csum_invalid", "refused_encrypted", "frame_invalid",
+                "codec_unknown", "errors")),
+            server.succeed(
+                "cat /sys/kernel/debug/encoded_ds/last_refused_off").strip()))
         assert "wrong=0" in outT and "short=0" in outT, \
             "twophase read-back wrong: %s" % outT.strip()
         # The point of describing a unit by its live range - length and base -
