@@ -471,3 +471,91 @@ position in this list, and `nix/tests/` refers to them by number.
     this was not a one-off but permanent space amplification. Fixed by
     gating the loosened condition on `BCH_WRITE_encoded_only` and keeping
     the original, strict equality for everything else.
+
+39. **Reads wasted ~68% of the bytes they fetched for a sequential reader,
+    because requests routinely straddled a unit instead of landing on its
+    boundary.** `bc_pg_bsize()` sizes a request to a whole number of units,
+    but `nfs_generic_pg_test()` cuts a batch by byte *count* from wherever it
+    happened to start - a batch starting at file offset 512 KiB still cuts
+    at 1.5 MiB, 2.5 MiB, ... whole units, never aligned with where a unit
+    actually starts. A request that ends inside a unit makes the *next*
+    request re-fetch that same unit from its own start (`bc_read_done()`'s
+    unit walk has no memory of what a neighbouring request already pulled),
+    which `ds_read_wasted` measures and #27/#28 document - but for a
+    workload that reads whole files sequentially, every one of those bytes
+    is wanted and read again moments later: nothing is wasted at the
+    application's read() calls, only at the data service, which pays a full
+    unit's cost (a btree transaction, a checksum, a decode) a second time
+    for bytes it already served.
+
+    Two pieces fixed it, both read-only and additive - nothing about the
+    unit walk, the decode path or the MDS fallback changed:
+
+    - `bc_readahead_expand()`, hooked into `nfs_readahead()` through a new
+      `->expand_readahead` layout-driver op (`pnfs_expand_readahead()`,
+      pnfs.h), widens a readahead window's *trailing* edge out to the next
+      unit boundary using the kernel's own `readahead_expand()`
+      (mm/readahead.c) - the same primitive btrfs and squashfs use to read a
+      whole compressed block. Trailing edge only: `readahead_expand()`
+      aborts its *entire* call, leading and trailing both, the moment it
+      finds a folio already present while walking the leading edge - and
+      for a sequential reader the pages behind a request are routinely
+      already there, so attempting the leading edge first would silently
+      defeat the trailing one on every call that matters. One window ending
+      aligned is enough: the next one starts where this one ended, so a
+      sequential reader converges to fully aligned requests after its first
+      window.
+    - `bc_expand_read_folio()`, hooked into `nfs_read_folio()` through
+      `->expand_read_folio` (`pnfs_expand_read_folio()`), covers the case
+      `->expand_readahead` structurally cannot reach: mmap's own read-around
+      (`do_sync_mmap_readahead()`, filemap.c, taken whenever the mapping was
+      not given `MADV_SEQUENTIAL`) recentres every sync readahead on the
+      current fault rather than continuing forward, and once that recentred
+      window's own start lands on an already-cached page - which happens on
+      every window after the first, for a sequential reader - the kernel's
+      bulk allocator (`page_cache_ra_order()`) stops at that first present
+      folio and allocates *nothing*, so `->readahead` is never even called
+      for an empty result. The single folio that still needs filling falls
+      through to `nfs_read_folio()` instead, where `->expand_readahead` can
+      no longer act - the folio has already left the only `readahead_control`
+      that existed. `bc_expand_read_folio()` fires a best-effort,
+      asynchronous fetch for the rest of that folio's unit through
+      `page_cache_ra_unbounded()`, which (unlike `readahead_expand()`)
+      tolerates a present folio in its range - it flushes whatever
+      contiguous batch it already has and skips past the gap instead of
+      aborting - which is what makes it safe to call for a range that
+      includes the already-locked, already-present folio `nfs_read_folio()`
+      itself is about to fill.
+
+    Measured on the deployment-shaped bed (sequential whole-file reads, one
+    small-file loop and one large mmap'd file): waste fell from the
+    unaligned baseline to under 4% for the mmap arm and under 0.02% for the
+    small-file arm, with `ds_read_ok` still advancing (the encoded path is
+    still the one serving the read) and every byte read back verified
+    correct. `nix/seqread.c` is the regression test; it is not a substitute
+    for `pnfs_waste.sh` against a real workload, which is still the way to
+    tell whether a given deployment's access pattern actually benefits.
+
+40. **A kernel-side fix that compiled, linked, and passed review three times
+    over before anyone noticed it was never in the kernel being tested.**
+    `dev/mkpatch.sh`'s file list is an explicit, hand-maintained array of
+    exactly which files the generated patch covers - a deliberate choice,
+    says its own comment, not an accident - and `fs/nfs/read.c` had never
+    needed to be in it, because no prior change in this project's history
+    touched a core NFS file outside the driver's own `bcachefs_layout.c` /
+    `bcachefs_ds.c`. #39's fix does: the two new hook call sites
+    (`pnfs_expand_readahead()`, `pnfs_expand_read_folio()`) live in
+    `nfs_readahead()` and `nfs_read_folio()`, in `read.c` - and every build
+    and every VM test ran, passed its *other* assertions, and silently
+    tested a kernel with neither call site in it, because `mkpatch.sh`
+    diffed the checkout against a file list that did not include the one
+    file the actual fix lived in. Three full edit/rebuild/retest cycles
+    produced the exact same `ds_read_wasted` ratio, bit for bit, before a
+    debug counter placed *inside* the hook functions themselves - not in
+    `read.c`, which would have had the same blind spot, but in the driver
+    file that was correctly tracked - read back zero calls and made the gap
+    obvious. `grep DBGPROBE nix/patches/*.patch` after a probe added to a
+    *newly*-touched file, before spending another cycle on it, is the
+    lesson: a clean build and a passing-elsewhere test prove the patch
+    applies and the tree is consistent, never that a specific edit is in
+    the patch at all.

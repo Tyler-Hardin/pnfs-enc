@@ -60,6 +60,37 @@ this on anything that matters, run it (`dev/run-nixos-test.sh` /
 `nix flake check`) and confirm `sizeclobber clobber`/`sizeclobber padding`
 pass and the existing suite still does too.
 
+## Fixed: most of the read-side waste for a sequential reader
+
+See `doc/gotchas.md` 39 for the full account. `bc_readahead_expand()` and
+`bc_expand_read_folio()` widen a readahead window or a single-folio read to
+an actual unit boundary (not just a unit-sized count, which `pg_units`
+already gave it) - which is what a sequential reader's `ds_read_wasted`
+figure (#27/#28, ~68% on the deployment-shaped bed) mostly turns out to be:
+every unit re-fetched once by the request that straddled it and once more
+by the neighbour that finished the job, for bytes the application reads
+exactly once either way.
+
+Measured on `nix/seqread.c`'s two arms (a small-file loop and one large
+mmap'd file, both read sequentially through a second mount): waste fell to
+under 4% (mmap) and under 0.02% (small files), full suite green on both the
+`lan` and `gce-network-storage` profiles (`bcachefs`, `bcachefs-gce-network-storage`,
+`btrfs`, `btrfs-gce-network-storage`, `promote`, `promote-on-write`, both
+module checks, `emulation` - `bcachefs-kmsan` not run). Unlike the previous
+entry, this one *was* taken all the way through the full suite before being
+called done - see gotcha #40 for why that discipline mattered more than
+usual this time.
+
+**What is not covered**: this is the read side only; the same count-vs-offset
+cut exists in the write path's `pg_test` too (still `pnfs_generic_pg_test`,
+unmodified) and was deliberately left alone to keep the read measurement
+uncontaminated - see the commit. `MADV_SEQUENTIAL` on the mmap side is not
+required for correctness (`bc_expand_read_folio()` covers the un-hinted
+case) but is still the cheaper, more predictable path where the application
+can use it. And `pnfs_waste.sh` against a real workload, not `seqread.c`
+against a synthetic one, is still the way to know what a given deployment
+actually gets.
+
 ## What is next
 
 ### More tests

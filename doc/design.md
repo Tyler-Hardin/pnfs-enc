@@ -199,6 +199,11 @@ three, with the service's RPC count and the time it spends in the backend
   previous one pulled; `ds_read_wasted` is the counter, and the request size is
   the fix (the two-deep walk was cut because it helped only
   one-request-at-a-time direct I/O).
+- Sizing the request is not the same as *aligning* it: `bc_readahead_expand()`
+  and `bc_expand_read_folio()` widen a readahead window and a single-folio
+  read, respectively, to an actual unit boundary rather than just a
+  unit-sized count from wherever a batch happened to start - see gotcha #39.
+  For a sequential reader this is most of what #27/#28's ~68% figure was.
 - The cost is server-side and per unit: bcachefs's btree transaction, checksum
   and copies are the largest single number in the runs.
 - The kernel's NFS client defaults are a ceiling - `sunrpc.tcp_slot_table_entries`
