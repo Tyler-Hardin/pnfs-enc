@@ -28,7 +28,7 @@ and works; btrfs was the control and works too.
 ### The wire
 
 The data service is an RPC program of its own, `ENCODED_DS_PROGRAM`
-(`0x2000BC01`), version 2, with the procedures NULL / PROBE / READ / WRITE. It
+(`0x2000BC01`), version 3, with the procedures NULL / PROBE / READ / WRITE. It
 listens on TCP port 2050 (`nfsd.encoded_ds_port`, `vs_hidden`, not registered
 with rpcbind) and uses AUTH_UNIX.
 
@@ -36,6 +36,15 @@ A separate program rather than new NFS operations, because the payload is one
 whole encoded extent plus a small descriptor rather than an NFS-shaped
 page-sized READ, and because riding on sunrpc gets transport, request slots,
 reconnects, timeouts and several requests in flight for free.
+
+A WRITE carries the request range it is for and the frame it compressed as two
+separate things, and a read reply describes a unit by its live range. They are
+different structs rather than one with a meaning per direction: an earlier
+version had one descriptor whose `unit_offset` was the frame's start going out
+and the live range's start coming back, and the two ends disagreeing about a
+field is how this path lost a file's tail more than once.
+`include/linux/encoded_extent_ds.h` is the wire, and the version moves when it
+changes rather than when it is extended.
 
 Files are named the way NFS names them - export path plus file handle, resolved
 with `exportfs` and nfsd's own open - so the service needs no
