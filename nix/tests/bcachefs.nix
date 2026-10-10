@@ -192,6 +192,24 @@ let
     '';
   };
 
+  # The read-side waste measurement's own tool (see seqread.c):
+  # sequential whole-file reads in the deployment's two shapes - many small
+  # files read whole with read(2), and large files read sequentially through
+  # mmap - the access pattern bc_readahead_expand() and bc_pg_test_read()
+  # exist for. ds_read_wasted should move by approximately nothing for either
+  # shape once a request's units are aligned, which is what the new arms
+  # below assert.
+  seqread = pkgs.stdenv.mkDerivation {
+    name = "seqread";
+    dontUnpack = true;
+    buildPhase = ''
+      $CC -O2 -Wall -o seqread ${../seqread.c}
+    '';
+    installPhase = ''
+      install -Dm755 seqread $out/bin/seqread
+    '';
+  };
+
   common = { pkgs, ... }: {
     imports = [ ./emulation.nix ./corpus.nix ./client.nix ];
 
@@ -209,7 +227,7 @@ let
     # it needs the module only as a codec provider, and loading it on demand
     # when a layout names "bcachefs-zstd" is itself being tested.
     boot.extraModulePackages = [ bcachefsModule ];
-    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen randwr mmapwrite sizeclobber pkgs.nftables pkgs.fio
+    environment.systemPackages = [ pkgs.nfs-utils pkgs.bcachefs-tools dsprobe closeopen randwr mmapwrite sizeclobber seqread pkgs.nftables pkgs.fio
       # fsx is not in the xfstests package's bin/, and it is the whole reason
       # for having it: random reads, writes, overwrites and truncates with
       # every read verified, and -f dropping the cache after each operation so
@@ -2265,6 +2283,82 @@ pkgs.testers.nixosTest {
         assert rcSP == 0, (
             "sizeclobber padding failed (sub-sector write read back wrong - "
             "see bc_write_padding_uptodate()): %s" % outSP.strip())
+
+        # The read-side waste measurement itself: bc_readahead_expand()
+        # (trailing-edge readahead_expand() to a unit boundary) and
+        # bc_pg_test_read() (refuse to coalesce a batch across one) exist so
+        # that a sequential reader's requests line up with the units the
+        # backend charges per-unit for, instead of routinely straddling one
+        # and making the next request re-fetch what this one already pulled
+        # (ds_read_wasted - see doc/gotchas.md 27/28 for the measurement that
+        # motivated this). Both arms below measure the *delta* across just
+        # the read being tested, the same way pnfs_waste.sh does against the
+        # real deployment: a single lifetime snapshot would not separate this
+        # read's own waste from everything the suite did before it.
+        #
+        # 7900000 bytes is a handful of this export's 256 KiB units (the
+        # default encoded_extent_max) plus a deliberately non-unit-aligned
+        # remainder, so the file's last unit is short - the one place this
+        # fix does not reach (bc_readahead_expand() clamps to i_size, not to
+        # a unit boundary, once the two disagree) and so the one place a
+        # small amount of real waste is still expected and fine.
+        seqlarge_size = 7900000
+        server.succeed("seqread write /mnt/self/seqlarge.bin %d" % seqlarge_size)
+        server.succeed("sync")
+        wb0, wo0 = dcnt("ds_read_bytes"), dcnt("ds_read_wasted")
+        ok0 = dcnt("ds_read_ok")
+        ra0, rae0 = dcnt("ra_calls"), dcnt("ra_expanded")
+        rf0, rfe0 = dcnt("rf_calls"), dcnt("rf_expanded")
+        rcML, outML = server.execute(
+            "timeout 60 seqread mmap /mnt/selfb/seqlarge.bin %d 2>&1" % seqlarge_size)
+        wb1, wo1 = dcnt("ds_read_bytes"), dcnt("ds_read_wasted")
+        ok1 = dcnt("ds_read_ok")
+        ra1, rae1 = dcnt("ra_calls"), dcnt("ra_expanded")
+        rf1, rfe1 = dcnt("rf_calls"), dcnt("rf_expanded")
+        d_bytes, d_wasted = wb1 - wb0, wo1 - wo0
+        server.log("same-host seqread mmap: rc=%d ds_read_ok %d->%d "
+                   "bytes +%d wasted +%d ratio=%s: %s" %
+                   (rcML, ok0, ok1, d_bytes, d_wasted,
+                    ("%.4f" % (d_wasted / d_bytes)) if d_bytes > 0 else "n/a",
+                    outML.strip()))
+        server.log("same-host seqread mmap: ra_calls +%d ra_expanded +%d "
+                   "rf_calls +%d rf_expanded +%d" %
+                   (ra1 - ra0, rae1 - rae0, rf1 - rf0, rfe1 - rfe0))
+        assert rcML == 0, "seqread mmap failed or found wrong bytes: %s" % outML.strip()
+        assert ok1 > ok0, "seqread mmap: no encoded read was served (ds_read_ok %d->%d)" % (ok0, ok1)
+        assert d_bytes > 0, "seqread mmap: ds_read_bytes did not move - nothing was measured"
+        assert d_wasted < d_bytes * 0.10, (
+            "seqread mmap: waste ratio %.4f is not near zero (bytes +%d wasted +%d) - "
+            "bc_readahead_expand()/bc_pg_test_read() alignment regressed" %
+            (d_wasted / d_bytes, d_bytes, d_wasted))
+
+        # The small-file shape: many files under one unit, read whole with a
+        # plain read(2). Before this fix a file this size paid two or three
+        # fetches of the same unit (the initial readahead window undershoots
+        # a whole unit, then the async window re-fetches it) - after,
+        # bc_readahead_expand() clamps straight to i_size on the first
+        # window, so one fetch should cover the whole file.
+        wb2, wo2 = dcnt("ds_read_bytes"), dcnt("ds_read_wasted")
+        ok2 = dcnt("ds_read_ok")
+        rcMS, outMS = server.execute(
+            "timeout 60 seqread small /mnt/self/seqsmall 40 150000 "
+            "/mnt/selfb/seqsmall 2>&1")
+        wb3, wo3 = dcnt("ds_read_bytes"), dcnt("ds_read_wasted")
+        ok3 = dcnt("ds_read_ok")
+        d_bytes_s, d_wasted_s = wb3 - wb2, wo3 - wo2
+        server.log("same-host seqread small: rc=%d ds_read_ok %d->%d "
+                   "bytes +%d wasted +%d ratio=%s: %s" %
+                   (rcMS, ok2, ok3, d_bytes_s, d_wasted_s,
+                    ("%.4f" % (d_wasted_s / d_bytes_s)) if d_bytes_s > 0 else "n/a",
+                    outMS.strip()))
+        assert rcMS == 0, "seqread small failed or found wrong bytes: %s" % outMS.strip()
+        assert ok3 > ok2, "seqread small: no encoded read was served (ds_read_ok %d->%d)" % (ok2, ok3)
+        if d_bytes_s > 0:
+            assert d_wasted_s < d_bytes_s * 0.10, (
+                "seqread small: waste ratio %.4f is not near zero (bytes +%d wasted +%d)" %
+                (d_wasted_s / d_bytes_s, d_bytes_s, d_wasted_s))
+
+        server.succeed("rm -f /mnt/self/seqlarge.bin /mnt/self/seqsmall.*")
 
         # The deployment's failing shape, at the deployment's size: an ~81MB
         # file written the way the application writes it - kilobyte chunks with

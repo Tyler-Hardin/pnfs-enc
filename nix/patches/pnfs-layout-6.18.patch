@@ -2037,10 +2037,10 @@ index 000000000..55938ba27
 +}
 diff --git a/fs/nfs/bcachefs_ds.h b/fs/nfs/bcachefs_ds.h
 new file mode 100644
-index 000000000..e393a1bd9
+index 000000000..194a54559
 --- /dev/null
 +++ b/fs/nfs/bcachefs_ds.h
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,239 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Shared state for the pNFS encoded-extent client: the layout driver
@@ -2093,6 +2093,18 @@ index 000000000..e393a1bd9
 +	 * says the service is answering. See bc_ds_mark_down().
 +	 */
 +	unsigned long		ds_down_until;
++	/*
++	 * unit_max, copied from the first lseg this inode ever gets
++	 * (bc_alloc_lseg()) so that ->readahead can align a request to the
++	 * server's units without taking a segment reference or risking a
++	 * LAYOUTGET: a property of the exporting filesystem, not of the range
++	 * a segment covers, so every segment for this inode carries the same
++	 * value and a plain store/load race between two segments landing here
++	 * at once is benign - whichever writes last writes the same number. 0
++	 * means "no segment has been allocated yet", which is the only state
++	 * ->readahead has to treat as "nothing to align to".
++	 */
++	u32			ra_unit_max;
 +};
 +
 +/*
@@ -2270,10 +2282,10 @@ index 000000000..e393a1bd9
 +#endif /* _NFS_BCACHEFS_DS_H */
 diff --git a/fs/nfs/bcachefs_layout.c b/fs/nfs/bcachefs_layout.c
 new file mode 100644
-index 000000000..b7aea81a6
+index 000000000..c93090939
 --- /dev/null
 +++ b/fs/nfs/bcachefs_layout.c
-@@ -0,0 +1,2193 @@
+@@ -0,0 +1,2487 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * pNFS layout driver for bcachefs encoded extents: the client side.
@@ -2440,6 +2452,16 @@ index 000000000..b7aea81a6
 +static atomic_t bc_stat_lseg_alloc = ATOMIC_INIT(0);
 +static atomic_t bc_stat_lseg_alloc_err = ATOMIC_INIT(0);
 +static atomic_t bc_stat_read_pagelist = ATOMIC_INIT(0);
++/* bc_readahead_expand()/bc_expand_read_folio(): how often each was called,
++ * and of those, how often there was a unit_max to align to and the window
++ * or folio was not already aligned/at EOF, so an actual expand/fetch call
++ * happened. ra_calls/ra_expanded moving in lockstep with rf_calls staying
++ * near zero (or vice versa) is the fast way to tell which path a given
++ * workload is actually taking. */
++static atomic_t bc_stat_ra_calls = ATOMIC_INIT(0);
++static atomic_t bc_stat_ra_expanded = ATOMIC_INIT(0);
++static atomic_t bc_stat_rf_calls = ATOMIC_INIT(0);
++static atomic_t bc_stat_rf_expanded = ATOMIC_INIT(0);
 +/* Requests the read side declined itself, before asking the service. */
 +static atomic_t bc_stat_read_declined = ATOMIC_INIT(0);
 +static atomic_t bc_stat_write_pagelist = ATOMIC_INIT(0);
@@ -2805,6 +2827,20 @@ index 000000000..b7aea81a6
 +	bl->unit_align = be32_to_cpup(p);
 +
 +	/*
++	 * Cached on the per-inode header too, for ->readahead
++	 * (bc_readahead_expand()): a property of the filesystem, the same for
++	 * every segment this inode will ever get, so there is nothing to
++	 * invalidate and no lock needed - see the field's own comment in
++	 * bcachefs_ds.h.
++	 */
++	{
++		struct bc_layout_hdr *blh =
++			container_of(lo, struct bc_layout_hdr, plh);
++
++		WRITE_ONCE(blh->ra_unit_max, bl->unit_max);
++	}
++
++	/*
 +	 * The codecs the export may serve this file with. Each is resolved to a
 +	 * local implementation now, once per segment, so the data path only
 +	 * ever indexes this array - and a name this client does not have stays
@@ -2926,11 +2962,28 @@ index 000000000..b7aea81a6
 +#define BC_PG_BSIZE_MAX		(8U << 20)
 +static unsigned int bc_pg_units = 1;
 +
++/*
++ * unit_max * pg_units, clamped: the granularity bc_pg_bsize() sizes a request
++ * to and bc_readahead_expand() aligns one to, so that a request this driver
++ * builds is always a whole number of these - one clamp, shared, rather than
++ * two copies that could drift apart on a later edit to either.
++ *
++ * The debugfs file is not validated on write, so the clamp is where the
++ * value is trusted, and @unit_max is clamped the same way before the
++ * multiplication so that neither can overflow it.
++ */
++static size_t bc_ra_granularity(u32 unit_max)
++{
++	size_t clamped_unit = min_t(size_t, unit_max, (size_t)ENCODED_DS_MAX_PAYLOAD);
++	size_t units = clamp_t(size_t, READ_ONCE(bc_pg_units), 1, BC_PG_UNITS_MAX);
++
++	return clamped_unit * units;
++}
++
 +static size_t
 +bc_pg_bsize(struct nfs_pageio_descriptor *pgio, size_t mds_bsize)
 +{
 +	struct bc_layout *bl;
-+	size_t unit_max, units;
 +
 +	if (!pgio->pg_lseg)
 +		return 0;
@@ -2938,16 +2991,165 @@ index 000000000..b7aea81a6
 +	if (!bl->unit_max)
 +		return 0;
 +
-+	/*
-+	 * The debugfs file is not validated on write, so the clamp is where the
-+	 * value is trusted, and unit_max is clamped the same way before the
-+	 * multiplication so that neither can overflow it.
-+	 */
-+	unit_max = min_t(size_t, bl->unit_max, (size_t)ENCODED_DS_MAX_PAYLOAD);
-+	units = clamp_t(size_t, READ_ONCE(bc_pg_units), 1, BC_PG_UNITS_MAX);
-+
-+	return min_t(size_t, max_t(size_t, unit_max * units, mds_bsize),
++	return min_t(size_t, max_t(size_t, bc_ra_granularity(bl->unit_max), mds_bsize),
 +		     (size_t)BC_PG_BSIZE_MAX);
++}
++
++/*
++ * This inode's current alignment granularity (unit_max * pg_units), or 0 if
++ * there is nothing to align to yet. Shared by bc_readahead_expand() and
++ * bc_expand_read_folio(), the two places that need it.
++ *
++ * nfs_have_layout() is a bare, unlocked pointer read - every existing caller
++ * treats it as a hint and re-reads nfsi->layout under i_lock before touching
++ * it (pnfs.c's own roc(), for one), because the only path that ever NULLs it
++ * (pnfs_detach_layout_hdr()) does so under that same lock, immediately
++ * before the header is handed to ->free_layout_hdr(). Taking the lock here
++ * is what makes a non-NULL read of it safe to dereference rather than a
++ * potential use-after-free of a header torn down between the hint and the
++ * cast.
++ *
++ * The cast itself needs no type check: this is only ever reached through
++ * this driver's own ->expand_readahead/->expand_read_folio vtable entries
++ * (pnfs_expand_readahead()/pnfs_expand_read_folio(), pnfs.h) - every
++ * pnfs_layout_hdr for this mount was allocated by
++ * pnfs_curr_ld->alloc_layout_hdr, the same driver for the mount's whole
++ * lifetime, so a non-NULL nfsi->layout on a call that reached here is always
++ * a bc_layout_hdr.
++ */
++static size_t bc_inode_ra_granularity(struct inode *inode)
++{
++	struct bc_layout_hdr *blh = NULL;
++	u32 unit_max;
++
++	spin_lock(&inode->i_lock);
++	if (NFS_I(inode)->layout)
++		blh = container_of(NFS_I(inode)->layout, struct bc_layout_hdr, plh);
++	/*
++	 * Set once, by the first lseg this inode ever got (bc_alloc_lseg()),
++	 * and never cleared afterwards - see the field's own comment. 0 means
++	 * no segment has been allocated for this inode yet, which on a mount
++	 * with PNFS_LAYOUTGET_ON_OPEN (this layout type always sets it) is
++	 * only the window between open() and the first LAYOUTGET's reply
++	 * landing - rare, and "nothing to align to" is exactly today's
++	 * behaviour. Read while still holding i_lock: @blh itself is only
++	 * known valid for as long as the lock keeps pnfs_detach_layout_hdr()
++	 * from handing it to free_layout_hdr() underneath this read.
++	 */
++	unit_max = blh ? READ_ONCE(blh->ra_unit_max) : 0;
++	spin_unlock(&inode->i_lock);
++
++	return unit_max ? bc_ra_granularity(unit_max) : 0;
++}
++
++/*
++ * Widen a readahead request's trailing edge out to a unit boundary, so that
++ * ->read_pagelist fetches a whole number of units instead of routinely
++ * fetching one and using only part of it - see doc/gotchas.md and the commit
++ * this landed in for the measurement.
++ *
++ * Only the trailing edge: readahead_expand() aborts the *entire* call,
++ * leading and trailing both, the moment it finds a folio already present
++ * while extending the leading edge (mm/readahead.c) - and for a sequential
++ * reader the pages behind a request are routinely already there (it is why
++ * the reader is fast), so attempting the leading edge first would silently
++ * defeat the trailing one on every call that matters. The leading edge of
++ * whatever window started the file, or followed a probe into pages nothing
++ * had touched, is left as readahead chose it: one bounded, partial-unit
++ * re-fetch per such window rather than per request - the thing this is
++ * actually trying to amortise - and the window after it starts aligned,
++ * because this one now ends aligned, so a sequential reader converges to
++ * fully aligned requests after its first window.
++ *
++ * Clamped to i_size: readahead_expand() does not know where the file ends,
++ * and an unclamped request past it would insert pages the backend has to be
++ * asked about only to be told there is nothing there - the request still
++ * being served, correctly, by the usual EOF handling, just paying a DS round
++ * trip (or an MDS one) for bytes that could not possibly exist. i_size here
++ * is this client's own cached value, the same one bc_read_pagelist() already
++ * trusts for the equivalent reason (see bc_read_finish()); if it is stale
++ * low the expansion under-reaches, which costs nothing beyond what today's
++ * code already costs, and if it is stale high the request still gets a
++ * short, honest answer back exactly as an unexpanded one would.
++ */
++static void
++bc_readahead_expand(struct inode *inode, struct readahead_control *ractl)
++{
++	size_t granularity = bc_inode_ra_granularity(inode);
++	loff_t start, end, new_end, i_size;
++
++	atomic_inc(&bc_stat_ra_calls);
++
++	if (!granularity)
++		return;
++
++	start = readahead_pos(ractl);
++	end = start + readahead_length(ractl);
++
++	/*
++	 * round_up() needs a power-of-2 granularity (it is a bitmask trick);
++	 * @granularity is unit_max * pg_units, and pg_units - the debugfs knob -
++	 * is not restricted to powers of 2 (3, 5, 6... are accepted values), so
++	 * this divides instead. unit_max itself always is a power of 2
++	 * (OPT_MUST_BE_POW_2 on encoded_extent_max), but the product with an
++	 * arbitrary pg_units is not.
++	 */
++	new_end = DIV_ROUND_UP_ULL(end, granularity) * granularity;
++	i_size = i_size_read(inode);
++	if (new_end > i_size)
++		new_end = DIV_ROUND_UP_ULL(i_size, PAGE_SIZE) * PAGE_SIZE;
++	if (new_end <= end)
++		return;
++
++	atomic_inc(&bc_stat_ra_expanded);
++	readahead_expand(ractl, start, new_end - start);
++}
++
++/*
++ * The single-folio counterpart: nfs_read_folio()'s own call, for the folio
++ * that reached it instead of ->readahead() because mmap's read-around
++ * recentred on a fault whose neighbours were already cached - see this
++ * function's own vtable comment in pnfs.h for why that happens and why
++ * ->expand_readahead alone cannot reach this case.
++ *
++ * @folio is already locked and already in the mapping (nfs_read_folio()'s
++ * caller put it there); this must not touch it. page_cache_ra_unbounded()
++ * (unlike readahead_expand()) tolerates a present folio in its range - it
++ * flushes whatever contiguous batch it has built so far and skips past the
++ * gap rather than aborting (mm/readahead.c) - which is what makes it safe to
++ * ask for the whole unit here, @folio included, rather than carving @folio's
++ * own range out of the request. Fire-and-forget: ->readahead() dispatches the
++ * fetch and returns, it does not wait for it, so this adds no latency to the
++ * read nfs_read_folio() itself is about to do for @folio.
++ */
++static void
++bc_expand_read_folio(struct inode *inode, struct file *file, struct folio *folio)
++{
++	size_t granularity = bc_inode_ra_granularity(inode);
++	loff_t pos, unit_start, unit_end, i_size;
++	struct address_space *mapping = folio->mapping;
++	DEFINE_READAHEAD(ractl, file, &file->f_ra, mapping, 0);
++
++	atomic_inc(&bc_stat_rf_calls);
++
++	if (!granularity || !mapping)
++		return;
++
++	pos = folio_pos(folio);
++	i_size = i_size_read(inode);
++	if (pos >= i_size)
++		return;
++
++	unit_start = (pos / (loff_t)granularity) * (loff_t)granularity;
++	unit_end = unit_start + granularity;
++	if (unit_end > i_size)
++		unit_end = DIV_ROUND_UP_ULL(i_size, PAGE_SIZE) * PAGE_SIZE;
++	if (unit_end <= unit_start)
++		return;
++
++	atomic_inc(&bc_stat_rf_expanded);
++	ractl._index = unit_start >> PAGE_SHIFT;
++	page_cache_ra_unbounded(&ractl, (unit_end - unit_start) >> PAGE_SHIFT, 0);
 +}
 +
 +static void
@@ -2988,9 +3190,90 @@ index 000000000..b7aea81a6
 +		pgio->pg_mirrors[0].pg_bsize = bsize;
 +}
 +
++/*
++ * pnfs_generic_pg_test() cuts a batch by byte *count* (pg_bsize, set per
++ * nfs_pageio_descriptor in bc_pg_init_read() above): a batch starting at file
++ * offset 512 KiB and sized to one unit still cuts at 1.5 MiB, 2.5 MiB, ... -
++ * a whole unit each time, but never aligned with where a unit actually
++ * starts, so consecutive requests still straddle a boundary and still make
++ * bc_read_done() re-fetch the far side from the neighbour that already
++ * pulled it. bc_readahead_expand() fixes this for the *common* case - the
++ * first request of an aligned readahead window - but the first window of a
++ * file, or a batch mmap's read-around starts at an arbitrary offset, still
++ * is not.
++ *
++ * This is the other half: clamp the size pnfs_generic_pg_test() returns so
++ * that it never reaches past the next granularity boundary from wherever the
++ * batch itself started, so every batch this driver ever builds is cut
++ * exactly at a unit (or unit_max * pg_units) boundary, never through the
++ * middle of one - a cut by file offset, not by how many bytes happen to have
++ * accumulated. A @req that straddles the boundary is not refused outright:
++ * returning a size smaller than @req->wb_bytes is __nfs_pageio_add_request()'s
++ * (pagelist.c) own signal to split it with nfs_create_subreq() and submit the
++ * piece that fits, then retry the remainder - which lands past the boundary,
++ * where this function correctly returns 0 for it and lets the generic code
++ * flush the batch and start a fresh, already-aligned one. Skipped for direct
++ * I/O (@pgio->pg_dreq set): a direct reader's request shape is the
++ * application's to answer for, the same reason blocklayout's
++ * is_aligned_req() only ever applies to it too.
++ */
++static size_t
++bc_pg_test_read(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
++		struct nfs_page *req)
++{
++	struct bc_layout *bl;
++	struct nfs_pgio_mirror *mirror;
++	size_t size, granularity;
++	loff_t batch_start, next_boundary, req_start, allowed;
++
++	size = pnfs_generic_pg_test(pgio, prev, req);
++	if (!size || pgio->pg_dreq || !pgio->pg_lseg)
++		return size;
++
++	bl = container_of(pgio->pg_lseg, struct bc_layout, lseg);
++	if (!bl->unit_max)
++		return size;
++
++	granularity = bc_ra_granularity(bl->unit_max);
++	if (!granularity)
++		return size;
++
++	req_start = req_offset(req);
++	mirror = nfs_pgio_current_mirror(pgio);
++	/*
++	 * The caller only offers a @req contiguous with @prev
++	 * (nfs_coalesce_size(), pagelist.c) - never a gap - so the batch's own
++	 * start is exactly this far behind @req when it is not the first
++	 * request in it.
++	 */
++	batch_start = prev ? req_start - (loff_t)mirror->pg_count : req_start;
++
++	next_boundary = (batch_start / (loff_t)granularity + 1) * (loff_t)granularity;
++	/*
++	 * @req_start landing exactly on (or, in principle, past) the boundary
++	 * is not a bug to warn about - it is __nfs_pageio_add_request()'s own
++	 * subrequest-splitting mechanism (pagelist.c) doing exactly what it is
++	 * for: a request that straddled the previous boundary got sized down
++	 * to the bytes that still fit (the `allowed` clamp below, on an
++	 * earlier call), nfs_create_subreq() split off that piece, and this
++	 * call is for what is left of the original request - its own start is
++	 * the old boundary. Returning 0 here is correct and expected: nothing
++	 * fits past a boundary into the batch that boundary belongs to, and
++	 * __nfs_pageio_add_request()'s `if (!size)` branch flushes the batch
++	 * and retries this same remainder against a fresh one, whose own
++	 * batch_start is this boundary - already aligned, so the retry always
++	 * succeeds.
++	 */
++	if (req_start >= next_boundary)
++		return 0;
++
++	allowed = next_boundary - req_start;
++	return min_t(size_t, size, (size_t)allowed);
++}
++
 +static const struct nfs_pageio_ops bc_pg_read_ops = {
 +	.pg_init	= bc_pg_init_read,
-+	.pg_test	= pnfs_generic_pg_test,
++	.pg_test	= bc_pg_test_read,
 +	.pg_doio	= pnfs_generic_pg_readpages,
 +	.pg_cleanup	= pnfs_generic_pg_cleanup,
 +};
@@ -4304,6 +4587,21 @@ index 000000000..b7aea81a6
 +	.read_pagelist		= bc_read_pagelist,
 +	.write_pagelist		= bc_write_pagelist,
 +	/*
++	 * Optional, and checked for NULL by the one caller
++	 * (pnfs_expand_readahead(), pnfs.h) - unlike ->sync below, most layout
++	 * types have nothing to align a readahead request to. This one does:
++	 * see bc_readahead_expand()'s own comment for what it is for and why
++	 * only its trailing edge is ever widened.
++	 */
++	.expand_readahead	= bc_readahead_expand,
++	/*
++	 * Optional, and checked for NULL by the one caller
++	 * (pnfs_expand_read_folio(), pnfs.h) - the degenerate case
++	 * ->expand_readahead cannot reach: see bc_expand_read_folio()'s own
++	 * comment for why it exists and what it has to be careful not to do.
++	 */
++	.expand_read_folio	= bc_expand_read_folio,
++	/*
 +	 * pnfs_sync_inode() calls this without a NULL check, and it is reached
 +	 * from nfs_wb_all() on every flush of a file on this mount; leaving it
 +	 * out is a call to address zero on the first write. The generic NFS
@@ -4365,6 +4663,14 @@ index 000000000..b7aea81a6
 +					&bc_stat_lseg_alloc_err);
 +		debugfs_create_atomic_t("read_pagelist", 0444, bc_debugfs_dir,
 +					&bc_stat_read_pagelist);
++		debugfs_create_atomic_t("ra_calls", 0444, bc_debugfs_dir,
++					&bc_stat_ra_calls);
++		debugfs_create_atomic_t("ra_expanded", 0444, bc_debugfs_dir,
++					&bc_stat_ra_expanded);
++		debugfs_create_atomic_t("rf_calls", 0444, bc_debugfs_dir,
++					&bc_stat_rf_calls);
++		debugfs_create_atomic_t("rf_expanded", 0444, bc_debugfs_dir,
++					&bc_stat_rf_expanded);
 +		debugfs_create_atomic_t("read_declined", 0444, bc_debugfs_dir,
 +					&bc_stat_read_declined);
 +		debugfs_create_atomic_t("write_pagelist", 0444, bc_debugfs_dir,
@@ -4525,10 +4831,51 @@ index 358d686d2..480abb4cb 100644
  /* Factored out from fs/nfsd/vfs.h:fh_getattr() */
  static int __vfs_getattr(const struct path *p, struct kstat *stat, int version)
 diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
-index 3db8f13d8..0e855beb9 100644
+index 3db8f13d8..76716e214 100644
 --- a/fs/nfs/pnfs.h
 +++ b/fs/nfs/pnfs.h
-@@ -529,7 +529,8 @@ pnfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
+@@ -178,6 +178,40 @@ struct pnfs_layoutdriver_type {
+ 	int (*prepare_layoutstats) (struct nfs42_layoutstat_args *args);
+ 
+ 	void (*cancel_io)(struct pnfs_layout_segment *lseg);
++
++	/*
++	 * Optional: widen a readahead request to whatever granularity this
++	 * layout type's backend actually stores and charges for, so that
++	 * ->read_pagelist fetches align with it instead of routinely
++	 * straddling it. Called from nfs_readahead() before any folio is
++	 * taken from @ractl, so the driver can still call
++	 * readahead_expand() (mm/readahead.h) - once a folio has been pulled
++	 * out, expansion is no longer possible. NULL is "this layout type has
++	 * nothing to align to", the common case; pnfs_expand_readahead()
++	 * is what callers use, and it is the NULL check.
++	 */
++	void (*expand_readahead)(struct inode *inode,
++				 struct readahead_control *ractl);
++
++	/*
++	 * Optional: the single-folio counterpart to ->expand_readahead.
++	 * nfs_read_folio() reaches this folio instead of ->readahead() when
++	 * mmap's read-around recentred on a fault whose neighbours were
++	 * already cached - the kernel's own bulk readahead allocator stops at
++	 * the first present folio and never calls ->readahead() for an empty
++	 * result, so ->expand_readahead never gets a chance to run at all for
++	 * this request. @folio is already locked and already in the mapping;
++	 * this must not touch it, only kick off a best-effort, asynchronous
++	 * fetch for whatever else the driver's own unit needs - see
++	 * page_cache_ra_unbounded() (mm/readahead.h), which (unlike
++	 * readahead_expand()) tolerates and skips over a present folio in its
++	 * range instead of aborting, which is what makes it safe to call here
++	 * at all. NULL is "nothing to widen to", the common case;
++	 * pnfs_expand_read_folio() is what callers use, and it is the NULL
++	 * check.
++	 */
++	void (*expand_read_folio)(struct inode *inode, struct file *file,
++				  struct folio *folio);
+ };
+ 
+ struct pnfs_commit_ops {
+@@ -529,7 +563,8 @@ pnfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
  {
  	struct pnfs_ds_commit_info *fl_cinfo = cinfo->ds;
  
@@ -4538,6 +4885,108 @@ index 3db8f13d8..0e855beb9 100644
  		return false;
  	fl_cinfo->ops->mark_request_commit(req, lseg, cinfo, ds_commit_idx);
  	return true;
+@@ -592,6 +627,31 @@ pnfs_sync_inode(struct inode *inode, bool datasync)
+ 	return NFS_SERVER(inode)->pnfs_curr_ld->sync(inode, datasync);
+ }
+ 
++/*
++ * Unlike ->sync, this one really is optional for every layout type - most
++ * have nothing of the shape "a request must be a multiple of N bytes" to
++ * align to - so this checks for NULL itself rather than leaving that to each
++ * driver's vtable, the way bc_sync's own comment warns ->sync cannot.
++ */
++static inline void
++pnfs_expand_readahead(struct inode *inode, struct readahead_control *ractl)
++{
++	if (!pnfs_enabled_sb(NFS_SERVER(inode)))
++		return;
++	if (NFS_SERVER(inode)->pnfs_curr_ld->expand_readahead)
++		NFS_SERVER(inode)->pnfs_curr_ld->expand_readahead(inode, ractl);
++}
++
++static inline void
++pnfs_expand_read_folio(struct inode *inode, struct file *file,
++		       struct folio *folio)
++{
++	if (!pnfs_enabled_sb(NFS_SERVER(inode)))
++		return;
++	if (NFS_SERVER(inode)->pnfs_curr_ld->expand_read_folio)
++		NFS_SERVER(inode)->pnfs_curr_ld->expand_read_folio(inode, file, folio);
++}
++
+ static inline bool
+ pnfs_layoutcommit_outstanding(struct inode *inode)
+ {
+@@ -766,6 +826,17 @@ pnfs_sync_inode(struct inode *inode, bool datasync)
+ 	return 0;
+ }
+ 
++static inline void
++pnfs_expand_readahead(struct inode *inode, struct readahead_control *ractl)
++{
++}
++
++static inline void
++pnfs_expand_read_folio(struct inode *inode, struct file *file,
++		       struct folio *folio)
++{
++}
++
+ static inline bool
+ pnfs_layoutcommit_outstanding(struct inode *inode)
+ {
+diff --git a/fs/nfs/read.c b/fs/nfs/read.c
+index fe41e4272..8b50404a3 100644
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@ -415,6 +415,29 @@ int nfs_read_folio(struct file *file, struct folio *folio)
+ 	if (NFS_STALE(inode))
+ 		goto out_unlock;
+ 
++	/*
++	 * This folio reaches here, instead of through ->readahead(), exactly
++	 * when mmap's own read-around (do_sync_mmap_readahead(), filemap.c)
++	 * recentred on a fault whose surrounding pages were already in cache:
++	 * page_cache_ra_order()'s bulk loop stops at the first present folio
++	 * and never calls ->readahead() at all for an empty result, so a
++	 * layout type whose backend charges for a larger unit than one page
++	 * never gets the chance pnfs_expand_readahead() exists for. A single
++	 * sequential mmap reader hits exactly this shape on every unit after
++	 * the first: see the commit this landed in for the measurement.
++	 *
++	 * pnfs_expand_read_folio() is this folio's own chance, the one
++	 * remaining call site for a request this driver can still widen: it
++	 * fires a best-effort, async fetch for whatever the rest of the unit
++	 * still needs, through page_cache_ra_unbounded() - which (unlike
++	 * readahead_expand()) tolerates and skips a present folio mid-range
++	 * rather than aborting - so it is safe to call even though @folio
++	 * itself is already locked and already in the mapping. It does not
++	 * touch @folio or block on what it starts; the ordinary read below
++	 * still does the one page this call actually has to return.
++	 */
++	pnfs_expand_read_folio(inode, file, folio);
++
+ 	ret = nfs_netfs_read_folio(file, folio);
+ 	if (ret)
+ 		ret = nfs_do_read_folio(file, folio);
+@@ -456,6 +479,17 @@ void nfs_readahead(struct readahead_control *ractl)
+ 	} else
+ 		ctx = get_nfs_open_context(nfs_file_open_context(file));
+ 
++	/*
++	 * Before any folio is taken from @ractl: a layout type whose backend
++	 * charges per some granularity larger than a page (pnfs_expand_readahead())
++	 * can only widen the request here, by inserting locked folios ahead of
++	 * and behind what readahead already chose (readahead_expand(),
++	 * mm/readahead.c) - once a folio has left @ractl that door is closed.
++	 * A no-op for every layout type that has nothing to align to, which is
++	 * most of them; see the comment on ->expand_readahead in pnfs.h.
++	 */
++	pnfs_expand_readahead(inode, ractl);
++
+ 	nfs_pageio_init_read(&pgio, inode, false,
+ 			     &nfs_async_read_completion_ops);
+ 
 diff --git a/fs/nfsd/Kconfig b/fs/nfsd/Kconfig
 index e134dce45..33c4d00ae 100644
 --- a/fs/nfsd/Kconfig
